@@ -6,8 +6,8 @@ import type { SecretRedactor } from '../errors.js';
  * Server-side guards that apply to every tool call, whether it arrives over
  * MCP or through the embeddable gateway entry point.
  *
- * - Write tools are opt-in per instance (EXAMPLE_ENABLE_WRITES=true).
- * - EXAMPLE_DISABLED_TOOLS turns individual tools off; they are not even
+ * - Write tools are opt-in per instance (VIPPS_ENABLE_WRITES=true).
+ * - VIPPS_DISABLED_TOOLS turns individual tools off; they are not even
  *   registered.
  *
  * The template has no input allowlists. A server that adds one (account or
@@ -37,8 +37,14 @@ export interface InstancePolicy {
   /** Tools turned off on this instance, with or without the prefix. Must name known tools. */
   disabledTools?: readonly string[];
   /**
+   * Allow-list: when given, only these tools are offered (reads included);
+   * every other tool is treated as disabled. Must name known tools and must
+   * not be empty.
+   */
+  allowedTools?: readonly string[];
+  /**
    * Receives every audit record of this instance's calls, instead of
-   * EXAMPLE_AUDIT_LOG. Without it the instance writes no audit records. A
+   * VIPPS_AUDIT_LOG. Without it the instance writes no audit records. A
    * write tool runs only if its start record was accepted, so a sink that
    * throws refuses the write.
    */
@@ -49,6 +55,7 @@ export interface InstancePolicy {
 export interface ResolvedInstancePolicy {
   readonly enableWrites: boolean;
   readonly disabledTools: ReadonlySet<string>;
+  readonly allowedTools?: ReadonlySet<string>;
   readonly audit?: AuditSink;
 }
 
@@ -71,6 +78,9 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
   if (policy.disabledTools !== undefined && !Array.isArray(policy.disabledTools)) {
     throw new ConfigError('policy.disabledTools must be an array of tool names');
   }
+  if (policy.allowedTools !== undefined && !Array.isArray(policy.allowedTools)) {
+    throw new ConfigError('policy.allowedTools must be an array of tool names');
+  }
   if (policy.audit !== undefined && typeof policy.audit !== 'function') {
     throw new ConfigError('policy.audit must be a function');
   }
@@ -83,9 +93,24 @@ export function resolveInstancePolicy(policy: InstancePolicy, knownTools: readon
     }
     disabled.add(canonicalToolName(name));
   }
+  let allowed: Set<string> | undefined;
+  if (policy.allowedTools !== undefined) {
+    allowed = new Set();
+    for (const [index, name] of policy.allowedTools.entries()) {
+      if (typeof name !== 'string' || !known.has(canonicalToolName(name))) {
+        throw new ConfigError(`policy.allowedTools[${index}] is not a known tool.`);
+      }
+      allowed.add(canonicalToolName(name));
+    }
+    if (allowed.size === 0) {
+      // An empty allow-list would read as "no allow-list"; refuse it so a mistake cannot turn it off.
+      throw new ConfigError('policy.allowedTools is empty; leave it out or list at least one tool.');
+    }
+  }
   return Object.freeze({
     enableWrites: policy.enableWrites === true,
     disabledTools: disabled,
+    ...(allowed ? { allowedTools: allowed } : {}),
     ...(policy.audit ? { audit: policy.audit } : {}),
   });
 }
@@ -120,14 +145,14 @@ export interface PolicyDecision {
   reason: string;
 }
 
-export const TOOL_PREFIX = 'example_';
+export const TOOL_PREFIX = 'vipps_';
 
 export function writesEnabled(): boolean {
   const hosted = currentInstancePolicy();
   if (hosted) {
     return hosted.enableWrites;
   }
-  return readEnvBoolean('EXAMPLE_ENABLE_WRITES', false);
+  return readEnvBoolean('VIPPS_ENABLE_WRITES', false);
 }
 
 /** Tool names are accepted with or without the prefix, case-insensitively. */
@@ -141,16 +166,18 @@ function disabledTools(): ReadonlySet<string> {
   if (hosted) {
     return hosted.disabledTools;
   }
-  return new Set(readEnvList('EXAMPLE_DISABLED_TOOLS').map(canonicalToolName));
+  return new Set(readEnvList('VIPPS_DISABLED_TOOLS').map(canonicalToolName));
 }
 
 export function isToolDisabled(toolName: string): boolean {
-  return disabledTools().has(canonicalToolName(toolName));
+  const name = canonicalToolName(toolName);
+  const allowed = currentInstancePolicy()?.allowedTools;
+  return disabledTools().has(name) || (allowed !== undefined && !allowed.has(name));
 }
 
 /**
  * Validate the policy environment once at startup: boolean switches must be
- * valid and EXAMPLE_DISABLED_TOOLS may only name known tools, so a typo
+ * valid and VIPPS_DISABLED_TOOLS may only name known tools, so a typo
  * cannot silently leave a tool enabled.
  */
 export function validatePolicyConfig(knownTools: readonly string[]): void {
@@ -159,13 +186,13 @@ export function validatePolicyConfig(knownTools: readonly string[]): void {
   const unknown = [...disabledTools()].filter(name => !known.has(name));
   if (unknown.length > 0) {
     // The names are not quoted: a configuration value is never echoed, not even shortened.
-    throw new ConfigError(`EXAMPLE_DISABLED_TOOLS names ${unknown.length} unknown tool(s).`);
+    throw new ConfigError(`VIPPS_DISABLED_TOOLS names ${unknown.length} unknown tool(s).`);
   }
 }
 
 export function checkToolPolicy(toolName: string, readOnly: boolean): PolicyDecision {
   if (isToolDisabled(toolName)) {
-    const source = currentInstancePolicy() ? 'by the embedding host' : '(EXAMPLE_DISABLED_TOOLS)';
+    const source = currentInstancePolicy() ? 'by the embedding host' : '(VIPPS_DISABLED_TOOLS)';
     return { allowed: false, reason: `tool is disabled on this instance ${source}: ${toolName}` };
   }
   if (readOnly) {
@@ -178,7 +205,7 @@ export function checkToolPolicy(toolName: string, readOnly: boolean): PolicyDeci
         `write tool is disabled on this instance: ${toolName}. ` +
         (currentInstancePolicy()
           ? 'The embedding host has not enabled writes for this instance.'
-          : 'Set EXAMPLE_ENABLE_WRITES=true in the server environment to allow write tools.'),
+          : 'Set VIPPS_ENABLE_WRITES=true in the server environment to allow write tools.'),
     };
   }
   return { allowed: true, reason: 'write tool (writes enabled on this instance)' };

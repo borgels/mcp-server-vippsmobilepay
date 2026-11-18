@@ -22,19 +22,19 @@ describe('key admission', () => {
   });
 
   it('accepts a vendor-like key and refuses short keys and keys that share text with our own texts', () => {
-    expect(admitsKey('Zq7pX2vK9mWb4TnR8yLc3HdJ6fGs1QeU')).toBe(true);
-    expect(admitsKey('Zq7pX2vK9mWb4Tn'.slice(0, MIN_KEY_LENGTH - 1))).toBe(false);
+    expect(admitsKey('notreal-qqqq-wwww-zzzz-qqqq-wwww')).toBe(true);
+    expect(admitsKey('notreal-qqqq-ww'.slice(0, MIN_KEY_LENGTH - 1))).toBe(false);
     const colliding = [
-      '‹redacted›-Zq7pX2vK9mWb',
-      '[nested too deep]Zq7pX2vK',
+      '‹redacted›-notreal-qqqq',
+      '[nested too deep]notreal-',
       KEY_REFUSED,
-      ...FIXED_CORPUS.filter(text => text.length >= 6).slice(0, 50).map(text => `Zq7pX2vK9mWb${text}`),
+      ...FIXED_CORPUS.filter(text => text.length >= 6).slice(0, 50).map(text => `notreal-qqqq${text}`),
     ];
     for (const key of colliding) expect(admitsKey(key), key).toBe(false);
   });
 
   it('never repeats a piece of a refused key in the refusal', () => {
-    for (const key of [KEY_REFUSED, `xx${KEY_REFUSED.slice(4, 40)}yy`, '‹redacted›-Zq7pX2vK9mWb', 'short-key']) {
+    for (const key of [KEY_REFUSED, `xx${KEY_REFUSED.slice(4, 40)}yy`, '‹redacted›-notreal-qqqq', 'short-key']) {
       const text = keyRefusedText(key);
       for (const piece of pieces(key)) expect(text, `${key} / ${piece}`).not.toContain(piece);
     }

@@ -48,10 +48,12 @@ function headerPattern(name: string): RegExp {
 
 /** Patterns that are always applied: credential-shaped key/value pairs. They hold no secret values. */
 const BASE_PATTERNS: readonly RegExp[] = [
-  headerPattern('x-api-key'),
+  headerPattern('client_secret'),
+  headerPattern('client_id'),
+  headerPattern('ocp-apim-subscription-key'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
-  /(apiKey|EXAMPLE_API_KEY|api_key|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
+  /(clientSecret|subscriptionKey|VIPPS_CLIENT_SECRET|VIPPS_SUBSCRIPTION_KEY|VIPPS_CLIENT_ID|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
 
 /**
@@ -86,6 +88,21 @@ export class SecretRedactor {
     const pattern = headerPattern(name);
     if (!this.patterns.some(existing => existing.source === pattern.source)) {
       this.patterns.push(pattern);
+    }
+    return this;
+  }
+
+  /**
+   * Redact this value only as a whole (raw, URL-encoded and JSON-escaped), not
+   * its pieces: for a long, structured secret such as an access token (a JWT),
+   * whose pieces are common in other base64 text.
+   */
+  addExactSecret(value: string | undefined): this {
+    if (!value || value.length < MIN_SECRET_LENGTH) {
+      return this;
+    }
+    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+      this.secrets.add(form);
     }
     return this;
   }
@@ -157,27 +174,36 @@ function applyPatterns(value: string, patterns: readonly RegExp[]): string {
   );
 }
 
-/** Our own guidance per HTTP status. Replace or extend with the vendor's documented statuses. */
+/** Our own guidance per HTTP status, for the statuses the Vipps MobilePay APIs document. */
 const STATUS_HINTS: Record<number, string> = {
-  401: 'The API key was rejected (invalid or expired). The server operator must renew EXAMPLE_API_KEY.',
-  403: 'The API key has no access to this resource. Retrying will not help.',
-  404: 'The object was not found, or the API key has no access to it. Check the ids.',
-  429: 'The upstream API is throttling requests. Wait and retry later.',
+  400: 'Vipps MobilePay refused the request as invalid. Check the input; retrying the same request will not help.',
+  401: 'The access token was refused. The keys may be wrong, expired or revoked.',
+  403: 'The keys have no access to this API or this sales unit. Retrying will not help.',
+  404: 'Not found, or the keys have no access to it. Check the reference or id.',
+  409: 'Vipps MobilePay refused the change in the current state of the payment or charge.',
+  429: 'Vipps MobilePay is throttling requests. Wait and retry later.',
+};
+
+/** Hints for the Access Token API. */
+const TOKEN_STATUS_HINTS: Record<number, string> = {
+  400: 'The Access Token API refused the request. Check the client_id, the Merchant-Serial-Number and the environment.',
+  401: 'The keys were rejected: client_id, client_secret or Ocp-Apim-Subscription-Key is wrong, or belongs to the other environment.',
+  403: 'The keys have no access. Check that they belong to this sales unit and environment.',
 };
 
 /**
- * An HTTP error from the upstream API. It keeps the status and the parsed
+ * An HTTP error from Vipps MobilePay. It keeps the status and the parsed
  * Retry-After, nothing from the response body: the message is our own.
  */
-export class ExampleHttpError extends Error {
+export class VippsHttpError extends Error {
   readonly status: number;
   readonly url: string;
   /** Seconds to wait, parsed from Retry-After; undefined when absent or malformed. */
   readonly retryAfter?: string;
 
-  constructor(input: { status: number; url: string; retryAfter?: string }) {
-    super(httpErrorMessage(input.status, input.retryAfter));
-    this.name = 'ExampleHttpError';
+  constructor(input: { status: number; url: string; retryAfter?: string; tokenRequest?: boolean }) {
+    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true));
+    this.name = 'VippsHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
     const retryMs = parseRetryAfterMs(input.retryAfter);
@@ -186,11 +212,12 @@ export class ExampleHttpError extends Error {
 }
 
 /** The whole text of an HTTP error: status, our hint, and a parsed Retry-After in seconds. */
-export function httpErrorMessage(status: number, retryAfter?: string): string {
+export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false): string {
   const retryMs = parseRetryAfterMs(retryAfter);
+  const hints = tokenRequest ? TOKEN_STATUS_HINTS : STATUS_HINTS;
   return [
-    `Example API request failed with HTTP ${status}`,
-    Object.hasOwn(STATUS_HINTS, status) ? STATUS_HINTS[status] : undefined,
+    tokenRequest ? `Vipps MobilePay access token request failed with HTTP ${status}` : `Vipps MobilePay API request failed with HTTP ${status}`,
+    Object.hasOwn(hints, status) ? hints[status] : undefined,
     retryMs === undefined ? undefined : `retry-after=${Math.ceil(retryMs / 1000)}s`,
   ]
     .filter(Boolean)
@@ -268,13 +295,13 @@ export function redactDeep(value: unknown, redactor?: SecretRedactor, depth = 0)
  * fixed text. Never the error's own message.
  */
 export function nestedFailureText(error: unknown): string {
-  if (error instanceof ExampleHttpError) {
-    return `Example API request failed with HTTP ${error.status}`;
+  if (error instanceof VippsHttpError) {
+    return `Vipps MobilePay API request failed with HTTP ${error.status}`;
   }
   if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-    return 'Example API request timed out.';
+    return 'Vipps MobilePay API request timed out.';
   }
-  return 'Example API request failed.';
+  return 'Vipps MobilePay API request failed.';
 }
 
 /** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
@@ -289,8 +316,8 @@ function failureEntry(value: unknown): { status?: number; message: string } {
   const status =
     typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>).status : undefined;
   return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
-    ? { status, message: `Example API request failed with HTTP ${status}` }
-    : { message: 'Example API request failed.' };
+    ? { status, message: `Vipps MobilePay API request failed with HTTP ${status}` }
+    : { message: 'Vipps MobilePay API request failed.' };
 }
 
 /** A failure list: every element (an object with any fields, a text, a list) becomes a failureEntry. */
@@ -335,8 +362,8 @@ export function nestedFailuresAsStatus(value: unknown, depth = 0, context = fals
   const present = (field: string) => Object.hasOwn(record, field) && record[field] !== null && record[field] !== undefined;
   if (failedStatus || present('error') || (context && FAILURE_FIELDS.some(present))) {
     return failedStatus
-      ? { status, error: `Example API request failed with HTTP ${status}` }
-      : { error: 'Example API request failed.' };
+      ? { status, error: `Vipps MobilePay API request failed with HTTP ${status}` }
+      : { error: 'Vipps MobilePay API request failed.' };
   }
   return Object.fromEntries(
     Object.entries(record).map(([key, entry]) => [
