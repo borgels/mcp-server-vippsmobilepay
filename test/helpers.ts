@@ -11,17 +11,17 @@ import { createServer } from '../src/server.js';
 export const BASE = 'https://apitest.vipps.no';
 
 /**
- * A made-up value that looks like a key, derived at run time from a seed, so the source holds no literal that
- * looks like a secret (the public-hygiene scan reads the source).
+ * An obviously fake, low-entropy key for tests: "notreal-" and a short code from the seed, repeated to the
+ * length. Invented here; it has never come from a Vipps MobilePay account.
  */
 export function fakeKey(seed: string, length = 32): string {
-  return createHash('sha256').update(seed).digest('base64url').slice(0, length);
+  const code = createHash('sha256').update(seed).digest('hex').slice(0, 4);
+  return `notreal-${`${code}-`.repeat(Math.ceil(length / 5))}`.slice(0, length);
 }
 
-/** A made-up access token in the shape of a JWT. */
+/** An obviously fake access token for tests. */
 export function fakeToken(seed: string): string {
-  const part = (text: string) => Buffer.from(text).toString('base64url');
-  return [part('{"typ":"JWT","alg":"RS256"}'), part(`{"sub":"${seed}","pad":"${'x'.repeat(60)}"}`), fakeKey(`${seed}-sig`, 43)].join('.');
+  return `notreal-access-${seed}-${'x'.repeat(24)}`;
 }
 
 /** Made-up keys of a made-up merchant ("Fjordbakeriet"). */
