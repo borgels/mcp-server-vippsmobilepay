@@ -117,8 +117,9 @@ export interface GatewayToolCatalogEntry {
    * Write tools only: what the change does, for a host that logs a change
    * before it is sent. `logFields` are the input fields that identify it,
    * each with the one type its value must have (amounts in minor units, ISO
-   * currency codes, references and ids matched against a strict pattern;
-   * never names or free text). `resolveVippsChange` returns their values.
+   * currency codes and flags in clear; references, agreement and charge
+   * ids and idempotency keys only as pseudonyms; never names or free text).
+   * `resolveVippsChange` returns their values.
    */
   readonly change?: VippsChangeSpec;
 }
@@ -243,10 +244,19 @@ function toolByGatewayName(toolName: unknown): ToolDefinition | undefined {
  * Resolves what a write tool call will change, for a host that logs the
  * change (and asks a person to confirm it) before the call runs: the action,
  * the record kind and the values of the tool's `logFields` that are present
- * and well-formed. Refuses read tools, unknown tools and invalid input, as
- * callTool does.
+ * and well-formed. Identifiers the caller chose (reference, agreement and
+ * charge id, idempotency key) come back only as pseudonyms: HMAC-SHA-256 with
+ * `options.pseudonymKey` when the host gives one (recommended: a reference
+ * such as an order number is easy to guess from a plain hash), otherwise
+ * SHA-256; 16 hex characters with an `hmac:` or `sha256:` prefix. Amounts,
+ * currency and flags are in clear. Refuses read tools, unknown tools and
+ * invalid input, as callTool does.
  */
-export function resolveVippsChange(toolName: string, input: GatewayJsonObject = {}): VippsChangeResolution {
+export function resolveVippsChange(
+  toolName: string,
+  input: GatewayJsonObject = {},
+  options: { pseudonymKey?: string | Uint8Array } = {},
+): VippsChangeResolution {
   const tool = toolByGatewayName(toolName);
   if (!tool) return { ok: false, reason: 'Unsupported Vipps MobilePay gateway tool.' };
   if (!tool.change) return { ok: false, reason: `${stripPrefix(tool.name)} is not a write tool.` };
@@ -255,7 +265,7 @@ export function resolveVippsChange(toolName: string, input: GatewayJsonObject = 
   const data = parsed.data as Record<string, unknown>;
   const values: Record<string, string | number | boolean> = {};
   for (const field of tool.change.logFields) {
-    const value = logFieldValue(field.type, data[field.name]);
+    const value = logFieldValue(field.type, data[field.name], options.pseudonymKey);
     if (value !== undefined) values[field.name] = value;
   }
   return {

@@ -10,6 +10,7 @@ import {
   type GatewayJsonObject,
 } from '../src/gateway.js';
 import { VIPPS_TOOLS } from '../src/tools/vipps.js';
+import { pseudonym } from '../src/vipps/values.js';
 import { apiCalls, charge, connect, fakeKey, fakeToken, gateway, KEYS, payment, stubFetch, texts, type Call } from './helpers.js';
 
 const originalEnv = { ...process.env };
@@ -31,11 +32,11 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   get_agreement: { agreementId: 'agr_7TqP2m' },
   list_charges: { agreementId: 'agr_7TqP2m' },
   get_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz' },
-  capture_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK' },
-  refund_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK' },
-  cancel_payment: { reference: 'fjord-order-10042' },
-  refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren' },
-  cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz' },
+  capture_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },
+  refund_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },
+  cancel_payment: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' },
+  refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren', idempotencyKey: 'op-0001-aaaa' },
+  cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
 };
 
 const answerEverything: typeof fetch = async (input, init) => {
@@ -132,11 +133,11 @@ describe('tool catalog', () => {
       record: 'charge',
       movesMoney: true,
       logFields: [
-        { name: 'agreementId', type: 'recurringId' },
-        { name: 'chargeId', type: 'recurringId' },
+        { name: 'agreementId', type: 'pseudonym' },
+        { name: 'chargeId', type: 'pseudonym' },
         { name: 'amount', type: 'amountMinor' },
         { name: 'currency', type: 'currency' },
-        { name: 'idempotencyKey', type: 'idempotencyKey' },
+        { name: 'idempotencyKey', type: 'pseudonym' },
       ],
     });
   });
@@ -208,7 +209,7 @@ describe('host policy', () => {
     process.env.VIPPS_CLIENT_SECRET = fakeKey('from-the-environment');
     const { gw, calls } = gateway({ 'GET /epayment/v1/payments/fjord-order-10042': { body: payment() } });
     expect(gw.tools.map(tool => tool.name)).toContain('get_payment');
-    expect((await gw.callTool('cancel_payment', { reference: 'fjord-order-10042' })).isError).toBe(true);
+    expect((await gw.callTool('cancel_payment', { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' })).isError).toBe(true);
     await gw.callTool('get_payment', { reference: 'fjord-order-10042', includeEvents: false });
     expect(calls[0]?.headers.client_secret).toBe(KEYS.clientSecret);
   });
@@ -221,7 +222,7 @@ describe('host policy', () => {
     );
     await gw.callTool(
       'refund_charge',
-      { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 900, currency: 'DKK', description: 'Kunden Ole Hansen klagede' },
+      { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 900, currency: 'DKK', description: 'TEST-PERSON-NAME klagede', idempotencyKey: 'op-0001-aaaa' },
       { caller: 'person@fjordbakeriet.test', requestId: 'req-1' },
     );
     expect(records.map(record => record.action)).toEqual(['start', 'finish']);
@@ -229,9 +230,15 @@ describe('host policy', () => {
       requestId: 'req-1',
       caller: 'person@fjordbakeriet.test',
       tool: 'vipps_refund_charge',
-      target: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 900, currency: 'DKK' },
+      target: {
+        agreementId: pseudonym('agr_7TqP2m'),
+        chargeId: pseudonym('chr-5kSeqz'),
+        idempotencyKey: pseudonym('op-0001-aaaa'),
+        amount: 900,
+        currency: 'DKK',
+      },
     });
-    expect(JSON.stringify(records)).not.toContain('Ole');
+    expect(JSON.stringify(records)).not.toMatch(/TEST-PERSON|agr_7TqP2m|chr-5kSeqz/);
 
     const refusing = gateway(
       { 'POST /epayment/v1/payments/fjord-order-10042/cancel': { body: {} } },
@@ -244,7 +251,7 @@ describe('host policy', () => {
         },
       },
     );
-    const result = await refusing.gw.callTool('cancel_payment', { reference: 'fjord-order-10042' });
+    const result = await refusing.gw.callTool('cancel_payment', { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' });
     expect(result.isError).toBe(true);
     expect(texts(result)[0]).toMatch(/Audit log is not writable.*was not run/);
     expect(apiCalls(refusing.calls)).toHaveLength(0);
@@ -259,8 +266,8 @@ describe('host policy', () => {
       merchantSerialNumber: '298765',
     };
     const b = gateway({}, { ...otherKeys });
-    expect((await a.gw.callTool('cancel_payment', { reference: 'fjord-order-10042' })).isError).toBeUndefined();
-    expect((await b.gw.callTool('cancel_payment', { reference: 'fjord-order-10042' })).isError).toBe(true);
+    expect((await a.gw.callTool('cancel_payment', { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' })).isError).toBeUndefined();
+    expect((await b.gw.callTool('cancel_payment', { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' })).isError).toBe(true);
     await b.gw.callTool('check_connection', {});
     expect(b.calls[0]?.headers['Merchant-Serial-Number']).toBe('298765');
     expect(b.calls[0]?.headers.client_secret).toBe(otherKeys.clientSecret);
@@ -290,7 +297,7 @@ describe('MCP server', () => {
 
   it('refuses writes unless VIPPS_ENABLE_WRITES is set, and audits them to VIPPS_AUDIT_LOG', async () => {
     const { mcpClient, calls } = await connect({ 'POST /epayment/v1/payments/fjord-order-10042/cancel': { body: {} } });
-    const refused = await mcpClient.callTool({ name: 'vipps_cancel_payment', arguments: { reference: 'fjord-order-10042' } });
+    const refused = await mcpClient.callTool({ name: 'vipps_cancel_payment', arguments: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' } });
     expect(refused.isError).toBe(true);
     expect(texts(refused)[0]).toMatch(/VIPPS_ENABLE_WRITES=true/);
     expect(calls).toHaveLength(0);
@@ -298,10 +305,24 @@ describe('MCP server', () => {
     const dir = mkdtempSync(join(tmpdir(), 'vipps-audit-'));
     process.env.VIPPS_ENABLE_WRITES = 'true';
     process.env.VIPPS_AUDIT_LOG = join(dir, 'audit.jsonl');
-    const ok = await mcpClient.callTool({ name: 'vipps_cancel_payment', arguments: { reference: 'fjord-order-10042' } });
+    const ok = await mcpClient.callTool({ name: 'vipps_cancel_payment', arguments: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' } });
     expect(ok.isError).toBeFalsy();
     const { auditLines } = await import('./helpers.js');
     expect(auditLines(join(dir, 'audit.jsonl')).map(line => line.action)).toEqual(['start', 'finish']);
+  });
+
+  it('redacts keys and the token that upstream echoes in an MCP result, values and object keys alike', async () => {
+    const { TOKEN } = await import('./helpers.js');
+    const echo = { reference: KEYS.clientSecret, [KEYS.subscriptionKey]: TOKEN, nested: { [KEYS.clientId]: KEYS.clientSecret.slice(2, 14) } };
+    const { mcpClient } = await connect({ 'GET /recurring/v3/agreements/agr_7TqP2m': { body: echo } });
+    const result = await mcpClient.callTool({ name: 'vipps_get_agreement', arguments: { agreementId: 'agr_7TqP2m' } });
+    const text = JSON.stringify(result);
+    expect(text).toContain('‹redacted›');
+    for (const secret of [KEYS.clientId, KEYS.clientSecret, KEYS.subscriptionKey]) {
+      for (let i = 0; i + 6 <= secret.length; i += 1) expect(text).not.toContain(secret.slice(i, i + 6));
+    }
+    expect(text).not.toContain(TOKEN);
+    expect(JSON.parse(texts(result)[0] ?? 'null')).toMatchObject({ reference: '‹redacted›' });
   });
 
   it('leaves out the Report API tools with partner keys', async () => {

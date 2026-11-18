@@ -144,9 +144,15 @@ describe('requests', () => {
   it('sends only the requests on the fixed list', async () => {
     const { fetchImpl, calls } = stubFetch();
     const client = makeClient(fetchImpl);
-    await expect(client.post('/recurring/v3/agreements', {})).rejects.toThrow(/never sends that POST/);
-    await expect(client.delete('/recurring/v3/agreements/agr_1')).rejects.toThrow(/never sends that DELETE/);
+    await expect(client.post('/recurring/v3/agreements', {}, { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that POST/);
+    await expect(client.delete('/recurring/v3/agreements/agr_1', { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that DELETE/);
     await expect(client.get('/management/v1/sales-units')).rejects.toThrow(/never sends that GET/);
+    // Dot segments are resolved by the URL parser; the list is checked on what would be sent, and they are refused.
+    await expect(client.delete('/recurring/v3/agreements/agr_1/charges/..', { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that DELETE/);
+    await expect(client.post('/epayment/v1/payments/../../recurring/v3/agreements/agr_1/charges/chr_1/refund', {}, { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(
+      /never sends that POST/,
+    );
+    await expect(client.get('/epayment/v1/payments/%2e%2e')).rejects.toThrow(/never sends that GET/);
     expect(calls).toHaveLength(0);
 
     expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/refund')).toBe(true);
@@ -157,15 +163,14 @@ describe('requests', () => {
     expect(isAllowedRequest('GET', '/report/v2/ledgers/abc/funds/dates/2026-11-01')).toBe(false);
   });
 
-  it('sends a fresh Idempotency-Key on each write unless one is given, and refuses a malformed one', async () => {
+  it('sends the Idempotency-Key it is given and never makes one up', async () => {
     const { fetchImpl, calls } = stubFetch({ 'POST /epayment/v1/payments/fjord-order-1/cancel': { body: {} } });
     const client = makeClient(fetchImpl);
-    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {});
-    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {});
-    const keys = apiCalls(calls).map(call => call.headers['Idempotency-Key']);
-    expect(keys[0]).toMatch(/^[0-9a-f-]{36}$/);
-    expect(keys[0]).not.toBe(keys[1]);
+    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, { idempotencyKey: 'op-0001-aaaa' });
+    expect(apiCalls(calls).map(call => call.headers['Idempotency-Key'])).toEqual(['op-0001-aaaa']);
     await expect(client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, { idempotencyKey: 'a/b' })).rejects.toThrow(/idempotencyKey/);
+    await expect(client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, undefined as never)).rejects.toThrow(/idempotencyKey/);
+    expect(apiCalls(calls)).toHaveLength(1);
   });
 
   it('never retries a POST on a gateway error, but retries a GET', async () => {
@@ -175,7 +180,7 @@ describe('requests', () => {
       'GET /epayment/v1/payments/fjord-order-1': () => ((gets += 1) === 1 ? { status: 503 } : { body: { ok: true } }),
     });
     const client = makeClient(fetchImpl, { maxAttempts: 3 });
-    await expect(client.post('/epayment/v1/payments/fjord-order-1/capture', {})).rejects.toBeInstanceOf(VippsHttpError);
+    await expect(client.post('/epayment/v1/payments/fjord-order-1/capture', {}, { idempotencyKey: 'op-0001-aaaa' })).rejects.toBeInstanceOf(VippsHttpError);
     await expect(client.get('/epayment/v1/payments/fjord-order-1')).resolves.toEqual({ ok: true });
     expect(apiCalls(calls).map(call => call.method)).toEqual(['POST', 'GET', 'GET']);
   });

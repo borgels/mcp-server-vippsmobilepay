@@ -29,11 +29,13 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 | `vipps_refund_payment` | destructive | Refund all or part of a captured payment. |
 | `vipps_cancel_payment` | destructive | Cancel a payment; the reserved, uncaptured amount is released. |
 | `vipps_refund_charge` | destructive | Refund all or part of a charged Recurring charge. |
-| `vipps_cancel_charge` | destructive | Cancel a pending, due, reserved or partially captured charge. |
+| `vipps_cancel_charge` | destructive | Cancel a pending, due, reserved or partially captured charge; what is reserved and not captured is released. |
 
-**Before a write.** Capture and refund read the payment (or charge) first and refuse, without sending anything, when the currency differs from the payment's or the amount is more than can be captured or refunded. Capture needs an `AUTHORIZED` payment; cancelling a charge needs a cancellable status. Every write sends an `Idempotency-Key` (a fresh UUID, or the `idempotencyKey` given); repeat a key only to repeat the very same change.
+**Before a write.** Capture and refund read the payment (or charge) first and refuse, without sending anything, when the currency differs from the payment's or the amount is more than can be captured or refunded. Capture needs an `AUTHORIZED` payment; cancelling a charge needs a cancellable status. The payment's or charge's amounts must be whole, non-negative minor units that add up (nothing captured beyond what was authorized, nothing refunded beyond what was captured), and its currency one of NOK, DKK and EUR; otherwise the change is refused with a fixed text.
 
-**Cancelling a charge uses DELETE.** The Recurring API cancels a charge with `DELETE /recurring/v3/agreements/{agreementId}/charges/{chargeId}`. It is the only DELETE this server can send, and it deletes no record: the charge remains, with status `CANCELLED`.
+**Every write needs an operation key.** `idempotencyKey` (8-40 letters, digits or dashes) is required for all five write tools and is sent as `Idempotency-Key`; the server never makes one up, and a call without one is refused before anything is sent. The caller chooses a new key for each new change, records it before the call, and sends the same key when it repeats that change (after a timeout, an error or a lost answer). Vipps MobilePay carries out a key once and answers a repeat with the first result, so a repeated partial refund cannot pay out twice. The key comes back in the result.
+
+**Cancelling a charge uses DELETE.** The Recurring API cancels a charge with `DELETE /recurring/v3/agreements/{agreementId}/charges/{chargeId}`. It is the only DELETE this server can send, and it deletes no record: the charge remains. A pending, due or reserved charge ends as `CANCELLED`; a partially captured charge ends as `CHARGED`, with the rest released to the customer.
 
 **Lists are complete or refused.** Every list is read to its end. When a cap is reached the call fails with a refusal and returns nothing, rather than a list that looks complete but is not:
 
@@ -147,7 +149,7 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 |---|---|---|
 | `VIPPS_ENABLE_WRITES` | `false` | Enable the write tools. |
 | `VIPPS_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `vipps_` prefix. |
-| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with references, ids, dates, amounts and currency in clear text, a refund description hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
+| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ledger ids, dates, amounts and currency in clear text, payment references, agreement and charge ids and idempotency keys as `sha256:` pseudonyms, a refund description hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
 
 ### HTTP transport
 
@@ -181,16 +183,16 @@ const gateway = createVippsMobilePayGateway({
   policy: { enableWrites: true, allowedTools: ['get_payment', 'refund_payment'], audit: record => log(record) },
 });
 
-// Before a write: what it will change, for the host's log and a person's confirmation.
-const change = resolveVippsChange('refund_payment', { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' });
-// → { ok: true, change: { tool: 'refund_payment', action: 'refund', record: 'payment', movesMoney: true,
-//      values: { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' } } }
+// The host chooses the operation key, stores it with the pending change, and reuses it on every retry.
+const input = { reference: 'acme-order-10042', amount: 12550, currency: 'DKK', idempotencyKey: crypto.randomUUID() };
 
-const result = await gateway.callTool(
-  'refund_payment',
-  { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' },
-  { caller: 'user-17' },
-);
+// Before a write: what it will change, for the host's log and a person's confirmation.
+const change = resolveVippsChange('refund_payment', input, { pseudonymKey: hostSecret });
+// → { ok: true, change: { tool: 'refund_payment', action: 'refund', record: 'payment', movesMoney: true,
+//      values: { reference: 'hmac:3f9c…', amount: 12550, currency: 'DKK', idempotencyKey: 'hmac:81ad…' } } }
+
+const result = await gateway.callTool('refund_payment', input, { caller: 'user-17' });
+// result.structuredContent.idempotencyKey === input.idempotencyKey
 ```
 
 - **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required; a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
@@ -198,16 +200,15 @@ const result = await gateway.callTool(
 - **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating payments or charges, capturing a Recurring charge, and any other DELETE.
 - **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `destructive`), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney: true` and `logFields`, each with the one type its value must have:
 
-  | Type | Value |
-  |---|---|
-  | `amountMinor` | a whole number of minor units, 1 to 65 000 000 |
-  | `currency` | an ISO 4217 code in capitals (`NOK`, `DKK`, `EUR`) |
-  | `reference` | an ePayment reference, `^[a-zA-Z0-9-]{8,64}$` |
-  | `recurringId` | an agreement or charge id, `^[A-Za-z0-9_-]{1,64}$` |
-  | `idempotencyKey` | `^[A-Za-z0-9-]{8,40}$` |
-  | `flag` | true or false |
+  | Type | Fields | Value |
+  |---|---|---|
+  | `amountMinor` | `amount` | in clear: a whole number of minor units, 1 to 65 000 000 |
+  | `currency` | `currency` | in clear: `NOK`, `DKK` or `EUR` |
+  | `flag` | `cancelTransactionOnly` | in clear: true or false |
+  | `pseudonym` | `reference`, `agreementId`, `chargeId`, `idempotencyKey` | never in clear: `hmac:` and 16 hex characters of HMAC-SHA-256 with the host's `pseudonymKey`, or `sha256:` and 16 hex characters of SHA-256 without one |
 
-  Names and free text are never log fields (a refund's `description` is sent to Vipps MobilePay and only hashed in the audit log). `resolveVippsChange(tool, input)` validates the input as `callTool` does and returns the values.
+  The identifiers are pseudonyms because the caller chooses them: a reference may be any text of the allowed characters, a person's name among them. The same identifier always gets the same pseudonym, so log lines can be matched; give a `pseudonymKey` (a secret of the host) so that a guessable reference such as an order number cannot be found from its hash. Names and free text are never log fields (a refund's `description` is sent to Vipps MobilePay and only hashed in the audit log). `resolveVippsChange(tool, input, { pseudonymKey })` validates the input as `callTool` does, the operation key included, and returns the values.
+- **For a host such as letmcp.** Create the operation key when the change is drafted, keep it with the draft and in the log before the call, and call the tool with that same key when the person approves it and on every retry. Log `resolveVippsChange(...).change.values`, never the raw input.
 - **Several merchants in one process.** Each instance keeps its own access token and redacts with its own keys; nothing is kept in process-wide state.
 
 ## Threat model

@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { VippsHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
@@ -97,8 +96,12 @@ export interface ResponsePage<T> {
 
 /** Options of a request that changes something. */
 export interface WriteOptions {
-  /** Idempotency-Key header. Generated when omitted. */
-  idempotencyKey?: string;
+  /**
+   * Idempotency-Key header. Required: the caller chooses it, logs it before
+   * the request, and sends the same key when it repeats the same change, so
+   * Vipps MobilePay carries the change out once. It is never generated here.
+   */
+  idempotencyKey: string;
 }
 
 /** Response headers this server reads; every other header is dropped unread. */
@@ -179,9 +182,13 @@ const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
   ],
   // Vipps MobilePay cancels a Recurring charge with DELETE on the charge. It is
   // the only DELETE this server can send, and it deletes no record: the charge
-  // stays, with status CANCELLED.
+  // stays. A pending, due or reserved charge ends as CANCELLED; a partially
+  // captured one ends as CHARGED, with the rest released to the customer.
   DELETE: [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`)],
 };
+
+/** A dot segment, or an encoded dot or separator, in a path: never sent. */
+const DOT_OR_ENCODED_SEPARATOR = /(^|\/)\.{1,2}(\/|$)|%2e|%2f|%5c/i;
 
 /** Whether this server may send the request at all (see ALLOWED_REQUESTS). */
 export function isAllowedRequest(method: HttpMethod, path: string): boolean {
@@ -195,8 +202,8 @@ export function isAllowedRequest(method: HttpMethod, path: string): boolean {
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
   getPage<T>(path: string, query?: Record<string, QueryValue>, headers?: Record<string, string>): Promise<ResponsePage<T>>;
-  post<T>(path: string, body: unknown, options?: WriteOptions): Promise<T>;
-  delete<T>(path: string, options?: WriteOptions): Promise<T>;
+  post<T>(path: string, body: unknown, options: WriteOptions): Promise<T>;
+  delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
 }
@@ -335,11 +342,11 @@ export class VippsMobilePayClient implements UpstreamClient {
     return this.call<T>('GET', path, { query, headers });
   }
 
-  async post<T>(path: string, body: unknown, options: WriteOptions = {}): Promise<T> {
+  async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
     return (await this.call<T>('POST', path, { body, idempotencyKey: idempotencyKey(options) })).data;
   }
 
-  async delete<T>(path: string, options: WriteOptions = {}): Promise<T> {
+  async delete<T>(path: string, options: WriteOptions): Promise<T> {
     return (await this.call<T>('DELETE', path, { idempotencyKey: idempotencyKey(options) })).data;
   }
 
@@ -427,6 +434,12 @@ export class VippsMobilePayClient implements UpstreamClient {
       throw new Error(`Refused: this server never sends that ${method} request to Vipps MobilePay.`);
     }
     const url = this.buildUrl(normalizedPath, request.query);
+    // Checked again on the final URL, after the URL parser has resolved dot segments and encodings: the list
+    // holds for what is sent, not only for what was asked.
+    const finalPath = new URL(url).pathname;
+    if (!isAllowedRequest(method, finalPath) || finalPath !== normalizedPath || DOT_OR_ENCODED_SEPARATOR.test(normalizedPath)) {
+      throw new Error(`Refused: this server never sends that ${method} request to Vipps MobilePay.`);
+    }
     for (let attempt = 1; ; attempt += 1) {
       const token = await this.accessToken();
       const { subscriptionKey } = this.credentials();
@@ -557,11 +570,10 @@ export class VippsMobilePayClient implements UpstreamClient {
   }
 }
 
-function idempotencyKey(options: WriteOptions): string {
-  const given = options.idempotencyKey;
-  if (given === undefined) return randomUUID();
+function idempotencyKey(options: WriteOptions | undefined): string {
+  const given = options?.idempotencyKey;
   if (typeof given !== 'string' || !IDEMPOTENCY_KEY_PATTERN.test(given)) {
-    throw new Error('idempotencyKey must be 8 to 40 letters, digits or dashes.');
+    throw new Error('Refused: a change needs an idempotencyKey of 8 to 40 letters, digits or dashes. Nothing was sent.');
   }
   return given;
 }

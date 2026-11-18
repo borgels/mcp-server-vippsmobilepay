@@ -1,7 +1,7 @@
 import { nestedFailureText } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
-import type { MerchantCurrency } from './values.js';
+import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
 
 /**
  * ePayment API: read one payment and its events; capture, refund or cancel it.
@@ -47,12 +47,12 @@ export async function getPayment(client: UpstreamClient, input: { reference: str
 /** An Amount object's value in minor units, or undefined. */
 function amountValue(amount: unknown): number | undefined {
   const value = asRecord(amount).value;
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+  return isMinorUnits(value) ? value : undefined;
 }
 
 interface PaymentFigures {
   state: string;
-  currency: string;
+  currency: MerchantCurrency;
   authorized: number;
   captured: number;
   cancelled: number;
@@ -71,12 +71,17 @@ async function paymentFigures(client: UpstreamClient, reference: string): Promis
     cancelled: amountValue(aggregate.cancelledAmount),
     refunded: amountValue(aggregate.refundedAmount),
   };
+  const { authorized, captured, cancelled, refunded } = figures;
   if (
-    !figures.currency ||
-    figures.authorized === undefined ||
-    figures.captured === undefined ||
-    figures.cancelled === undefined ||
-    figures.refunded === undefined
+    !isMerchantCurrency(figures.currency) ||
+    authorized === undefined ||
+    captured === undefined ||
+    cancelled === undefined ||
+    refunded === undefined ||
+    // The sums must hold together: nothing captured or cancelled beyond what was authorized, nothing refunded
+    // beyond what was captured.
+    captured + cancelled > authorized ||
+    refunded > captured
   ) {
     throw new ChangeRefusedError('Refused: the payment could not be read in the expected form, so nothing was sent.');
   }
@@ -87,14 +92,14 @@ export interface MoneyChangeInput {
   reference: string;
   amount: number;
   currency: MerchantCurrency;
-  idempotencyKey?: string;
+  /** Chosen by the caller, logged before the call, and reused when the same change is repeated. */
+  idempotencyKey: string;
 }
 
-function checkCurrency(figures: { currency: string }, currency: string): void {
+function checkCurrency(figures: { currency: MerchantCurrency }, currency: MerchantCurrency): void {
   if (figures.currency !== currency) {
-    throw new ChangeRefusedError(
-      `Refused: the payment is in ${figures.currency}, not ${currency}. Nothing was sent.`,
-    );
+    // Fixed text, our own enum values only.
+    throw new ChangeRefusedError(`Refused: the payment is in ${figures.currency}, not ${currency}. Nothing was sent.`);
   }
 }
 
@@ -110,11 +115,12 @@ export async function capturePayment(client: UpstreamClient, input: MoneyChangeI
       `Refused: ${input.amount} is more than the ${Math.max(0, capturable)} (minor units) left to capture. Nothing was sent.`,
     );
   }
-  return client.post(
+  const payment = await client.post(
     `${paymentPath(input.reference)}/capture`,
     { modificationAmount: { currency: input.currency, value: input.amount } },
     { idempotencyKey: input.idempotencyKey },
   );
+  return { idempotencyKey: input.idempotencyKey, payment };
 }
 
 export async function refundPayment(client: UpstreamClient, input: MoneyChangeInput): Promise<unknown> {
@@ -126,20 +132,22 @@ export async function refundPayment(client: UpstreamClient, input: MoneyChangeIn
       `Refused: ${input.amount} is more than the ${Math.max(0, refundable)} (minor units) captured and not yet refunded. Nothing was sent.`,
     );
   }
-  return client.post(
+  const payment = await client.post(
     `${paymentPath(input.reference)}/refund`,
     { modificationAmount: { currency: input.currency, value: input.amount } },
     { idempotencyKey: input.idempotencyKey },
   );
+  return { idempotencyKey: input.idempotencyKey, payment };
 }
 
 export async function cancelPayment(
   client: UpstreamClient,
-  input: { reference: string; cancelTransactionOnly?: boolean; idempotencyKey?: string },
+  input: { reference: string; cancelTransactionOnly?: boolean; idempotencyKey: string },
 ): Promise<unknown> {
-  return client.post(
+  const payment = await client.post(
     `${paymentPath(input.reference)}/cancel`,
     input.cancelTransactionOnly === undefined ? {} : { cancelTransactionOnly: input.cancelTransactionOnly },
     { idempotencyKey: input.idempotencyKey },
   );
+  return { idempotencyKey: input.idempotencyKey, payment };
 }

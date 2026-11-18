@@ -8,7 +8,9 @@ import {
 } from '../vipps/annotations.js';
 import { assertAuditLogWritable, auditTarget, newRequestId, writeAuditEvent } from '../vipps/audit.js';
 import { IDEMPOTENCY_KEY_PATTERN, readOnlyClient, type UpstreamClient, type VippsKeyType } from '../vipps/client.js';
-import { formatUnknownError, type SecretRedactor } from '../errors.js';
+import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
+import { withheldResult } from '../fallbacks.js';
+import { leaksSecret } from '../key-admission.js';
 import { cancelPayment, capturePayment, getPayment, refundPayment } from '../vipps/payments.js';
 import {
   AGREEMENT_STATUSES,
@@ -32,11 +34,12 @@ import {
 import {
   daysBetween,
   isAmountMinor,
-  isCurrencyCode,
   isIsoDate,
+  isMerchantCurrency,
   LEDGER_ID_PATTERN,
   MAX_AMOUNT_MINOR,
   MERCHANT_CURRENCIES,
+  pseudonym,
   RECURRING_ID_PATTERN,
   REFERENCE_PATTERN,
 } from '../vipps/values.js';
@@ -66,14 +69,17 @@ export type VippsChangeAction = 'capture' | 'refund' | 'cancel';
 
 /**
  * The type a logged value must have; anything else is left out of the values.
- *   amountMinor     a whole number of minor units, 1 to 65 000 000
- *   currency        an ISO 4217 code written in capitals (NOK, DKK, EUR)
- *   reference       an ePayment reference: ^[a-zA-Z0-9-]{8,64}$
- *   recurringId     a Recurring agreement or charge id: ^[A-Za-z0-9_-]{1,64}$
- *   idempotencyKey  ^[A-Za-z0-9-]{8,40}$
- *   flag            true or false
+ *   amountMinor  a whole number of minor units, 1 to 65 000 000, in clear
+ *   currency     one of NOK, DKK, EUR, in clear
+ *   flag         true or false, in clear
+ *   pseudonym    an identifier the caller chose (payment reference, agreement
+ *                or charge id, idempotency key). It can be any text of the
+ *                allowed characters, a name among them, so it is never logged
+ *                in clear: the value is "sha256:" and 16 hex characters of its
+ *                SHA-256, or "hmac:" and 16 hex characters of its HMAC-SHA-256
+ *                when the host gives a key (see pseudonym()).
  */
-export type VippsLogFieldType = 'amountMinor' | 'currency' | 'reference' | 'recurringId' | 'idempotencyKey' | 'flag';
+export type VippsLogFieldType = 'amountMinor' | 'currency' | 'flag' | 'pseudonym';
 
 export interface VippsLogField {
   readonly name: string;
@@ -166,8 +172,9 @@ const currencySchema = z.enum(MERCHANT_CURRENCIES).describe('ISO 4217 currency c
 const idempotencyKeySchema = z
   .string()
   .regex(IDEMPOTENCY_KEY_PATTERN)
-  .optional()
-  .describe('Optional Idempotency-Key (8-40 letters, digits or dashes). Reuse a key only to repeat the very same change.');
+  .describe(
+    'Required operation key (8-40 letters, digits or dashes), sent as Idempotency-Key. Choose a new one for each new change, record it before the call, and send the same key when repeating that change after a failure or a lost answer: Vipps MobilePay then carries it out only once.',
+  );
 
 const periodShape = {
   ledgerId: ledgerIdSchema,
@@ -336,10 +343,10 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     ],
     keyTypes: ALL_KEYS,
     change: change('capture', 'payment', {
-      reference: 'reference',
+      reference: 'pseudonym',
       amount: 'amountMinor',
       currency: 'currency',
-      idempotencyKey: 'idempotencyKey',
+      idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => capturePayment(client, input),
   }),
@@ -357,10 +364,10 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     ],
     keyTypes: ALL_KEYS,
     change: change('refund', 'payment', {
-      reference: 'reference',
+      reference: 'pseudonym',
       amount: 'amountMinor',
       currency: 'currency',
-      idempotencyKey: 'idempotencyKey',
+      idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => refundPayment(client, input),
   }),
@@ -379,9 +386,9 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     upstream: [{ access: 'write', method: 'POST', path: '/epayment/v1/payments/{reference}/cancel' }],
     keyTypes: ALL_KEYS,
     change: change('cancel', 'payment', {
-      reference: 'reference',
+      reference: 'pseudonym',
       cancelTransactionOnly: 'flag',
-      idempotencyKey: 'idempotencyKey',
+      idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => cancelPayment(client, input),
   }),
@@ -406,18 +413,18 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     ],
     keyTypes: ALL_KEYS,
     change: change('refund', 'charge', {
-      agreementId: 'recurringId',
-      chargeId: 'recurringId',
+      agreementId: 'pseudonym',
+      chargeId: 'pseudonym',
       amount: 'amountMinor',
       currency: 'currency',
-      idempotencyKey: 'idempotencyKey',
+      idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => refundCharge(client, input),
   }),
   defineTool({
     name: 'vipps_cancel_charge',
     title: 'Cancel Recurring charge (Vipps MobilePay)',
-    description: `Cancel a pending, due, reserved or partially captured Recurring charge; money reserved for it is released to the customer. Reads the charge first and refuses any other status. The agreement itself is not changed. ${WRITE_NOTE}`,
+    description: `Cancel a pending, due, reserved or partially captured Recurring charge; money reserved and not captured is released to the customer. A pending, due or reserved charge ends as CANCELLED, a partially captured one as CHARGED. Reads the charge first and refuses any other status. The agreement itself is not changed. ${WRITE_NOTE}`,
     inputShape: { agreementId: agreementIdSchema, chargeId: chargeIdSchema, idempotencyKey: idempotencyKeySchema },
     annotations: WRITE_TOOL_ANNOTATIONS,
     returnsUpstreamContent: false,
@@ -428,9 +435,9 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     ],
     keyTypes: ALL_KEYS,
     change: change('cancel', 'charge', {
-      agreementId: 'recurringId',
-      chargeId: 'recurringId',
-      idempotencyKey: 'idempotencyKey',
+      agreementId: 'pseudonym',
+      chargeId: 'pseudonym',
+      idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => cancelCharge(client, input),
   }),
@@ -440,21 +447,24 @@ export function findTool(name: string): ToolDefinition | undefined {
   return VIPPS_TOOLS.find(tool => tool.name === name);
 }
 
-/** The value of one log field when it has exactly the field's type; otherwise undefined. */
-export function logFieldValue(type: VippsLogFieldType, value: unknown): string | number | boolean | undefined {
+/**
+ * The value of one log field when it has exactly the field's type; otherwise
+ * undefined. Identifiers come back only as pseudonyms, never in clear.
+ */
+export function logFieldValue(
+  type: VippsLogFieldType,
+  value: unknown,
+  pseudonymKey?: string | Uint8Array,
+): string | number | boolean | undefined {
   switch (type) {
     case 'amountMinor':
       return isAmountMinor(value) ? value : undefined;
     case 'currency':
-      return isCurrencyCode(value) ? value : undefined;
-    case 'reference':
-      return typeof value === 'string' && REFERENCE_PATTERN.test(value) ? value : undefined;
-    case 'recurringId':
-      return typeof value === 'string' && RECURRING_ID_PATTERN.test(value) ? value : undefined;
-    case 'idempotencyKey':
-      return typeof value === 'string' && IDEMPOTENCY_KEY_PATTERN.test(value) ? value : undefined;
+      return isMerchantCurrency(value) ? value : undefined;
     case 'flag':
       return typeof value === 'boolean' ? value : undefined;
+    case 'pseudonym':
+      return typeof value === 'string' && value.length > 0 && value.length <= 100 ? pseudonym(value, pseudonymKey) : undefined;
     default:
       return undefined;
   }
@@ -493,14 +503,17 @@ export function registerTools(server: McpServer, client: RedactingClient): void 
         annotations: tool.annotations,
       },
       async (input: Record<string, unknown>) => {
+        let result: { content: Array<{ type: 'text'; text: string }>; isError?: true };
         try {
-          return mcpToolResult(tool, await runInCallScope({ redactor: client.redactor }, () => executeTool(tool, client, input)));
+          const data = await runInCallScope({ redactor: client.redactor }, () => executeTool(tool, client, input));
+          // Upstream data can echo a key or the token, in values or in object keys: redacted as data before it
+          // is serialised (a serialised key is escaped and no longer matches).
+          result = mcpToolResult(tool, redactDeep(redactDeep(data, client.redactor), client.redactor));
         } catch (error) {
-          return {
-            isError: true,
-            content: [{ type: 'text' as const, text: formatUnknownError(error, client.redactor) }],
-          };
+          result = { isError: true, content: [{ type: 'text', text: formatUnknownError(error, client.redactor) }] };
         }
+        // The gateway's last check: a result that still holds a piece of a key is withheld whole.
+        return leaksSecret(result, client.redactor) ? withheldResult() : result;
       },
     );
   }

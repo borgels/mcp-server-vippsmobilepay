@@ -1,3 +1,5 @@
+import { createHash, createHmac } from 'node:crypto';
+
 /**
  * The shapes of the values tools accept, shared by input validation, the
  * change log fields and the API calls. Each is strict: a value that does not
@@ -56,4 +58,28 @@ export function datesBetween(from: string, to: string): string[] {
 export function daysBetween(from: string, to: string): number {
   const days = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1;
   return Math.max(0, days);
+}
+
+/**
+ * A pseudonym for an identifier the caller chose (a payment reference, an
+ * agreement or charge id, an idempotency key). A reference can be any text of
+ * the right characters, a name among them, so it is never logged in clear:
+ * `hmac:` and 16 hex characters of HMAC-SHA-256 with the host's key when one
+ * is given, otherwise `sha256:` and 16 hex characters of SHA-256. The same
+ * identifier always gets the same pseudonym, so a host can match log lines.
+ */
+export function pseudonym(value: string, key?: string | Uint8Array): string {
+  return key === undefined
+    ? `sha256:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`
+    : `hmac:${createHmac('sha256', key).update(value).digest('hex').slice(0, 16)}`;
+}
+
+/** Whether a value is a whole number of minor units that can be counted on: a safe integer of 0 or more. */
+export function isMinorUnits(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Whether a value is one of the currencies a merchant uses. */
+export function isMerchantCurrency(value: unknown): value is MerchantCurrency {
+  return typeof value === 'string' && (MERCHANT_CURRENCIES as readonly string[]).includes(value);
 }

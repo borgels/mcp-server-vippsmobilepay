@@ -2,7 +2,7 @@ import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { ChangeRefusedError } from './payments.js';
 import { TooMuchDataError } from './reports.js';
-import type { MerchantCurrency } from './values.js';
+import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
 
 /**
  * Recurring API (v3): agreements and their charges; refund or cancel one
@@ -131,7 +131,8 @@ export interface ChargeRefundInput {
   amount: number;
   currency: MerchantCurrency;
   description: string;
-  idempotencyKey?: string;
+  /** Chosen by the caller, logged before the call, and reused when the same change is repeated. */
+  idempotencyKey: string;
 }
 
 export async function refundCharge(client: UpstreamClient, input: ChargeRefundInput): Promise<unknown> {
@@ -139,7 +140,7 @@ export async function refundCharge(client: UpstreamClient, input: ChargeRefundIn
   const summary = asRecord(charge.summary);
   const captured = summary.captured;
   const refunded = summary.refunded;
-  if (typeof charge.currency !== 'string' || typeof captured !== 'number' || typeof refunded !== 'number') {
+  if (!isMerchantCurrency(charge.currency) || !isMinorUnits(captured) || !isMinorUnits(refunded) || refunded > captured) {
     throw new ChangeRefusedError('Refused: the charge could not be read in the expected form, so nothing was sent.');
   }
   if (charge.currency !== input.currency) {
@@ -158,6 +159,7 @@ export async function refundCharge(client: UpstreamClient, input: ChargeRefundIn
   );
   return {
     refundRequested: true,
+    idempotencyKey: input.idempotencyKey,
     agreementId: input.agreementId,
     chargeId: input.chargeId,
     amount: input.amount,
@@ -167,7 +169,7 @@ export async function refundCharge(client: UpstreamClient, input: ChargeRefundIn
 
 export async function cancelCharge(
   client: UpstreamClient,
-  input: { agreementId: string; chargeId: string; idempotencyKey?: string },
+  input: { agreementId: string; chargeId: string; idempotencyKey: string },
 ): Promise<unknown> {
   const charge = asRecord(await client.get(chargePath(input.agreementId, input.chargeId)));
   const status = typeof charge.status === 'string' ? charge.status : '';
@@ -177,5 +179,11 @@ export async function cancelCharge(
     );
   }
   await client.delete(chargePath(input.agreementId, input.chargeId), { idempotencyKey: input.idempotencyKey });
-  return { cancelRequested: true, agreementId: input.agreementId, chargeId: input.chargeId, previousStatus: status };
+  return {
+    cancelRequested: true,
+    idempotencyKey: input.idempotencyKey,
+    agreementId: input.agreementId,
+    chargeId: input.chargeId,
+    previousStatus: status,
+  };
 }

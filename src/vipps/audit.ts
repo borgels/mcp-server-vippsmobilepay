@@ -7,6 +7,7 @@ import { STDERR_WITHHELD, withheldAuditRecord } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import { ConfigError, readEnvString } from '../config-env.js';
 import { currentInstancePolicy, currentRedactor } from './policy.js';
+import { pseudonym } from './values.js';
 
 export interface AuditEvent {
   /** Shared by all events of one tool call (start/finish/error). */
@@ -137,16 +138,12 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
 }
 
 /**
- * Fields logged in clear text: ids, references, dates, amounts in minor units
- * and currency codes. They are checked against the tool's input schema before
- * a call runs, so they hold no free text. Names and texts are never logged.
+ * Fields logged in clear text: provider ledger ids (digits), dates, enum
+ * values, amounts in minor units, currency codes and flags. They are checked
+ * against the tool's input schema before a call runs.
  */
 const ID_FIELDS = [
-  'reference',
-  'agreementId',
-  'chargeId',
   'ledgerId',
-  'idempotencyKey',
   'topic',
   'status',
   'fromDate',
@@ -156,6 +153,13 @@ const ID_FIELDS = [
   'currency',
   'cancelTransactionOnly',
 ] as const;
+
+/**
+ * Identifiers the caller chose (a payment reference can be any text of the
+ * allowed characters, a name among them): logged only as their pseudonym,
+ * the same one resolveVippsChange gives without a host key.
+ */
+const PSEUDONYM_FIELDS = ['reference', 'agreementId', 'chargeId', 'idempotencyKey'] as const;
 
 /** Free-text fields are hashed so user-written text does not land in the log. */
 const FREE_TEXT_FIELDS = ['description'] as const;
@@ -175,6 +179,12 @@ export function auditTarget(input: unknown): Record<string, unknown> | undefined
   for (const field of ID_FIELDS) {
     if (value[field] !== undefined) {
       target[field] = value[field];
+    }
+  }
+
+  for (const field of PSEUDONYM_FIELDS) {
+    if (typeof value[field] === 'string' && value[field] !== '') {
+      target[field] = pseudonym(value[field] as string);
     }
   }
 
