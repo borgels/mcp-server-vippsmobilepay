@@ -135,6 +135,25 @@ export interface ChargeRefundInput {
   idempotencyKey: string;
 }
 
+/**
+ * Whether the charge's history holds a successful event of this very change:
+ * the same Idempotency-Key, the expected event and, for a refund, the same
+ * amount. Used only when the check before a change would refuse it, so a
+ * retry whose first answer was lost learns that it was done.
+ */
+function hasEarlierEvent(charge: Record<string, unknown>, idempotencyKey: string, event: 'REFUND' | 'CANCEL', amount?: number): boolean {
+  const history = Array.isArray(charge.history) ? charge.history : [];
+  return history.some(entry => {
+    const item = asRecord(entry);
+    return (
+      item.idempotencyKey === idempotencyKey &&
+      item.event === event &&
+      item.success === true &&
+      (amount === undefined || item.amount === amount)
+    );
+  });
+}
+
 export async function refundCharge(client: UpstreamClient, input: ChargeRefundInput): Promise<unknown> {
   const charge = asRecord(await client.get(chargePath(input.agreementId, input.chargeId)));
   const summary = asRecord(charge.summary);
@@ -148,6 +167,17 @@ export async function refundCharge(client: UpstreamClient, input: ChargeRefundIn
   }
   const refundable = captured - refunded;
   if (input.amount > refundable) {
+    if (hasEarlierEvent(charge, input.idempotencyKey, 'REFUND', input.amount)) {
+      return {
+        refundRequested: true,
+        alreadyDone: true,
+        idempotencyKey: input.idempotencyKey,
+        agreementId: input.agreementId,
+        chargeId: input.chargeId,
+        amount: input.amount,
+        currency: input.currency,
+      };
+    }
     throw new ChangeRefusedError(
       `Refused: ${input.amount} is more than the ${Math.max(0, refundable)} (minor units) charged and not yet refunded. Nothing was sent.`,
     );
@@ -174,6 +204,15 @@ export async function cancelCharge(
   const charge = asRecord(await client.get(chargePath(input.agreementId, input.chargeId)));
   const status = typeof charge.status === 'string' ? charge.status : '';
   if (!CANCELLABLE_CHARGE_STATUSES.has(status)) {
+    if (hasEarlierEvent(charge, input.idempotencyKey, 'CANCEL')) {
+      return {
+        cancelRequested: true,
+        alreadyDone: true,
+        idempotencyKey: input.idempotencyKey,
+        agreementId: input.agreementId,
+        chargeId: input.chargeId,
+      };
+    }
     throw new ChangeRefusedError(
       'Refused: only a pending, due, reserved or partially captured charge can be cancelled. Nothing was sent.',
     );

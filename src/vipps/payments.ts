@@ -103,6 +103,38 @@ function checkCurrency(figures: { currency: MerchantCurrency }, currency: Mercha
   }
 }
 
+/**
+ * The earlier, successful event of this very change, when one exists: an
+ * event of the payment with the same Idempotency-Key, the expected name, the
+ * same amount and currency, and success true. Used only when the amount check
+ * would refuse a call: a retry of a change that was carried out, whose answer
+ * was lost, then learns that it was done instead of being refused.
+ */
+async function earlierEvent(
+  client: UpstreamClient,
+  input: MoneyChangeInput,
+  name: 'CAPTURED' | 'REFUNDED',
+): Promise<{ name: string; amount: { currency: MerchantCurrency; value: number }; timestamp: string | null } | undefined> {
+  // When the events cannot be read, the change is refused as before: nothing is sent either way.
+  const events = await client.get(`${paymentPath(input.reference)}/events`).catch(() => undefined);
+  if (!Array.isArray(events)) return undefined;
+  for (const entry of events) {
+    const event = asRecord(entry);
+    const amount = asRecord(event.amount);
+    if (
+      event.idempotencyKey === input.idempotencyKey &&
+      event.name === name &&
+      event.success === true &&
+      amount.value === input.amount &&
+      amount.currency === input.currency
+    ) {
+      const timestamp = typeof event.timestamp === 'string' && /^[\dT:.+Z-]{10,40}$/.test(event.timestamp) ? event.timestamp : null;
+      return { name, amount: { currency: input.currency, value: input.amount }, timestamp };
+    }
+  }
+  return undefined;
+}
+
 export async function capturePayment(client: UpstreamClient, input: MoneyChangeInput): Promise<unknown> {
   const figures = await paymentFigures(client, input.reference);
   if (figures.state !== 'AUTHORIZED') {
@@ -111,6 +143,8 @@ export async function capturePayment(client: UpstreamClient, input: MoneyChangeI
   checkCurrency(figures, input.currency);
   const capturable = figures.authorized - figures.captured - figures.cancelled;
   if (input.amount > capturable) {
+    const done = await earlierEvent(client, input, 'CAPTURED');
+    if (done) return { idempotencyKey: input.idempotencyKey, alreadyDone: true, event: done };
     throw new ChangeRefusedError(
       `Refused: ${input.amount} is more than the ${Math.max(0, capturable)} (minor units) left to capture. Nothing was sent.`,
     );
@@ -128,6 +162,8 @@ export async function refundPayment(client: UpstreamClient, input: MoneyChangeIn
   checkCurrency(figures, input.currency);
   const refundable = figures.captured - figures.refunded;
   if (input.amount > refundable) {
+    const done = await earlierEvent(client, input, 'REFUNDED');
+    if (done) return { idempotencyKey: input.idempotencyKey, alreadyDone: true, event: done };
     throw new ChangeRefusedError(
       `Refused: ${input.amount} is more than the ${Math.max(0, refundable)} (minor units) captured and not yet refunded. Nothing was sent.`,
     );

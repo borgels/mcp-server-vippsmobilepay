@@ -335,3 +335,132 @@ describe('resolveVippsChange', () => {
     expect(resolveVippsChange('capture_payment', { reference: 'Test Person', amount: 100, currency: 'DKK', idempotencyKey: KEY })).toMatchObject({ ok: false });
   });
 });
+
+describe('a retry with the same key after a lost answer', () => {
+  it('ePayment: a full refund whose answer was lost is reported as already done, not refused', async () => {
+    let refunded = 0;
+    const events: unknown[] = [{ name: 'CAPTURED', amount: { currency: 'DKK', value: 10_000 }, idempotencyKey: 'op-capture-aaaa', success: true }];
+    const state = () =>
+      payment({
+        aggregate: {
+          authorizedAmount: { currency: 'DKK', value: 10_000 },
+          capturedAmount: { currency: 'DKK', value: 10_000 },
+          cancelledAmount: { currency: 'DKK', value: 0 },
+          refundedAmount: { currency: 'DKK', value: refunded },
+        },
+      });
+    const { gw, calls } = gateway(
+      {
+        [`GET ${PAY}`]: () => ({ body: state() }),
+        [`GET ${PAY}/events`]: () => ({ body: events }),
+        [`POST ${PAY}/refund`]: (_url, init) => {
+          // Carried out at Vipps MobilePay, but the answer never arrives.
+          refunded = 10_000;
+          const key = (init.headers as Record<string, string>)['Idempotency-Key'];
+          events.push({ name: 'REFUNDED', amount: { currency: 'DKK', value: 10_000 }, idempotencyKey: key, success: true, timestamp: '2026-11-18T12:00:00Z' });
+          return { status: 504 };
+        },
+      },
+      WRITES,
+    );
+    const input = { reference: 'fjord-order-10042', amount: 10_000, currency: 'DKK', idempotencyKey: 'op-refund-aaaa' };
+    expect((await gw.callTool('refund_payment', input)).isError).toBe(true);
+
+    const retry = await gw.callTool('refund_payment', input);
+    expect(retry.isError).toBeUndefined();
+    expect(retry.structuredContent).toEqual({
+      idempotencyKey: 'op-refund-aaaa',
+      alreadyDone: true,
+      event: { name: 'REFUNDED', amount: { currency: 'DKK', value: 10_000 }, timestamp: '2026-11-18T12:00:00Z' },
+    });
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(1);
+
+    // Another key, or the same key with another amount, is a different change: refused as before.
+    for (const other of [{ ...input, idempotencyKey: 'op-refund-bbbb' }, { ...input, amount: 9_999 }]) {
+      const result = await gw.callTool('refund_payment', other);
+      expect(result.isError).toBe(true);
+      expect(texts(result)[0]).toMatch(/Nothing was sent/);
+    }
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(1);
+  });
+
+  it('ePayment: refuses as before when the events cannot be read', async () => {
+    const { gw, calls } = gateway(
+      {
+        [`GET ${PAY}`]: { body: payment() },
+        [`GET ${PAY}/events`]: { status: 500 },
+      },
+      WRITES,
+    );
+    const result = await gw.callTool('capture_payment', { reference: 'fjord-order-10042', amount: 49_901, currency: 'DKK', idempotencyKey: KEY });
+    expect(texts(result)[0]).toMatch(/more than the 49900.*Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it('Recurring: a full charge refund whose answer was lost is reported as already done, not refused', async () => {
+    let refunded = 0;
+    const history: unknown[] = [{ event: 'CAPTURE', amount: 19_900, idempotencyKey: 'op-charge-aaaa', success: true, occurred: '2026-11-01T00:00:00Z' }];
+    const { gw, calls } = gateway(
+      {
+        [`GET ${CHARGE}`]: () => ({ body: charge({ summary: { captured: 19_900, refunded, cancelled: 0 }, history }) }),
+        [`POST ${CHARGE}/refund`]: (_url, init) => {
+          refunded = 19_900;
+          const key = (init.headers as Record<string, string>)['Idempotency-Key'];
+          history.push({ event: 'REFUND', amount: 19_900, idempotencyKey: key, success: true, occurred: '2026-11-18T12:00:00Z' });
+          return { status: 504 };
+        },
+      },
+      WRITES,
+    );
+    const input = {
+      agreementId: 'agr_7TqP2m',
+      chargeId: 'chr-5kSeqz',
+      amount: 19_900,
+      currency: 'DKK',
+      description: 'Leveringen udeblev',
+      idempotencyKey: 'op-refund-cccc',
+    };
+    expect((await gw.callTool('refund_charge', input)).isError).toBe(true);
+
+    const retry = await gw.callTool('refund_charge', input);
+    expect(retry.isError).toBeUndefined();
+    expect(retry.structuredContent).toEqual({
+      refundRequested: true,
+      alreadyDone: true,
+      idempotencyKey: 'op-refund-cccc',
+      agreementId: 'agr_7TqP2m',
+      chargeId: 'chr-5kSeqz',
+      amount: 19_900,
+      currency: 'DKK',
+    });
+    const other = await gw.callTool('refund_charge', { ...input, idempotencyKey: 'op-refund-dddd' });
+    expect(texts(other)[0]).toMatch(/Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(1);
+  });
+
+  it('Recurring: a cancellation whose answer was lost is reported as already done', async () => {
+    let status = 'PENDING';
+    const history: unknown[] = [];
+    const { gw, calls } = gateway(
+      {
+        [`GET ${CHARGE}`]: () => ({ body: charge({ status, history }) }),
+        [`DELETE ${CHARGE}`]: (_url, init) => {
+          status = 'CANCELLED';
+          history.push({ event: 'CANCEL', amount: 19_900, idempotencyKey: (init.headers as Record<string, string>)['Idempotency-Key'], success: true });
+          return { status: 504 };
+        },
+      },
+      WRITES,
+    );
+    const input = { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-cancel-aaaa' };
+    expect((await gw.callTool('cancel_charge', input)).isError).toBe(true);
+    expect((await gw.callTool('cancel_charge', input)).structuredContent).toEqual({
+      cancelRequested: true,
+      alreadyDone: true,
+      idempotencyKey: 'op-cancel-aaaa',
+      agreementId: 'agr_7TqP2m',
+      chargeId: 'chr-5kSeqz',
+    });
+    expect(apiCalls(calls).filter(call => call.method === 'DELETE')).toHaveLength(1);
+  });
+});

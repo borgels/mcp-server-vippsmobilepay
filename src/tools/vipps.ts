@@ -339,6 +339,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     summary: 'Captured payment.',
     upstream: [
       { access: 'read', method: 'GET', path: '/epayment/v1/payments/{reference}' },
+      { access: 'read', method: 'GET', path: '/epayment/v1/payments/{reference}/events' },
       { access: 'write', method: 'POST', path: '/epayment/v1/payments/{reference}/capture' },
     ],
     keyTypes: ALL_KEYS,
@@ -360,6 +361,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     summary: 'Refunded payment.',
     upstream: [
       { access: 'read', method: 'GET', path: '/epayment/v1/payments/{reference}' },
+      { access: 'read', method: 'GET', path: '/epayment/v1/payments/{reference}/events' },
       { access: 'write', method: 'POST', path: '/epayment/v1/payments/{reference}/refund' },
     ],
     keyTypes: ALL_KEYS,
