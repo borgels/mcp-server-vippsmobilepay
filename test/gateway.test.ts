@@ -175,7 +175,12 @@ describe('tool catalog', () => {
       expect(result.isError, `${entry.name}: ${texts(result).join(' ')}`).toBeUndefined();
       const made = [...new Set(apiCalls(calls).map(call => `${call.method} ${template(call)}`))].sort();
       const declared = entry.upstream.map(operation => `${operation.method} ${operation.path}`).sort();
-      const expected = entry.name === 'list_transactions' ? declared.filter(item => item.includes('/fees/')) : declared;
+      // The events of a payment are read only when a capture or refund would be refused (a retry of a change
+      // already carried out); tested in writes.test.ts.
+      const conditional = ['capture_payment', 'refund_payment'].includes(entry.name) ? ['GET /epayment/v1/payments/{reference}/events'] : [];
+      const expected = (entry.name === 'list_transactions' ? declared.filter(item => item.includes('/fees/')) : declared).filter(
+        item => !conditional.includes(item),
+      );
       expect(made, entry.name).toEqual(expected);
     }
   });
