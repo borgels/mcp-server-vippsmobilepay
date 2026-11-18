@@ -464,3 +464,143 @@ describe('a retry with the same key after a lost answer', () => {
     expect(apiCalls(calls).filter(call => call.method === 'DELETE')).toHaveLength(1);
   });
 });
+
+describe('looking up an earlier change before refusing', () => {
+  const fullyRefunded = () =>
+    payment({
+      aggregate: {
+        authorizedAmount: { currency: 'DKK', value: 10_000 },
+        capturedAmount: { currency: 'DKK', value: 10_000 },
+        cancelledAmount: { currency: 'DKK', value: 0 },
+        refundedAmount: { currency: 'DKK', value: 10_000 },
+      },
+    });
+  const event = (overrides: Record<string, unknown> = {}) => ({
+    name: 'REFUNDED',
+    amount: { currency: 'DKK', value: 10_000 },
+    idempotencyKey: 'op-retry-aaaa',
+    success: true,
+    timestamp: '2026-11-18T12:00:00Z',
+    ...overrides,
+  });
+  const moneyInput = { reference: 'fjord-order-10042', amount: 10_000, currency: 'DKK', idempotencyKey: 'op-retry-aaaa' };
+
+  it('ePayment: a capture retried with the same key after a lost answer is reported as already done', async () => {
+    const { gw, calls } = gateway(
+      {
+        [`GET ${PAY}`]: {
+          body: payment({
+            aggregate: {
+              authorizedAmount: { currency: 'DKK', value: 49_900 },
+              capturedAmount: { currency: 'DKK', value: 49_900 },
+              cancelledAmount: { currency: 'DKK', value: 0 },
+              refundedAmount: { currency: 'DKK', value: 0 },
+            },
+          }),
+        },
+        [`GET ${PAY}/events`]: { body: [event({ name: 'CAPTURED', amount: { currency: 'DKK', value: 49_900 } })] },
+      },
+      WRITES,
+    );
+    const result = await gw.callTool('capture_payment', { ...moneyInput, amount: 49_900 });
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toEqual({
+      idempotencyKey: 'op-retry-aaaa',
+      alreadyDone: true,
+      event: { name: 'CAPTURED', amount: { currency: 'DKK', value: 49_900 }, timestamp: '2026-11-18T12:00:00Z' },
+    });
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it.each([
+    ['the wrong event type', [event({ name: 'CAPTURED' })]],
+    ['success false', [event({ success: false })]],
+    ['the wrong currency', [event({ amount: { currency: 'NOK', value: 10_000 } })]],
+    ['another amount', [event({ amount: { currency: 'DKK', value: 9_999 } })]],
+    ['another key', [event({ idempotencyKey: 'op-retry-bbbb' })]],
+    ['events that are not a list', { events: [event()] }],
+    ['an empty list', []],
+    ['entries that are not objects', [null, 'REFUNDED', 42, [event()]]],
+  ])('ePayment: refuses a refund retry when the events hold %s', async (_label, events) => {
+    const { gw, calls } = gateway({ [`GET ${PAY}`]: { body: fullyRefunded() }, [`GET ${PAY}/events`]: { body: events } }, WRITES);
+    const result = await gw.callTool('refund_payment', moneyInput);
+    expect(result.isError).toBe(true);
+    expect(texts(result)[0]).toMatch(/more than the 0 .*Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it('ePayment: refuses a refund retry when the events are missing (404)', async () => {
+    const { gw, calls } = gateway({ [`GET ${PAY}`]: { body: fullyRefunded() } }, WRITES);
+    const result = await gw.callTool('refund_payment', moneyInput);
+    expect(texts(result)[0]).toMatch(/Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it('ePayment: refuses a capture retry when the only matching event is a refund', async () => {
+    const { gw, calls } = gateway({ [`GET ${PAY}`]: { body: fullyRefunded() }, [`GET ${PAY}/events`]: { body: [event()] } }, WRITES);
+    const result = await gw.callTool('capture_payment', moneyInput);
+    expect(texts(result)[0]).toMatch(/left to capture.*Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  const refundedCharge = (history: unknown, overrides: Record<string, unknown> = {}) =>
+    charge({ summary: { captured: 19_900, refunded: 19_900, cancelled: 0 }, history, ...overrides });
+  const chargeEvent = (overrides: Record<string, unknown> = {}) => ({
+    event: 'REFUND',
+    amount: 19_900,
+    idempotencyKey: 'op-retry-aaaa',
+    success: true,
+    occurred: '2026-11-18T12:00:00Z',
+    ...overrides,
+  });
+  const chargeInput = {
+    agreementId: 'agr_7TqP2m',
+    chargeId: 'chr-5kSeqz',
+    amount: 19_900,
+    currency: 'DKK',
+    description: 'Leveringen udeblev',
+    idempotencyKey: 'op-retry-aaaa',
+  };
+
+  it('Recurring: finds the earlier refund in the history', async () => {
+    const { gw, calls } = gateway({ [`GET ${CHARGE}`]: { body: refundedCharge([chargeEvent()]) } }, WRITES);
+    expect((await gw.callTool('refund_charge', chargeInput)).structuredContent).toMatchObject({ alreadyDone: true, idempotencyKey: 'op-retry-aaaa' });
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it.each([
+    ['the wrong event type', [chargeEvent({ event: 'CAPTURE' })]],
+    ['success false', [chargeEvent({ success: false })]],
+    ['another amount', [chargeEvent({ amount: 19_899 })]],
+    ['another key', [chargeEvent({ idempotencyKey: 'op-retry-bbbb' })]],
+    ['no history', undefined],
+    ['a history that is not a list', { events: [chargeEvent()] }],
+    ['entries that are not objects', [null, 'REFUND', 42, [chargeEvent()]]],
+  ])('Recurring: refuses a refund retry when the charge holds %s', async (_label, history) => {
+    const { gw, calls } = gateway({ [`GET ${CHARGE}`]: { body: refundedCharge(history) } }, WRITES);
+    const result = await gw.callTool('refund_charge', chargeInput);
+    expect(result.isError).toBe(true);
+    expect(texts(result)[0]).toMatch(/more than the 0 .*Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it('Recurring: refuses a refund retry in the wrong currency, even with a matching event', async () => {
+    const { gw, calls } = gateway({ [`GET ${CHARGE}`]: { body: refundedCharge([chargeEvent()]) } }, WRITES);
+    const result = await gw.callTool('refund_charge', { ...chargeInput, currency: 'NOK' });
+    expect(texts(result)[0]).toMatch(/in DKK, not NOK\. Nothing was sent/);
+    expect(apiCalls(calls).filter(call => call.method === 'POST')).toHaveLength(0);
+  });
+
+  it.each([
+    ['the wrong event type', [chargeEvent({ event: 'REFUND' })]],
+    ['success false', [chargeEvent({ event: 'CANCEL', success: false })]],
+    ['another key', [chargeEvent({ event: 'CANCEL', idempotencyKey: 'op-retry-bbbb' })]],
+    ['no history', undefined],
+    ['a history that is not a list', 'CANCEL'],
+  ])('Recurring: refuses a cancel retry when the charge holds %s', async (_label, history) => {
+    const { gw, calls } = gateway({ [`GET ${CHARGE}`]: { body: refundedCharge(history, { status: 'CANCELLED' }) } }, WRITES);
+    const result = await gw.callTool('cancel_charge', { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-retry-aaaa' });
+    expect(texts(result)[0]).toMatch(/only a pending, due, reserved or partially captured charge/);
+    expect(apiCalls(calls).filter(call => call.method === 'DELETE')).toHaveLength(0);
+  });
+});
