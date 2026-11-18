@@ -1,440 +1,209 @@
-import { createServer as createHttpServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { API_KEY_HEADER, ExampleClient } from '../src/example/client.js';
-import { ExampleHttpError, parseRetryAfterMs, redactSecrets, SecretRedactor } from '../src/errors.js';
-import { USER_AGENT } from '../src/version.js';
+import { describe, expect, it } from 'vitest';
+import { VippsHttpError } from '../src/errors.js';
+import { isAllowedRequest, VippsMobilePayClient } from '../src/vipps/client.js';
+import { PACKAGE_VERSION } from '../src/version.js';
+import { apiCalls, KEYS, makeClient, stubFetch, TOKEN } from './helpers.js';
 
-const originalEnv = { ...process.env };
+describe('authentication', () => {
+  it('requests a token with the keys and the system headers, then calls the API with it', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { body: { id: 'agr_1' } } });
+    const client = makeClient(fetchImpl, { systemPluginName: 'acme-host', systemPluginVersion: '2.1.0' });
+    await expect(client.get('/recurring/v3/agreements/agr_1')).resolves.toEqual({ id: 'agr_1' });
 
-afterEach(() => {
-  process.env = { ...originalEnv };
-});
-
-const BASE = 'https://api.vendor.test/v1';
-
-type Handler = (url: string, init?: RequestInit) => Response | unknown | Promise<Response | unknown>;
-
-function makeFetch(handler: Handler) {
-  return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-    const result = await handler(String(input), init);
-    if (result instanceof Response) {
-      return result;
-    }
-    return new Response(JSON.stringify(result), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
+    const [token, api] = calls;
+    expect(token).toMatchObject({ method: 'POST', path: '/accesstoken/get' });
+    expect(token?.headers).toMatchObject({
+      client_id: KEYS.clientId,
+      client_secret: KEYS.clientSecret,
+      'Ocp-Apim-Subscription-Key': KEYS.subscriptionKey,
+      'Merchant-Serial-Number': KEYS.merchantSerialNumber,
+      'Vipps-System-Name': 'mcp-server-vippsmobilepay',
+      'Vipps-System-Version': PACKAGE_VERSION,
+      'Vipps-System-Plugin-Name': 'acme-host',
+      'Vipps-System-Plugin-Version': '2.1.0',
     });
-  }) as unknown as typeof fetch & ReturnType<typeof vi.fn>;
-}
-
-function jsonResponse(body: unknown, status: number, headers: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json', ...headers },
-  });
-}
-
-function headersOf(init?: RequestInit): Record<string, string> {
-  return (init?.headers ?? {}) as Record<string, string>;
-}
-
-const noSleep = vi.fn(async (_ms: number) => undefined);
-
-function makeClient(fetchImpl: typeof fetch, extra: Partial<ConstructorParameters<typeof ExampleClient>[0]> = {}) {
-  return new ExampleClient({ apiKey: 'k', baseUrl: BASE, fetchImpl, sleep: noSleep, ...extra });
-}
-
-describe('ExampleClient', () => {
-  it('sends the API key and User-Agent headers and never follows redirects', async () => {
-    let seenUrl = '';
-    let seenInit: RequestInit | undefined;
-    const fetchImpl = makeFetch((url, init) => {
-      seenUrl = url;
-      seenInit = init;
-      return { id: '1' };
+    expect(api?.headers).toMatchObject({
+      Authorization: `Bearer ${TOKEN}`,
+      'Ocp-Apim-Subscription-Key': KEYS.subscriptionKey,
+      'Merchant-Serial-Number': KEYS.merchantSerialNumber,
+      'Vipps-System-Name': 'mcp-server-vippsmobilepay',
     });
-
-    await new ExampleClient({ apiKey: 'secret-key', baseUrl: `${BASE}/`, fetchImpl }).get('/items/1', { q: 'x' });
-
-    expect(seenUrl).toBe(`${BASE}/items/1?q=x`);
-    expect(headersOf(seenInit)[API_KEY_HEADER]).toBe('secret-key');
-    expect(headersOf(seenInit)['User-Agent']).toBe(USER_AGENT);
-    expect(seenInit?.redirect).toBe('manual');
+    // The API call never carries client_id or client_secret.
+    expect(api?.headers).not.toHaveProperty('client_secret');
+    expect(api?.headers).not.toHaveProperty('client_id');
+    expect(fetchImpl.mock.calls.every(([, init]) => (init as RequestInit).redirect === 'manual')).toBe(true);
   });
 
-  it('throws before sending anything when the API key or base URL is missing', async () => {
-    const fetchImpl = makeFetch(() => ({}));
-    delete process.env.EXAMPLE_API_KEY;
-    delete process.env.EXAMPLE_BASE_URL;
+  it('keeps the token until shortly before it expires, and shares one token request between concurrent calls', async () => {
+    let now = Date.parse('2026-11-18T10:00:00Z');
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { body: {} } });
+    const client = makeClient(fetchImpl, { now: () => now });
+    await Promise.all([1, 2, 3].map(() => client.get('/recurring/v3/agreements/agr_1')));
+    expect(calls.filter(call => call.path === '/accesstoken/get')).toHaveLength(1);
 
-    await expect(new ExampleClient({ baseUrl: BASE, fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_API_KEY');
-    await expect(new ExampleClient({ apiKey: 'k', fetchImpl }).get('/x')).rejects.toThrow('EXAMPLE_BASE_URL');
-    expect(fetchImpl).not.toHaveBeenCalled();
+    now += 50 * 60_000; // 50 of 60 minutes: still kept
+    await client.get('/recurring/v3/agreements/agr_1');
+    expect(calls.filter(call => call.path === '/accesstoken/get')).toHaveLength(1);
+
+    now += 6 * 60_000; // within five minutes of expiry: renewed
+    await client.get('/recurring/v3/agreements/agr_1');
+    expect(calls.filter(call => call.path === '/accesstoken/get')).toHaveLength(2);
   });
 
-  it('refuses unsafe base URLs without echoing credentials', () => {
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://api.vendor.test' })).toThrow('https://');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'not a url' })).toThrow('not a valid URL');
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://127.0.0.1:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://localhost:8080/api' })).not.toThrow();
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: 'http://[::1]:8080/api' })).not.toThrow();
-
-    for (const baseUrl of [
-      'https://user:hunter2@api.vendor.test/v1',
-      'https://api.vendor.test/v1?x=1',
-      'https://api.vendor.test/v1#frag',
-    ]) {
-      let message = '';
-      try {
-        new ExampleClient({ apiKey: 'k', baseUrl });
-      } catch (error) {
-        message = (error as Error).message;
-      }
-      expect(message).toContain('credentials, a query string or a fragment');
-      expect(message).not.toContain('hunter2');
-    }
-  });
-
-  it('validates numeric environment variables and options instead of producing NaN', () => {
-    process.env.EXAMPLE_TIMEOUT_MS = '30s';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    process.env.EXAMPLE_TIMEOUT_MS = '3000000000';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_TIMEOUT_MS');
-    delete process.env.EXAMPLE_TIMEOUT_MS;
-    process.env.EXAMPLE_MAX_CONCURRENCY = 'many';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_CONCURRENCY');
-    delete process.env.EXAMPLE_MAX_CONCURRENCY;
-    process.env.EXAMPLE_MAX_RESPONSE_BYTES = '10MB';
-    expect(() => new ExampleClient({ apiKey: 'k' })).toThrow('EXAMPLE_MAX_RESPONSE_BYTES');
-    delete process.env.EXAMPLE_MAX_RESPONSE_BYTES;
-    process.env.EXAMPLE_ALLOW_CUSTOM_BASE_URL = 'perhaps';
-    expect(() => new ExampleClient({ apiKey: 'k', baseUrl: BASE })).toThrow('EXAMPLE_ALLOW_CUSTOM_BASE_URL');
-
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: 0 })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', maxConcurrency: Number.NaN })).toThrow('maxConcurrency');
-    expect(() => new ExampleClient({ apiKey: 'k', timeoutMs: 2 ** 31 })).toThrow('timeoutMs');
-    expect(() => new ExampleClient({ apiKey: 'k', maxAttempts: 0 })).toThrow('maxAttempts');
-  });
-});
-
-describe('error handling', () => {
-  it('gives the status and our own hint, never the vendor body or code', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({ code: 'invalid_key', message: 'Unrecognized key' }, 401));
-    const error = await makeClient(fetchImpl).get('/x').catch((e: unknown) => e);
-
-    expect(error).toBeInstanceOf(ExampleHttpError);
-    expect((error as ExampleHttpError).status).toBe(401);
-    expect((error as Error).message).toContain('HTTP 401');
-    expect((error as Error).message).toContain('EXAMPLE_API_KEY');
-    expect((error as Error).message).not.toContain('Unrecognized key');
-    expect((error as Error).message).not.toContain('invalid_key');
-  });
-
-  it('never puts an error body in the error', async () => {
-    const html = `<html>${'x'.repeat(5000)}</html>`;
-    const fetchImpl = makeFetch(() => new Response(html, { status: 502, headers: { 'content-type': 'text/html' } }));
-    const error = (await makeClient(fetchImpl, { maxAttempts: 1 })
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.message).toBe('Example API request failed with HTTP 502');
-  });
-
-  it('reads at most 64 KB of an error body', async () => {
-    let pulled = 0;
-    const fetchImpl = makeFetch(
-      () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            pull(controller) {
-              pulled += 1;
-              controller.enqueue(new TextEncoder().encode('e'.repeat(16 * 1024)));
-            },
-          }),
-          { status: 500, headers: { 'content-type': 'text/html' } },
-        ),
-    );
-    const error = (await makeClient(fetchImpl)
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error).toBeInstanceOf(ExampleHttpError);
-    expect(pulled).toBeLessThan(10);
-    expect(error.message.length).toBeLessThan(700);
-  });
-
-  it('redacts the configured API key wherever it appears, before truncating', async () => {
-    const apiKey = 'live-key-0123456789abcdef';
-    const respond = (body: string, type = 'text/plain') =>
-      new ExampleClient({
-        apiKey,
-        baseUrl: BASE,
-        fetchImpl: makeFetch(() => new Response(body, { status: 400, headers: { 'content-type': type } })),
-      });
-
-    const echoed = (await respond(`proxy error: ${apiKey} and ${encodeURIComponent(apiKey)}`)
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(echoed.message).not.toContain(apiKey);
-    expect(echoed.message).not.toContain('proxy error');
-
-    const boundary = (await respond(`${'x'.repeat(490)}${apiKey}`)
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(boundary.message).not.toContain(apiKey.slice(0, 6));
-
-    const nested = (await respond(JSON.stringify({ message: 'bad', nested: { echo: apiKey } }), 'application/json')
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(JSON.stringify(nested)).not.toContain(apiKey);
-
-    expect(redactSecrets('X-API-KEY: abc123')).not.toContain('abc123');
-    expect(redactSecrets('Authorization: Bearer abc123')).not.toContain('abc123');
-    expect(redactSecrets('EXAMPLE_API_KEY=abc123')).not.toContain('abc123');
-  });
-
-  it('redacts the configured key header by name', () => {
-    const redactor = new SecretRedactor().addHeader('X-Vendor-Token').addHeader(API_KEY_HEADER);
-    const redactSecrets = (text: string) => redactor.redact(text);
-    expect(redactSecrets('sent x-vendor-token: abc123, ok')).toBe('sent x-vendor-token: ‹redacted›, ok');
-    expect(redactSecrets(`${API_KEY_HEADER}: abc123`)).not.toContain('abc123');
-    for (const text of [
-      '{"X-Vendor-Token":"abc123"}',
-      "{'x-vendor-token': 'abc123'}",
-      'x-vendor-token=abc123',
-      `{"${API_KEY_HEADER}": "abc123"}`,
-      '{"authorization":"Bearer abc123"}',
-      'authorization=abc123',
-      'x-api-key=abc123:def',
-      'X-Vendor-Token=abc123=def',
-      'authorization=abc123:pass',
-      'Authorization: Basic abc123',
-      'Authorization: Token abc123',
-      '"Authorization": "Digest abc123"',
-    ]) {
-      expect(redactSecrets(text), text).not.toContain('abc123');
-    }
-  });
-
-  it('keeps query strings out of error URLs', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({}, 400));
-    const error = (await makeClient(fetchImpl)
-      .get('/items', { cursor: 'secret-cursor' })
-      .catch((e: unknown) => e)) as ExampleHttpError;
-    expect(error.url).toBe(`${BASE}/items`);
-    expect(error.message).not.toContain('secret-cursor');
-  });
-
-  it('parses Retry-After as seconds or an HTTP date', async () => {
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    expect(parseRetryAfterMs('5', now)).toBe(5000);
-    expect(parseRetryAfterMs('Thu, 01 Jan 2026 00:00:10 GMT', now)).toBe(10_000);
-    for (const value of ['0', 'Wed, 31 Dec 2025 23:59:00 GMT', 'soon', '1.5', '-1', '+5', '']) {
-      expect(parseRetryAfterMs(value, now)).toBeUndefined();
-    }
-    expect(parseRetryAfterMs(null, now)).toBeUndefined();
-  });
-
-  it('names only the system error code of a network error, never its message', async () => {
-    const fetchImpl = makeFetch(() => {
-      throw new TypeError('fetch failed somewhere odd', {
-        cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.vendor.test'), { code: 'ENOTFOUND' }),
-      });
+  it('gets a new token and retries once on 401, for reads and writes, with the same Idempotency-Key', async () => {
+    let tokens = 0;
+    let answers = 0;
+    const { fetchImpl, calls } = stubFetch({
+      'POST /accesstoken/get': () => ({ body: { expires_in: '3600', access_token: `${TOKEN}${(tokens += 1)}` } }),
+      'POST /epayment/v1/payments/fjord-order-1/cancel': () => ((answers += 1) === 1 ? { status: 401 } : { body: { state: 'TERMINATED' } }),
     });
-    const message = await makeClient(fetchImpl, { maxAttempts: 1 })
-      .get('/x')
-      .catch((e: Error) => e.message);
-    expect(message).toMatch(/Network error calling the Example API \(GET\) \(ENOTFOUND\)\./);
-    expect(message).not.toMatch(/odd|getaddrinfo/);
-  });
-
-  it('reports timeouts clearly', async () => {
-    const fetchImpl = makeFetch(
-      () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            pull(controller) {
-              controller.error(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
-            },
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        ),
-    );
-    await expect(makeClient(fetchImpl).get('/items?cursor=c')).rejects.toThrow(
-      /timed out after \d+ ms \(GET\)/,
-    );
-  });
-
-  it('caps successful response bodies', async () => {
-    const big = makeFetch(
-      () => new Response('x'.repeat(100), { status: 200, headers: { 'content-type': 'text/plain' } }),
-    );
-    await expect(makeClient(big, { maxResponseBytes: 10 }).get('/x')).rejects.toThrow('exceeds the 10 byte limit');
-    await expect(makeClient(big, { maxResponseBytes: 1000 }).get('/x')).resolves.toBe('x'.repeat(100));
-  });
-});
-
-describe('redirects', () => {
-  it('never follows redirects and names the target without its query', async () => {
-    const fetchImpl = makeFetch(
-      () => new Response(null, { status: 302, headers: { location: 'https://other.vendor.test/v1/items?t=1' } }),
-    );
-    const message = await makeClient(fetchImpl)
-      .get('/items')
-      .catch((e: Error) => e.message);
-    expect(message).toContain('redirect (HTTP 302) for GET');
-    expect(message).toContain('EXAMPLE_BASE_URL');
-    // The Location is the vendor's text: never quoted.
-    expect(message).not.toContain('other.vendor.test');
-    await expect(makeClient(fetchImpl).post('/items', {})).rejects.toThrow(/redirect/);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(fetchImpl.mock.calls.every(([url]) => !String(url).includes('other.vendor.test'))).toBe(true);
-  });
-});
-
-describe('retries and concurrency', () => {
-  it('retries idempotent GETs on 429/502/503/504 honouring Retry-After', async () => {
-    const statuses = [503, 429];
-    const fetchImpl = makeFetch(() => {
-      const status = statuses.shift();
-      if (status === 429) {
-        return jsonResponse({}, 429, { 'retry-after': '2' });
-      }
-      if (status) {
-        return jsonResponse({}, status);
-      }
-      return { ok: true };
-    });
-    const sleep = vi.fn(async (_ms: number) => undefined);
-    const client = makeClient(fetchImpl, { sleep, retryBaseDelayMs: 10 });
-
-    await expect(client.get('/x')).resolves.toEqual({ ok: true });
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
-    expect(sleep).toHaveBeenCalledTimes(2);
-    expect(sleep.mock.calls[1]).toEqual([2000]);
-  });
-
-  it('does not wait for a Retry-After beyond the retry budget and surfaces it', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({}, 503, { 'retry-after': '3600' }));
-    const sleep = vi.fn(async (_ms: number) => undefined);
-    const error = (await makeClient(fetchImpl, { sleep })
-      .get('/x')
-      .catch((e: unknown) => e)) as ExampleHttpError;
-
-    expect(error).toBeInstanceOf(ExampleHttpError);
-    expect(error.message).toContain('retry-after=3600s');
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(sleep).not.toHaveBeenCalled();
-  });
-
-  it('retries GETs on transient network errors only', async () => {
-    let calls = 0;
-    const fetchImpl = makeFetch(() => {
-      calls += 1;
-      if (calls === 1) {
-        throw new TypeError('fetch failed', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) });
-      }
-      return { ok: true };
-    });
-    await expect(makeClient(fetchImpl).get('/x')).resolves.toEqual({ ok: true });
-    expect(calls).toBe(2);
-
-    const permanent = makeFetch(() => {
-      throw new TypeError('Headers.append: invalid header value');
-    });
-    await expect(makeClient(permanent).get('/x')).rejects.toThrow('Network error');
-    expect(permanent).toHaveBeenCalledTimes(1);
-  });
-
-  it('never retries POST or PATCH', async () => {
-    const fetchImpl = makeFetch(() => jsonResponse({}, 503));
     const client = makeClient(fetchImpl);
-    await expect(client.post('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
-    await expect(client.patch('/x', {})).rejects.toBeInstanceOf(ExampleHttpError);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-
-    const failing = makeFetch(() => {
-      throw new TypeError('fetch failed', { cause: Object.assign(new Error('reset'), { code: 'ECONNRESET' }) });
+    await expect(client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, { idempotencyKey: 'key-0001-abcd' })).resolves.toEqual({
+      state: 'TERMINATED',
     });
-    await expect(makeClient(failing).post('/x', {})).rejects.toThrow('Network error');
-    expect(failing).toHaveBeenCalledTimes(1);
+    const posts = apiCalls(calls);
+    expect(posts).toHaveLength(2);
+    expect(posts.map(call => call.headers['Idempotency-Key'])).toEqual(['key-0001-abcd', 'key-0001-abcd']);
+    expect(posts.map(call => call.headers.Authorization)).toEqual([`Bearer ${TOKEN}1`, `Bearer ${TOKEN}2`]);
   });
 
-  it('releases the concurrency slot after failures', async () => {
-    let calls = 0;
-    const fetchImpl = makeFetch(() => {
-      calls += 1;
-      if (calls === 1) {
-        throw new DOMException('timeout', 'TimeoutError');
-      }
-      if (calls === 2) {
-        return jsonResponse({}, 500);
-      }
-      return { ok: true };
-    });
-    const client = makeClient(fetchImpl, { maxConcurrency: 1 });
-    await expect(client.get('/x')).rejects.toThrow('timed out');
-    await expect(client.get('/x')).rejects.toBeInstanceOf(ExampleHttpError);
-    await expect(client.get('/x')).resolves.toEqual({ ok: true });
+  it('gives up after the second 401 with our own text', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { status: 401, body: { message: 'secret detail' } } });
+    const error = (await makeClient(fetchImpl).get('/recurring/v3/agreements/agr_1').catch((e: unknown) => e)) as VippsHttpError;
+    expect(error).toBeInstanceOf(VippsHttpError);
+    expect(error.status).toBe(401);
+    expect(error.message).not.toContain('secret detail');
+    expect(apiCalls(calls)).toHaveLength(2);
+    expect(calls.filter(call => call.path === '/accesstoken/get')).toHaveLength(2);
   });
 
-  it('limits concurrent requests per client', async () => {
-    let inFlight = 0;
-    let peak = 0;
-    const fetchImpl = makeFetch(async () => {
-      inFlight += 1;
-      peak = Math.max(peak, inFlight);
-      await new Promise(resolve => setTimeout(resolve, 5));
-      inFlight -= 1;
-      return { ok: true };
-    });
-    const client = makeClient(fetchImpl, { maxConcurrency: 2 });
+  it('explains a refused token request without quoting the answer', async () => {
+    const { fetchImpl } = stubFetch({ 'POST /accesstoken/get': { status: 401, body: { error: 'invalid_client', key: KEYS.clientSecret } } });
+    const error = (await makeClient(fetchImpl).verifyCredentials().catch((e: unknown) => e)) as Error;
+    expect(error.message).toMatch(/access token request failed with HTTP 401.*keys were rejected/);
+    expect(error.message).not.toContain('invalid_client');
+  });
 
-    await Promise.all(Array.from({ length: 8 }, () => client.get('/x')));
-    expect(fetchImpl).toHaveBeenCalledTimes(8);
-    expect(peak).toBe(2);
+  it('refuses a token answer without a usable token', async () => {
+    const { fetchImpl } = stubFetch({ 'POST /accesstoken/get': { body: { token_type: 'Bearer' } } });
+    await expect(makeClient(fetchImpl).verifyCredentials()).rejects.toThrow(/without a usable access token/);
+  });
+
+  it('redacts the access token exactly, and the keys with their pieces', () => {
+    const { fetchImpl } = stubFetch();
+    const client = makeClient(fetchImpl);
+    return client.verifyCredentials().then(() => {
+      expect(client.redactor.redact(`a ${TOKEN} b`)).toBe('a ‹redacted› b');
+      expect(client.redactor.redact(`x${KEYS.clientSecret.slice(3, 12)}y`)).not.toContain(KEYS.clientSecret.slice(3, 12));
+      expect(client.redactor.redact(`client_secret: whatever`)).toBe('client_secret: ‹redacted›');
+    });
   });
 });
 
-describe('against a local upstream (real sockets)', () => {
-  let upstream: Server | undefined;
-
-  afterEach(async () => {
-    await new Promise<void>(resolve => (upstream ? upstream.close(() => resolve()) : resolve()));
-    upstream = undefined;
+describe('configuration', () => {
+  it('uses the test and production hosts and refuses other hosts, plain http and paths', () => {
+    expect(makeClient(fetch).baseUrl).toBe('https://apitest.vipps.no');
+    expect(makeClient(fetch, { environment: 'production' }).baseUrl).toBe('https://api.vipps.no');
+    expect(makeClient(fetch, { baseUrl: 'http://127.0.0.1:8080' }).baseUrl).toBe('http://127.0.0.1:8080');
+    expect(() => makeClient(fetch, { baseUrl: 'https://api.vipps.no.example.test' })).toThrow(/must be on api\.vipps\.no/);
+    expect(() => makeClient(fetch, { baseUrl: 'http://api.vipps.no' })).toThrow(/https/);
+    expect(() => makeClient(fetch, { baseUrl: 'https://api.vipps.no/epayment' })).toThrow(/without a path/);
   });
 
-  async function startUpstream(handler: Parameters<typeof createHttpServer>[1]): Promise<string> {
-    upstream = createHttpServer(handler);
-    await new Promise<void>(resolve => upstream?.listen(0, '127.0.0.1', resolve));
-    return `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
-  }
+  it('accepts partner keys only in production', () => {
+    expect(() => makeClient(fetch, { keyType: 'partner' })).toThrow(/only in the production/);
+    expect(makeClient(fetch, { keyType: 'partner', environment: 'production' }).keyType).toBe('partner');
+  });
 
-  it('sends the key, refuses a redirect and does not contact the redirect target', async () => {
-    const seen: Array<{ url?: string; key?: string }> = [];
-    const base = await startUpstream((req, res) => {
-      seen.push({ url: req.url, key: req.headers[API_KEY_HEADER.toLowerCase()] as string | undefined });
-      if (req.url === '/v1/items/1') {
-        res.writeHead(200, { 'content-type': 'application/json' }).end('{"id":"1"}');
-        return;
+  it('validates the MSN, the environment and the plugin headers without quoting them', () => {
+    expect(() => makeClient(fetch, { merchantSerialNumber: 'abc' })).toThrow(/4 to 10 digits/);
+    expect(() => makeClient(fetch, { environment: 'staging' as never })).toThrow(/"test" or "production"/);
+    expect(() => makeClient(fetch, { systemPluginName: 'has space' })).toThrow(/systemPluginName/);
+  });
+
+  it('reads the keys from the environment in the standalone server only', async () => {
+    const { fetchImpl, calls } = stubFetch();
+    const client = new VippsMobilePayClient({
+      fetchImpl,
+      credentialEnv: {
+        VIPPS_CLIENT_ID: KEYS.clientId,
+        VIPPS_CLIENT_SECRET: KEYS.clientSecret,
+        VIPPS_SUBSCRIPTION_KEY: KEYS.subscriptionKey,
+        VIPPS_MERCHANT_SERIAL_NUMBER: KEYS.merchantSerialNumber,
+      },
+    });
+    await client.verifyCredentials();
+    expect(calls[0]?.headers.client_id).toBe(KEYS.clientId);
+
+    const empty = new VippsMobilePayClient({ fetchImpl, credentialEnv: {} });
+    await expect(empty.verifyCredentials()).rejects.toThrow(/Missing Vipps MobilePay keys/);
+  });
+});
+
+describe('requests', () => {
+  it('sends only the requests on the fixed list', async () => {
+    const { fetchImpl, calls } = stubFetch();
+    const client = makeClient(fetchImpl);
+    await expect(client.post('/recurring/v3/agreements', {})).rejects.toThrow(/never sends that POST/);
+    await expect(client.delete('/recurring/v3/agreements/agr_1')).rejects.toThrow(/never sends that DELETE/);
+    await expect(client.get('/management/v1/sales-units')).rejects.toThrow(/never sends that GET/);
+    expect(calls).toHaveLength(0);
+
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/refund')).toBe(true);
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/capture')).toBe(false);
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges')).toBe(false);
+    expect(isAllowedRequest('DELETE', '/recurring/v3/agreements/agr_1/charges/chr_1')).toBe(true);
+    expect(isAllowedRequest('POST', '/epayment/v1/payments')).toBe(false);
+    expect(isAllowedRequest('GET', '/report/v2/ledgers/abc/funds/dates/2026-11-01')).toBe(false);
+  });
+
+  it('sends a fresh Idempotency-Key on each write unless one is given, and refuses a malformed one', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'POST /epayment/v1/payments/fjord-order-1/cancel': { body: {} } });
+    const client = makeClient(fetchImpl);
+    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {});
+    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {});
+    const keys = apiCalls(calls).map(call => call.headers['Idempotency-Key']);
+    expect(keys[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(keys[0]).not.toBe(keys[1]);
+    await expect(client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, { idempotencyKey: 'a/b' })).rejects.toThrow(/idempotencyKey/);
+  });
+
+  it('never retries a POST on a gateway error, but retries a GET', async () => {
+    let gets = 0;
+    const { fetchImpl, calls } = stubFetch({
+      'POST /epayment/v1/payments/fjord-order-1/capture': { status: 503 },
+      'GET /epayment/v1/payments/fjord-order-1': () => ((gets += 1) === 1 ? { status: 503 } : { body: { ok: true } }),
+    });
+    const client = makeClient(fetchImpl, { maxAttempts: 3 });
+    await expect(client.post('/epayment/v1/payments/fjord-order-1/capture', {})).rejects.toBeInstanceOf(VippsHttpError);
+    await expect(client.get('/epayment/v1/payments/fjord-order-1')).resolves.toEqual({ ok: true });
+    expect(apiCalls(calls).map(call => call.method)).toEqual(['POST', 'GET', 'GET']);
+  });
+
+  it('never follows a redirect and does not quote its target', async () => {
+    const { fetchImpl } = stubFetch({
+      'GET /epayment/v1/payments/fjord-order-1': { status: 302, headers: { location: 'https://elsewhere.test/steal' } },
+    });
+    const error = (await makeClient(fetchImpl).get('/epayment/v1/payments/fjord-order-1').catch((e: unknown) => e)) as Error;
+    expect(error.message).toMatch(/redirect \(HTTP 302\)/);
+    expect(error.message).not.toContain('elsewhere');
+  });
+
+  it('caps the size of a successful answer', async () => {
+    const { fetchImpl } = stubFetch({ 'GET /epayment/v1/payments/fjord-order-1': { body: { pad: 'x'.repeat(5_000) } } });
+    await expect(makeClient(fetchImpl, { maxResponseBytes: 1_000 }).get('/epayment/v1/payments/fjord-order-1')).rejects.toThrow(
+      /byte limit/,
+    );
+  });
+
+  it('names only a known network error code', async () => {
+    const fetchImpl = (async (input: string | URL) => {
+      if (String(input).endsWith('/accesstoken/get')) {
+        return new Response(JSON.stringify({ access_token: TOKEN, expires_in: '3600' }), { headers: { 'content-type': 'application/json' } });
       }
-      res.writeHead(302, { location: `${base}/items/1` }).end();
-    });
-    const client = new ExampleClient({ apiKey: 'local-key-123456', baseUrl: base });
-
-    await expect(client.get('/items/1')).resolves.toEqual({ id: '1' });
-    await expect(client.get('/moved')).rejects.toThrow('redirects are not followed');
-    expect(seen).toEqual([
-      { url: '/v1/items/1', key: 'local-key-123456' },
-      { url: '/v1/moved', key: 'local-key-123456' },
-    ]);
-  });
-
-  it('times out a stalled upstream', async () => {
-    const base = await startUpstream(() => {
-      // never answers
-    });
-    const client = new ExampleClient({ apiKey: 'k', baseUrl: base, timeoutMs: 100, maxAttempts: 1 });
-    await expect(client.get('/slow')).rejects.toThrow(/timed out after 100 ms/);
-    upstream?.closeAllConnections();
+      throw new TypeError('fetch failed: secret host detail', { cause: Object.assign(new Error('x'), { code: 'ENOTFOUND' }) });
+    }) as typeof fetch;
+    const error = (await makeClient(fetchImpl).get('/recurring/v3/agreements').catch((e: unknown) => e)) as Error;
+    expect(error.message).toBe('Network error calling the Vipps MobilePay API (GET) (ENOTFOUND).');
   });
 });

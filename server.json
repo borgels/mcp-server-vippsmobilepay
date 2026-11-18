@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.borgels/mcp-server-example",
-  "title": "Example",
-  "description": "Unofficial MCP server for the Example API.",
+  "name": "io.github.borgels/mcp-server-vippsmobilepay",
+  "title": "Vipps MobilePay",
+  "description": "Unofficial MCP server for Vipps MobilePay: settlements, ePayment and Recurring.",
   "repository": {
-    "url": "https://github.com/borgels/mcp-server-example",
+    "url": "https://github.com/borgels/mcp-server-vippsmobilepay",
     "source": "github"
   },
   "version": "0.1.0",
@@ -12,7 +12,7 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "mcp-server-example",
+      "identifier": "mcp-server-vippsmobilepay",
       "version": "0.1.0",
       "runtimeHint": "npx",
       "transport": {
@@ -20,29 +20,50 @@
       },
       "environmentVariables": [
         {
-          "name": "EXAMPLE_API_KEY",
-          "description": "API key for the Example API.",
+          "name": "VIPPS_CLIENT_ID",
+          "description": "client_id of the sales unit.",
           "isRequired": true,
           "isSecret": true
         },
         {
-          "name": "EXAMPLE_BASE_URL",
-          "description": "Base URL of the Example API.",
+          "name": "VIPPS_CLIENT_SECRET",
+          "description": "client_secret of the sales unit.",
           "isRequired": true,
-          "placeholder": "https://api.vendor.test/v1"
+          "isSecret": true
         },
         {
-          "name": "EXAMPLE_ENABLE_WRITES",
-          "description": "Enable the write tools.",
+          "name": "VIPPS_SUBSCRIPTION_KEY",
+          "description": "Ocp-Apim-Subscription-Key of the sales unit.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "VIPPS_MERCHANT_SERIAL_NUMBER",
+          "description": "Merchant-Serial-Number (MSN) of the sales unit.",
+          "isRequired": true
+        },
+        {
+          "name": "VIPPS_ENVIRONMENT",
+          "description": "test or production.",
+          "default": "test"
+        },
+        {
+          "name": "VIPPS_KEY_TYPE",
+          "description": "merchant or partner (partner keys work in production only).",
+          "default": "merchant"
+        },
+        {
+          "name": "VIPPS_ENABLE_WRITES",
+          "description": "Enable the capture, refund and cancel tools.",
           "format": "boolean",
           "default": "false"
         },
         {
-          "name": "EXAMPLE_DISABLED_TOOLS",
+          "name": "VIPPS_DISABLED_TOOLS",
           "description": "Comma-separated tool names to disable."
         },
         {
-          "name": "EXAMPLE_AUDIT_LOG",
+          "name": "VIPPS_AUDIT_LOG",
           "description": "Path of the JSONL audit log. Write tools refuse to run if it cannot be written.",
           "format": "filepath"
         }

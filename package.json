@@ -1,8 +1,8 @@
 {
-  "name": "mcp-server-example",
+  "name": "mcp-server-vippsmobilepay",
   "version": "0.1.0",
-  "mcpName": "io.github.borgels/mcp-server-example",
-  "description": "Unofficial MCP server for the Example API.",
+  "mcpName": "io.github.borgels/mcp-server-vippsmobilepay",
+  "description": "Unofficial MCP server for the Vipps MobilePay APIs: settlements and ledger entries, ePayment payments and Recurring agreements, with opt-in capture, refund and cancel.",
   "type": "module",
   "main": "./dist/transports/stdio.js",
   "exports": {
@@ -20,7 +20,7 @@
     ".env.example"
   ],
   "bin": {
-    "mcp-server-example": "./dist/transports/stdio.js"
+    "mcp-server-vippsmobilepay": "./dist/transports/stdio.js"
   },
   "scripts": {
     "build": "tsup src/transports/stdio.ts src/transports/http.ts src/gateway.ts --format esm --dts --clean --sourcemap",
@@ -33,22 +33,27 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/borgels/mcp-server-example.git"
+    "url": "git+https://github.com/borgels/mcp-server-vippsmobilepay.git"
   },
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "example"
+    "vipps",
+    "mobilepay",
+    "vipps-mobilepay",
+    "epayment",
+    "recurring",
+    "settlement"
   ],
-  "author": "",
+  "author": "Borgels",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22"
   },
   "bugs": {
-    "url": "https://github.com/borgels/mcp-server-example/issues"
+    "url": "https://github.com/borgels/mcp-server-vippsmobilepay/issues"
   },
-  "homepage": "https://github.com/borgels/mcp-server-example#readme",
+  "homepage": "https://github.com/borgels/mcp-server-vippsmobilepay#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^4.6.7"

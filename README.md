@@ -1,50 +1,83 @@
-# mcp-server-example
+# mcp-server-vippsmobilepay
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for the Example API. It lets an MCP client (Claude or any other MCP-capable assistant) read data from the Example API and, when enabled, write to it.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for the Vipps MobilePay APIs. It lets an MCP client (Claude or any other MCP-capable assistant) read a merchant's settlements, ledger entries, ePayment payments and Recurring agreements and charges, and, when enabled, capture, refund or cancel payments and charges.
 
-> This is an independent, unofficial project. It is not developed, endorsed or supported by &lt;Vendor&gt;.
+> This is an independent, unofficial project. It is not developed, endorsed or supported by Vipps MobilePay.
 
-- Read-only by default; writes are opt-in per instance.
-- One set of upstream credentials per server instance; the server does no per-user authorization itself (see [Security model](#security-model)).
+- Read-only by default. The five write tools move or release money; they are off unless enabled per instance, and a host should have a person confirm every call.
+- Uses only the official [Access Token](https://developer.vippsmobilepay.com/docs/APIs/access-token-api/), [Report](https://developer.vippsmobilepay.com/docs/APIs/report-api/), [ePayment](https://developer.vippsmobilepay.com/docs/APIs/epayment-api/) and [Recurring](https://developer.vippsmobilepay.com/docs/APIs/recurring-api/) APIs.
+- Nothing can change an agreement (price, interval, status), merchant or sales unit settings, or the keys, and nothing creates a payment or a charge: every request is checked against a fixed list before it is sent.
 - Two transports: stdio for local clients, stateless streamable HTTP for containers and gateways.
-- Embeddable: the `./gateway` export exposes the same tools, validation, policy and audit to a host application.
-
-<!-- template:start -->
-## Using this template
-
-This repository is a GitHub template for TypeScript MCP servers: a minimal working server for a fictional upstream API (one read tool, one write tool) with hardened transports, client, policy, audit, tests and release workflows. After creating a repository from it, run `node scripts/rename.mjs <name> [PREFIX]` and follow [docs/NEW-SERVER.md](docs/NEW-SERVER.md). The rename removes this section; the checklist stays. Nothing is published from the template repository, or from a generated repository before the rename.
-<!-- template:end -->
+- Embeddable: the `./gateway` export exposes the same tools, validation, policy and audit to a host application, with a host policy and typed change descriptions for the host's own log.
 
 ## Tools
 
-| Tool | Purpose |
+Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
+
+| Tool | Risk | Purpose |
+|---|---|---|
+| `vipps_check_connection` | read | Check that the keys work (requests an access token). |
+| `vipps_list_ledgers` | read | Settlement ledgers with currency and the sales units they settle for. The payout account is shown as its last four characters. Merchant keys only. |
+| `vipps_get_funds_summary` | read | Totals of the funds ledger for up to 31 days, per date and in all: sales, refunds, fees retained, payouts, balance before and after. Merchant keys only. |
+| `vipps_list_transactions` | read | Every entry of the funds or fees ledger for up to 31 days. Merchant keys only. |
+| `vipps_get_payment` | read | One ePayment payment by reference, with its events. |
+| `vipps_list_agreements` | read | Recurring agreements with one status (default `ACTIVE`). |
+| `vipps_get_agreement` | read | One Recurring agreement. |
+| `vipps_list_charges` | read | The charges of one agreement, optionally by status. |
+| `vipps_get_charge` | read | One charge of an agreement. |
+| `vipps_capture_payment` | destructive | Capture all or part of an authorized payment. |
+| `vipps_refund_payment` | destructive | Refund all or part of a captured payment. |
+| `vipps_cancel_payment` | destructive | Cancel a payment; the reserved, uncaptured amount is released. |
+| `vipps_refund_charge` | destructive | Refund all or part of a charged Recurring charge. |
+| `vipps_cancel_charge` | destructive | Cancel a pending, due, reserved or partially captured charge. |
+
+**Before a write.** Capture and refund read the payment (or charge) first and refuse, without sending anything, when the currency differs from the payment's or the amount is more than can be captured or refunded. Capture needs an `AUTHORIZED` payment; cancelling a charge needs a cancellable status. Every write sends an `Idempotency-Key` (a fresh UUID, or the `idempotencyKey` given); repeat a key only to repeat the very same change.
+
+**Cancelling a charge uses DELETE.** The Recurring API cancels a charge with `DELETE /recurring/v3/agreements/{agreementId}/charges/{chargeId}`. It is the only DELETE this server can send, and it deletes no record: the charge remains, with status `CANCELLED`.
+
+**Lists are complete or refused.** Every list is read to its end. When a cap is reached the call fails with a refusal and returns nothing, rather than a list that looks complete but is not:
+
+| List | Cap |
 |---|---|
-| `example_get_item` | Fetch one item by id. |
-| `example_create_item` *(write)* | Create an item. |
+| Ledgers | 20 pages |
+| Report entries | 31 days and 200 pages per call; `list_transactions` at most 5 000 entries |
+| Agreements | 10 pages of 500 |
+| Charges of one agreement | 20 pages (`Continuation-Token`) |
+
+A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`.
+
+**Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
+
+## Keys and authentication
+
+The server uses the Access Token API (`POST /accesstoken/get`, standard authentication) with these headers, and sends the token as `Authorization: Bearer` together with the subscription key and MSN on every API call:
+
+- `client_id`, `client_secret`, `Ocp-Apim-Subscription-Key`: from the business portal ([portal.vippsmobilepay.com](https://portal.vippsmobilepay.com/)), *Developer* section, for the sales unit.
+- `Merchant-Serial-Number`: the sales unit's MSN.
+- `Vipps-System-Name: mcp-server-vippsmobilepay`, `Vipps-System-Version: <package version>`, and, when an embedding host gives them, `Vipps-System-Plugin-Name` and `Vipps-System-Plugin-Version`.
+
+The token is kept until five minutes before it expires (Vipps MobilePay: one hour in test, 24 hours in production) and shared by concurrent calls. A call answered with 401 gets a new token and is sent once more (a write with the same `Idempotency-Key`); a second 401 is reported.
+
+**Environments.** `test` uses `https://apitest.vipps.no` with the test keys; `production` uses `https://api.vipps.no`. The keys are never sent to another host (a loopback URL is allowed for a local mock).
+
+**Partner keys.** Set `VIPPS_KEY_TYPE=partner` (gateway: `keyType: 'partner'`) to use a partner's `client_id`, `client_secret` and subscription key with the merchant's MSN, which is then required. Vipps MobilePay documents partner keys for the ePayment and Recurring APIs, in production only, and not for the Report API; with partner keys the three report tools are not offered. Accounting keys (the Report API for accounting partners, without subscription key and MSN) are not supported yet.
 
 ## Quick start
 
-Requires Node.js 22 or later and an API key for the Example API.
+Requires Node.js 22 or later and the sales unit's keys.
 
 ```bash
-npx <npm-package>
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/borgels/mcp-server-example.git
-cd mcp-server-example
-npm ci
-npm run build
+npx mcp-server-vippsmobilepay
 ```
 
 Claude Code:
 
 ```bash
-claude mcp add example \
-  --env EXAMPLE_API_KEY=<key> --env EXAMPLE_BASE_URL=<base url> \
-  -- npx -y <npm-package>
+claude mcp add vippsmobilepay \
+  --env VIPPS_CLIENT_ID=<client_id> --env VIPPS_CLIENT_SECRET=<client_secret> \
+  --env VIPPS_SUBSCRIPTION_KEY=<subscription key> --env VIPPS_MERCHANT_SERIAL_NUMBER=<msn> \
+  --env VIPPS_ENVIRONMENT=test \
+  -- npx -y mcp-server-vippsmobilepay
 ```
 
 Claude Desktop (`claude_desktop_config.json`), or any client that launches stdio servers:
@@ -52,12 +85,15 @@ Claude Desktop (`claude_desktop_config.json`), or any client that launches stdio
 ```json
 {
   "mcpServers": {
-    "example": {
+    "vippsmobilepay": {
       "command": "npx",
-      "args": ["-y", "<npm-package>"],
+      "args": ["-y", "mcp-server-vippsmobilepay"],
       "env": {
-        "EXAMPLE_API_KEY": "<key>",
-        "EXAMPLE_BASE_URL": "<base url>"
+        "VIPPS_CLIENT_ID": "<client_id>",
+        "VIPPS_CLIENT_SECRET": "<client_secret>",
+        "VIPPS_SUBSCRIPTION_KEY": "<subscription key>",
+        "VIPPS_MERCHANT_SERIAL_NUMBER": "<msn>",
+        "VIPPS_ENVIRONMENT": "test"
       }
     }
   }
@@ -66,21 +102,22 @@ Claude Desktop (`claude_desktop_config.json`), or any client that launches stdio
 
 ### Docker and HTTP
 
-Images are published to `ghcr.io/borgels/mcp-server-example`: `latest` and the commit SHA from `main`, and `vX.Y.Z` for release tags. The container serves streamable HTTP at `/mcp` on port 3000, plus an unauthenticated `GET /healthz`.
+Images are published to `ghcr.io/borgels/mcp-server-vippsmobilepay`: `latest` and the commit SHA from `main`, and `vX.Y.Z` for release tags. The container serves streamable HTTP at `/mcp` on port 3000, plus an unauthenticated `GET /healthz`.
 
 ```bash
 TOKEN=$(openssl rand -hex 32); echo "$TOKEN"
-docker run -d --name example-mcp -p 127.0.0.1:3000:3000 \
-  -e EXAMPLE_API_KEY=<key> \
-  -e EXAMPLE_BASE_URL=<base url> \
+docker run -d --name vippsmobilepay-mcp -p 127.0.0.1:3000:3000 \
+  -e VIPPS_CLIENT_ID=<client_id> -e VIPPS_CLIENT_SECRET=<client_secret> \
+  -e VIPPS_SUBSCRIPTION_KEY=<subscription key> -e VIPPS_MERCHANT_SERIAL_NUMBER=<msn> \
+  -e VIPPS_ENVIRONMENT=test \
   -e MCP_HTTP_TOKEN="$TOKEN" \
-  ghcr.io/borgels/mcp-server-example:latest
+  ghcr.io/borgels/mcp-server-vippsmobilepay:latest
 
-claude mcp add --transport http example http://127.0.0.1:3000/mcp \
+claude mcp add --transport http vippsmobilepay http://127.0.0.1:3000/mcp \
   --header "Authorization: Bearer $TOKEN"
 ```
 
-To keep an audit log in the container, mount a writable directory and point `EXAMPLE_AUDIT_LOG` into it (e.g. `-v example-audit:/audit -e EXAMPLE_AUDIT_LOG=/audit/audit.jsonl`); the image runs as the `node` user and `/app` is not writable.
+To keep an audit log in the container, mount a writable directory and point `VIPPS_AUDIT_LOG` into it (e.g. `-v vippsmobilepay-audit:/audit -e VIPPS_AUDIT_LOG=/audit/audit.jsonl`); the image runs as the `node` user and `/app` is not writable.
 
 Clients send `Authorization: Bearer <MCP_HTTP_TOKEN>`. The server will not start on a non-loopback address without a token of at least 32 characters. It does not terminate TLS; run it behind a reverse proxy or gateway that does.
 
@@ -88,24 +125,29 @@ Clients send `Authorization: Bearer <MCP_HTTP_TOKEN>`. The server will not start
 
 Configuration is read from the environment (see `.env.example`). Invalid numbers, booleans, URLs and unknown tool names stop the server at startup. Booleans accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`.
 
-### Upstream API
+### Vipps MobilePay
 
 | Variable | Default | Description |
 |---|---|---|
-| `EXAMPLE_API_KEY` | – | **Required.** API key. |
-| `EXAMPLE_BASE_URL` | – | **Required.** Base URL of the API. Must be `https` (loopback `http` is allowed for local mocks). |
-| `EXAMPLE_ALLOW_CUSTOM_BASE_URL` | `false` | Allow a base URL outside the hosts the server expects, when such a list is configured. |
-| `EXAMPLE_TIMEOUT_MS` | `30000` | Timeout per request attempt. |
-| `EXAMPLE_MAX_CONCURRENCY` | `4` | Maximum concurrent upstream requests. |
-| `EXAMPLE_MAX_RESPONSE_BYTES` | `10485760` | Largest response body read (at most 100 MB). |
+| `VIPPS_CLIENT_ID` | – | **Required.** `client_id`. |
+| `VIPPS_CLIENT_SECRET` | – | **Required.** `client_secret`. |
+| `VIPPS_SUBSCRIPTION_KEY` | – | **Required.** `Ocp-Apim-Subscription-Key`. |
+| `VIPPS_MERCHANT_SERIAL_NUMBER` | – | The sales unit's MSN (4-10 digits). Required with partner keys; recommended always (the Report API needs it with the merchant's own keys). |
+| `VIPPS_ENVIRONMENT` | `test` | `test` or `production`. |
+| `VIPPS_KEY_TYPE` | `merchant` | `merchant` or `partner` (production only). |
+| `VIPPS_BASE_URL` | from the environment | Override for a local mock: a loopback URL, or `api.vipps.no` / `apitest.vipps.no` over https. |
+| `VIPPS_ALLOW_CUSTOM_BASE_URL` | `false` | Allow another https host. |
+| `VIPPS_TIMEOUT_MS` | `30000` | Timeout per request attempt. |
+| `VIPPS_MAX_CONCURRENCY` | `4` | Maximum concurrent upstream requests. |
+| `VIPPS_MAX_RESPONSE_BYTES` | `10485760` | Largest response body read (at most 100 MB). |
 
 ### Access control
 
 | Variable | Default | Description |
 |---|---|---|
-| `EXAMPLE_ENABLE_WRITES` | `false` | Enable the write tools. |
-| `EXAMPLE_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `example_` prefix. |
-| `EXAMPLE_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ids in clear text, free text hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
+| `VIPPS_ENABLE_WRITES` | `false` | Enable the write tools. |
+| `VIPPS_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `vipps_` prefix. |
+| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with references, ids, dates, amounts and currency in clear text, a refund description hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
 
 ### HTTP transport
 
@@ -123,87 +165,84 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 
 ## Embedding (`./gateway`)
 
-A host application can run the tools in-process instead of over MCP:
+A host application can run the tools in-process instead of over MCP, one instance per merchant:
 
 ```ts
-import { createExampleGateway, exampleToolCatalog } from '<npm-package>/gateway';
+import { createVippsMobilePayGateway, resolveVippsChange, vippsToolCatalog } from 'mcp-server-vippsmobilepay/gateway';
 
-const gateway = createExampleGateway({ apiKey: tenant.apiKey, baseUrl: tenant.baseUrl });
-const result = await gateway.callTool('get_item', { itemId: 'i1' }, { caller: 'user@example.test' });
+const gateway = createVippsMobilePayGateway({
+  clientId: merchant.clientId,
+  clientSecret: merchant.clientSecret,
+  subscriptionKey: merchant.subscriptionKey,
+  merchantSerialNumber: merchant.msn,
+  environment: 'production',
+  keyType: 'merchant',
+  systemPluginName: 'acme-host',
+  policy: { enableWrites: true, allowedTools: ['get_payment', 'refund_payment'], audit: record => log(record) },
+});
+
+// Before a write: what it will change, for the host's log and a person's confirmation.
+const change = resolveVippsChange('refund_payment', { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' });
+// → { ok: true, change: { tool: 'refund_payment', action: 'refund', record: 'payment', movesMoney: true,
+//      values: { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' } } }
+
+const result = await gateway.callTool(
+  'refund_payment',
+  { reference: 'acme-order-10042', amount: 12550, currency: 'DKK' },
+  { caller: 'user-17' },
+);
 ```
 
-- **Explicit credentials.** `apiKey` and `baseUrl` are required; a missing value throws when the gateway is created. A gateway never reads `EXAMPLE_API_KEY` or `EXAMPLE_BASE_URL` from the environment, so one tenant cannot silently fall back to the process's credentials. The stdio and HTTP transports still read them from the environment.
-- **Several tenants in one process.** Create one gateway per set of credentials. Each instance redacts error text, tool results and audit records with its own key only; no secret is kept in a process-wide registry, and a dropped instance releases its key.
-- **Instance policy from the host.** Pass `policy` to `createExampleGateway`: `enableWrites` (default false), `disabledTools` (must name known tools) and `audit`, a function that receives each audit record instead of `EXAMPLE_AUDIT_LOG` (without it the instance writes no audit; a write tool does not run if the sink throws on its start record). An instance with `policy` reads none of `EXAMPLE_ENABLE_WRITES`, `EXAMPLE_DISABLED_TOOLS`, `EXAMPLE_AUDIT_LOG` or `EXAMPLE_ALLOW_CUSTOM_BASE_URL`, so tenants in one process can have different settings. Without `policy` the instance uses the environment, like the MCP server. Each call runs in a scope of its own, so a call made from inside another instance's call never inherits its policy, sink or redactor, and every audit record is redacted as a whole with the instance's own key before the sink sees it. The limits (`EXAMPLE_TIMEOUT_MS`, ...) are still read from the environment and apply to every gateway in the process. Per-user and per-tenant authorization is the host's job.
-- **Tool catalog.** `exampleToolCatalog` is a frozen list of every tool: `name` (without the `example_` prefix), `title`, `description`, `riskLevel` (`read`, `write` or `destructive`), `enabledByDefault`, `inputSchema` (JSON Schema), `broad` (true when a tool can read more than its name says, so a host gives it only to roles that may read everything) and `upstream`, the API requests the tool may make (`access`, `method` and path template). It is generated from the same tool table as the MCP server, so it cannot drift from the registered tools. `exampleGatewayTools` holds the same definitions without `upstream` and `broad`; `gateway.tools` lists those enabled on the instance.
+- **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required; a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
+- **Host policy.** `policy` takes `enableWrites` (default false), `disabledTools`, `allowedTools` (an allow-list: when given, only these tools are offered, reads included; it must name known tools and must not be empty) and `audit`, a function that receives each audit record (a write does not run if the sink throws on its start record). Unknown tool names and malformed values throw at creation. An instance with `policy` reads none of `VIPPS_ENABLE_WRITES`, `VIPPS_DISABLED_TOOLS`, `VIPPS_AUDIT_LOG` or `VIPPS_ALLOW_CUSTOM_BASE_URL`.
+- **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating payments or charges, capturing a Recurring charge, and any other DELETE.
+- **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `destructive`), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney: true` and `logFields`, each with the one type its value must have:
+
+  | Type | Value |
+  |---|---|
+  | `amountMinor` | a whole number of minor units, 1 to 65 000 000 |
+  | `currency` | an ISO 4217 code in capitals (`NOK`, `DKK`, `EUR`) |
+  | `reference` | an ePayment reference, `^[a-zA-Z0-9-]{8,64}$` |
+  | `recurringId` | an agreement or charge id, `^[A-Za-z0-9_-]{1,64}$` |
+  | `idempotencyKey` | `^[A-Za-z0-9-]{8,40}$` |
+  | `flag` | true or false |
+
+  Names and free text are never log fields (a refund's `description` is sent to Vipps MobilePay and only hashed in the audit log). `resolveVippsChange(tool, input)` validates the input as `callTool` does and returns the values.
+- **Several merchants in one process.** Each instance keeps its own access token and redacts with its own keys; nothing is kept in process-wide state.
 
 ## Threat model
 
-What this server guarantees about the API key, and what it does not. It is
-the yardstick for every change that touches errors, results or audit.
+**Scope.** The guarantees apply to the embeddable gateway. The standalone MCP server, configured from the environment for one merchant, keeps best-effort redaction.
 
-**Scope.** Guarantees (a), (b) and (c) apply to the embeddable gateway
-(`./gateway`), the surface a multi-tenant host uses. The standalone MCP
-server, configured from the environment for one key, keeps best-effort
-redaction: its errors and audit records are redacted with its key, but it is
-not held to these guarantees.
+**Secrets.** `client_id`, `client_secret` and the subscription key are the instance's keys; the access token becomes a secret of the instance when it is issued. The MSN is not secret.
 
 **Guaranteed:**
 
-- **(a) The key never reaches anything persisted or shared:** audit sinks and
-  the audit log file, logs, error texts, export hooks or files. Errors are
-  our own texts; audit records and everything a gateway instance returns are
-  redacted with the instance's own key before they leave it.
-- **(b) No vendor-controlled free text in errors.** An error carries our own
-  fixed text, the HTTP status, numbers we parse (Retry-After), and codes from
-  a fixed list we wrote down; never a response body, a vendor message or
-  code, a redirect's `Location`, a type or field name from the vendor, or
-  the message of an error thrown while reading a response. A failure kept
-  inside an otherwise returned result is the status or a fixed text as well.
-  Errors never quote the key, the configured address or a refused configuration value (a timeout names its limit in milliseconds).
-- **(c) Results go only to the tenant whose key it is.** One gateway
-  instance per tenant; every call runs in a scope of its own; nothing about a
-  tenant is kept in process-wide state. The MCP server serves one key.
+- **(a) No key reaches anything persisted or shared:** audit sinks and the audit log file, logs, error texts. Everything a gateway instance returns is redacted with the instance's own keys (the keys and every piece of them of 6 characters or more; the access token as a whole) and then checked at the sink: an output that still holds a piece of a key is replaced by a fixed fallback.
+- **(b) No vendor-controlled free text in errors.** An error carries our own text, the HTTP status and a parsed Retry-After; never a response body, a vendor message or code, or a redirect's `Location`.
+- **(c) Results go only to the merchant whose keys they are.** One gateway instance per merchant; every call runs in a scope of its own.
 
-**Not guaranteed (residual risk):** a vendor that deliberately echoes the
-customer's own key back in data. Results are redacted on a best-effort
-basis: the exact key, its URL- and JSON-encoded forms and any piece of it of
-6 characters or more, in strings, object keys and the string form of
-numbers and booleans, are replaced by `"‹redacted›"` before anything is
-serialised. A key that comes back otherwise transformed (split into pieces
-shorter than 6 characters, reversed, re-encoded, hashed) is not recognised.
-Such data reaches only the tenant whose key it is, which already holds the
-key. **What leaves a gateway holds no piece of the key.** This is checked at
-the sink, not inferred from our texts: every output is checked in its final
-form, and one that holds a piece of 6 characters of the key (or of one of
-its encoded forms) is replaced by a fixed fallback. The outputs are the tool
-list, every tool result as a whole (outer fields such as `isError`
-included), audit records and stderr lines, and construction errors. A result becomes a fixed
-"withheld" error, an audit record or line becomes a fixed one, and a
-construction error becomes the fixed refusal. Every error a gateway throws is a fresh error in final form: no `cause`, a `stack` of only `name: message` (no frames, paths or function names), and name, message and stack masked against the secret. The fallbacks are a small,
-closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
-them, or with the tool list, is refused when the gateway is created.
+**Not guaranteed:** a vendor that echoes a key back otherwise transformed (split into pieces shorter than 6 characters, re-encoded). Such data reaches only the merchant whose key it is. The access token is redacted only as a whole, since pieces of a JWT are common in other base64 text such as report cursors.
 
-**Key admission.** Every key is a secret the vendor issues. A gateway
-accepts only printable ASCII (0x21-0x7E) of at least 16 characters, checked
-before anything is built from the key. As a cheap first filter it also
-refuses a key that shares a piece of 6 characters with a string literal in
-`src/` (`src/fixed-corpus.generated.ts`, kept up to date by a test). The
-refusal is a fixed text that never repeats the key. The standalone MCP server applies the same redaction to errors
-and audit records on a best-effort basis; its successful results are passed
-on as the API returned them.
+**Key admission.** A gateway accepts only keys of printable ASCII of at least 16 characters that share no piece of 6 characters with this server's own texts; the refusal never repeats the key.
 
 ## Security model
 
-- **One shared identity.** Every caller acts with the rights of the configured API key. Give it the least rights that work and rotate it regularly.
-- **Per-user authorization belongs in front of the server.** The server checks a single bearer token and does not know the end user. For multi-user use, run it behind an identity-aware gateway that decides which users may call which tools, holds the bearer token, and is the only network path to the server. Hosts can also embed the tools through the `./gateway` module export and pass the caller identity into the audit log.
-- **Tool access is not data access.** A gateway controls who may call which tool; every permitted caller still sees everything the API key can see. To separate data, run several instances with different keys.
-- **Writes are off by default.** Write tools are annotated as destructive so clients can ask for confirmation. Read-only tools get a client that refuses non-GET requests. When `EXAMPLE_AUDIT_LOG` is set, a write tool does not run unless its start record is written; without it there is no audit record.
-- **Upstream content is untrusted input.** Data returned by the API may be written by anyone with access to it. Tool results label it as data; clients that combine this server with other tools should treat it accordingly.
-- **The API key stays on the API origin.** Redirects are never followed, the base URL must use `https`, and error messages and audit records are redacted (by each instance, with that instance's key) and size-capped. See the threat model above for what is and is not guaranteed.
-- **The HTTP transport fails closed.** It refuses to start on a non-loopback address or with any origin allowed unless a token is set, compares tokens in constant time, throttles failed authentication per client address, checks `Origin` and `Host` (DNS rebinding), and caps request bodies.
+- **One identity per instance.** Every caller acts with the rights of the configured keys. Per-user authorization belongs to the host or a gateway in front of the server.
+- **Writes are off by default** and annotated destructive. Read-only tools get a client that refuses POST and DELETE. When an audit log or sink is configured, a write does not run unless its start record is written.
+- **The keys stay on the Vipps MobilePay hosts.** Redirects are never followed, and the base URL must be `api.vipps.no` or `apitest.vipps.no` over https (or loopback).
+- **The HTTP transport fails closed**: token required off loopback, constant-time comparison, throttled failures, `Origin` and `Host` checks, capped bodies.
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
+
+## Not verified against Vipps MobilePay
+
+The client follows the published OpenAPI specifications (Access Token 2.0.0, Report 2.0, ePayment 1.8.5, Recurring 3.2.3) and is tested against mocked HTTP only. Not yet tried against the test environment:
+
+- the paging of `GET /recurring/v3/agreements` with `pageNumber` and `pageSize`, and `Continuation-Token` on the charge list;
+- an `Idempotency-Key` on `POST .../cancel` (the ePayment specification does not list it for cancel);
+- partner keys (production only, so they cannot be tried in the test environment);
+- the Report API with the merchant's own keys for every kind of sales unit.
 
 ## Development
 
@@ -215,23 +254,19 @@ npm test
 npm run build
 ```
 
-Project layout:
-
 | Path | Contents |
 |---|---|
-| `src/tools/example.ts` | Shared tool table (MCP and gateway), policy and audit wrapper. |
-| `src/example/` | Upstream client, API calls, policy, audit, tool annotations. |
-| `src/transports/` | stdio and HTTP entry points; HTTP auth, origin and host checks. |
+| `src/tools/vipps.ts` | Shared tool table (MCP and gateway), log field types, policy and audit wrapper. |
+| `src/vipps/client.ts` | Access token, headers, retries, the fixed list of allowed requests. |
+| `src/vipps/reports.ts`, `payments.ts`, `recurring.ts` | API calls and paging. |
 | `src/gateway.ts` | Embeddable entry point (`./gateway` export). |
-| `src/config-env.ts` | Validated environment readers. |
+| `src/transports/` | stdio and HTTP entry points. |
 
 ## Releasing
 
 1. Bump the version in `package.json`, `server.json` (`version` and the npm package `version`) and `src/version.ts`; tests and CI check that they agree. Update `CHANGELOG.md`. Merge.
 2. Tag the merged commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. `release.yml` tests, packs and publishes the tarball to npm through trusted publishing (no stored token; npm adds provenance when the repository is public), then publishes `server.json` to the MCP Registry. Versions already on npm or in the registry are skipped, so a failed run can be re-run. Pre-release tags (`vX.Y.Z-rc.1`) go to the npm dist-tag `next` and not to the registry. `publish.yml` pushes the `vX.Y.Z` image.
-
-The first version of a new package is published by hand; see the header of `.github/workflows/release.yml` (and [docs/NEW-SERVER.md](docs/NEW-SERVER.md)).
+3. `release.yml` publishes to npm through trusted publishing and `server.json` to the MCP Registry; `publish.yml` pushes the `vX.Y.Z` image. The first version of the package is published by hand (see the header of `.github/workflows/release.yml`).
 
 ## License
 

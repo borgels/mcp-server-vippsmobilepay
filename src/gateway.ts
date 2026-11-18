@@ -1,50 +1,65 @@
 import { z } from 'zod/v4';
-import { UNTRUSTED_CONTENT_NOTE } from './example/annotations.js';
-import { ExampleClient, type ExampleClientOptions } from './example/client.js';
+import { UNTRUSTED_CONTENT_NOTE } from './vipps/annotations.js';
+import {
+  VippsMobilePayClient,
+  type VippsClientOptions,
+  type VippsEnvironment,
+  type VippsKeyType,
+} from './vipps/client.js';
 import {
   isToolDisabled,
   resolveInstancePolicy,
   runInCallScope,
   TOOL_PREFIX,
   type InstancePolicy,
-} from './example/policy.js';
+} from './vipps/policy.js';
 import { ConfigError } from './config-env.js';
 import { formatUnknownError, redactDeep, SecretRedactor } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
   auditRejectedCall,
-  EXAMPLE_TOOLS,
   executeTool,
   findTool,
+  logFieldValue,
+  toolSupportsKeyType,
   validateStartupConfig,
+  VIPPS_TOOLS,
   type CallContext,
   type ToolDefinition,
   type UpstreamOperation,
-} from './tools/example.js';
+  type VippsChangeAction,
+  type VippsChangeSpec,
+  type VippsLogField,
+  type VippsLogFieldType,
+} from './tools/vipps.js';
 
 /**
  * Embeddable entry point (package export `./gateway`): an embedding host,
  * such as an MCP gateway that does its own per-user authorization, lists
  * `tools` and invokes `callTool`. Tool definitions, input validation,
  * instance policy and audit are shared with the MCP server in
- * src/tools/example.ts.
+ * src/tools/vipps.ts.
  *
- * Several gateway instances (for example one per tenant) can run in one
- * process. Each instance uses only the credentials passed to
- * createExampleGateway (never EXAMPLE_API_KEY or EXAMPLE_BASE_URL from the
- * environment) and redacts errors with its own secrets only.
+ * One instance per merchant (sales unit). Several instances can run in one
+ * process: each uses only the keys passed to createVippsMobilePayGateway
+ * (never VIPPS_* credentials from the environment), keeps its own access
+ * token, and redacts with its own secrets only.
  *
- * Instance policy (writes, disabled tools, audit) comes from the host when it
- * passes `policy`: that instance then reads none of EXAMPLE_ENABLE_WRITES,
- * EXAMPLE_DISABLED_TOOLS, EXAMPLE_AUDIT_LOG or EXAMPLE_ALLOW_CUSTOM_BASE_URL,
- * so two tenants in one process can have different settings. Without
- * `policy` the instance uses the environment, as the MCP server does. Limits
- * (timeouts, retries) are still read from the environment and apply to every
- * instance.
+ * Instance policy comes from the host when it passes `policy`: that instance
+ * then reads none of VIPPS_ENABLE_WRITES, VIPPS_DISABLED_TOOLS,
+ * VIPPS_AUDIT_LOG or VIPPS_ALLOW_CUSTOM_BASE_URL. Limits (timeouts, retries)
+ * are still read from the environment and apply to every instance.
+ *
+ * What no policy can turn on: a request outside the client's fixed list
+ * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that changes an
+ * agreement (price, interval, status), merchant or sales unit settings, or
+ * the keys, and none that creates a payment or a charge.
  */
 
-export type { AuditSink, InstancePolicy } from './example/policy.js';
+export type { AuditSink, InstancePolicy } from './vipps/policy.js';
+export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
+export type { VippsChangeAction, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -88,27 +103,70 @@ export interface GatewayToolCatalogEntry {
   readonly enabledByDefault: boolean;
   readonly inputSchema: { readonly [key: string]: GatewayReadonlyJsonValue };
   readonly upstream: readonly GatewayUpstreamOperation[];
-  /**
-   * True when the tool can read more than its name says (anything in the
-   * system, chosen by the input). A host that grants tools per role gives a
-   * broad tool only to roles that may read everything. From the tool table
-   * (`broad`), false unless a tool declares it.
-   */
+  /** True when the tool can read more than its name says. False for every tool here. */
   readonly broad: boolean;
+  /** The key types the tool works with. Report tools need the merchant's own keys. */
+  readonly keyTypes: readonly VippsKeyType[];
+  /**
+   * Vipps MobilePay addition: true for every tool that moves or releases
+   * money (all write tools). A host should have a person confirm each call
+   * outside the chat before it runs.
+   */
+  readonly requiresConfirmation: boolean;
+  /**
+   * Write tools only: what the change does, for a host that logs a change
+   * before it is sent. `logFields` are the input fields that identify it,
+   * each with the one type its value must have (amounts in minor units, ISO
+   * currency codes, references and ids matched against a strict pattern;
+   * never names or free text). `resolveVippsChange` returns their values.
+   */
+  readonly change?: VippsChangeSpec;
 }
 
-export interface ExampleGatewayOptions extends Omit<ExampleClientOptions, 'apiKey' | 'baseUrl' | 'credentialEnv'> {
-  /** API key of this instance. Required; never read from the environment. */
-  apiKey: string;
-  /** API base URL of this instance. Required; never read from the environment. */
-  baseUrl: string;
+export interface VippsGatewayOptions
+  extends Omit<VippsClientOptions, 'clientId' | 'clientSecret' | 'subscriptionKey' | 'merchantSerialNumber' | 'environment' | 'credentialEnv'> {
+  /** client_id of this instance. Required; never read from the environment. */
+  clientId: string;
+  /** client_secret of this instance. Required; never read from the environment. */
+  clientSecret: string;
+  /** Ocp-Apim-Subscription-Key of this instance. Required; never read from the environment. */
+  subscriptionKey: string;
+  /** Merchant-Serial-Number of the merchant's sales unit (4-10 digits). Required. */
+  merchantSerialNumber: string;
+  /** test or production. Required: an instance never guesses the environment. */
+  environment: VippsEnvironment;
   /**
-   * Instance policy from the host. When given, the instance reads no policy
-   * or audit variables from the environment (see InstancePolicy). A host
-   * serving several tenants should always pass it.
+   * merchant (default): the sales unit's own keys. partner: a partner's keys
+   * used for this merchant's MSN; production only, and without the Report
+   * API tools (Vipps MobilePay does not accept partner keys there).
+   */
+  keyType?: VippsKeyType;
+  /**
+   * Instance policy from the host: enableWrites, disabledTools,
+   * allowedTools and audit. When given, the instance reads no policy or
+   * audit variables from the environment. A host serving several merchants
+   * should always pass it.
    */
   policy?: InstancePolicy;
 }
+
+/** What a write tool call will change, resolved from its input before anything is sent. */
+export interface VippsChange {
+  readonly tool: string;
+  readonly action: VippsChangeAction;
+  readonly record: 'payment' | 'charge';
+  readonly movesMoney: true;
+  /**
+   * The values of the tool's `logFields` that are present and have their
+   * field's type. A value of the wrong type is left out, so a name or a free
+   * text can never reach the values.
+   */
+  readonly values: Readonly<Record<string, string | number | boolean>>;
+}
+
+export type VippsChangeResolution =
+  | { readonly ok: true; readonly change: VippsChange }
+  | { readonly ok: false; readonly reason: string };
 
 /**
  * JSON Schema for a gateway tool, derived from the tool's zod schema.
@@ -119,6 +177,7 @@ export interface ExampleGatewayOptions extends Omit<ExampleClientOptions, 'apiKe
 function toGatewayJsonSchema(tool: ToolDefinition): GatewayJsonObject {
   const { $schema: _ignored, ...schema } = z.toJSONSchema(tool.inputSchema, {
     io: 'input',
+    unrepresentable: 'any',
     override: ctx => {
       delete (ctx.jsonSchema as Record<string, unknown>).format;
     },
@@ -130,12 +189,16 @@ function stripPrefix(name: string): string {
   return name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : name;
 }
 
+function riskLevel(tool: ToolDefinition): GatewayRiskLevel {
+  return tool.annotations.readOnlyHint ? 'read' : tool.annotations.destructiveHint ? 'destructive' : 'write';
+}
+
 function toGatewayDefinition(tool: ToolDefinition): GatewayToolDefinition {
   return {
     name: stripPrefix(tool.name),
     title: tool.title,
     description: tool.description,
-    riskLevel: tool.annotations.readOnlyHint ? 'read' : tool.annotations.destructiveHint ? 'destructive' : 'write',
+    riskLevel: riskLevel(tool),
     enabledByDefault: tool.annotations.readOnlyHint,
     inputSchema: toGatewayJsonSchema(tool),
   };
@@ -143,128 +206,182 @@ function toGatewayDefinition(tool: ToolDefinition): GatewayToolDefinition {
 
 function deepFreeze<T>(value: T): T {
   if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
-    for (const entry of Object.values(value)) {
-      deepFreeze(entry);
-    }
+    for (const entry of Object.values(value)) deepFreeze(entry);
     Object.freeze(value);
   }
   return value;
 }
 
 /** All tools, as gateway definitions (names without the prefix). */
-export const exampleGatewayTools: GatewayToolDefinition[] = EXAMPLE_TOOLS.map(toGatewayDefinition);
+export const vippsGatewayTools: GatewayToolDefinition[] = VIPPS_TOOLS.map(toGatewayDefinition);
 
 /**
- * The tool catalog: every tool with its gateway definition and the upstream
- * requests it may make. Generated from the same tool table as the MCP server
- * and `exampleGatewayTools`, and deeply frozen. Hosts can use it to build
- * their own permission model without creating a gateway instance.
+ * The tool catalog: every tool with its gateway definition, the upstream
+ * requests it may make, the key types it works with, whether it needs a
+ * person's confirmation, and (write tools) what it changes. Generated from
+ * the same tool table as the MCP server, and deeply frozen.
  */
-export const exampleToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
-  EXAMPLE_TOOLS.map(tool => ({
+export const vippsToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
+  VIPPS_TOOLS.map(tool => ({
     ...toGatewayDefinition(tool),
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
+    keyTypes: [...tool.keyTypes],
+    requiresConfirmation: tool.change !== undefined,
+    ...(tool.change
+      ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
+      : {}),
   })),
 );
 
-function requiredCredential(options: ExampleGatewayOptions, name: 'apiKey' | 'baseUrl'): string {
-  const value: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.[name];
+function toolByGatewayName(toolName: unknown): ToolDefinition | undefined {
+  const name = typeof toolName === 'string' ? toolName.trim() : '';
+  return name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
+}
+
+/**
+ * Resolves what a write tool call will change, for a host that logs the
+ * change (and asks a person to confirm it) before the call runs: the action,
+ * the record kind and the values of the tool's `logFields` that are present
+ * and well-formed. Refuses read tools, unknown tools and invalid input, as
+ * callTool does.
+ */
+export function resolveVippsChange(toolName: string, input: GatewayJsonObject = {}): VippsChangeResolution {
+  const tool = toolByGatewayName(toolName);
+  if (!tool) return { ok: false, reason: 'Unsupported Vipps MobilePay gateway tool.' };
+  if (!tool.change) return { ok: false, reason: `${stripPrefix(tool.name)} is not a write tool.` };
+  const parsed = tool.inputSchema.safeParse(input ?? {});
+  if (!parsed.success) return { ok: false, reason: `Invalid input for ${stripPrefix(tool.name)}.` };
+  const data = parsed.data as Record<string, unknown>;
+  const values: Record<string, string | number | boolean> = {};
+  for (const field of tool.change.logFields) {
+    const value = logFieldValue(field.type, data[field.name]);
+    if (value !== undefined) values[field.name] = value;
+  }
+  return {
+    ok: true,
+    change: Object.freeze({
+      tool: stripPrefix(tool.name),
+      action: tool.change.action,
+      record: tool.change.record,
+      movesMoney: true as const,
+      values: Object.freeze(values),
+    }),
+  };
+}
+
+const SECRET_OPTIONS = ['clientId', 'clientSecret', 'subscriptionKey'] as const;
+type SecretOption = (typeof SECRET_OPTIONS)[number];
+
+function requiredSecret(options: Partial<VippsGatewayOptions> | undefined, name: SecretOption): string {
+  const value: unknown = options?.[name];
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ConfigError(
-      `createExampleGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
+      `createVippsMobilePayGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
     );
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
   // ours. Checked before anything is built from the key; the refusal is a fixed text that holds no piece of it.
-  if (name === 'apiKey' && !admitsKey(value.trim())) {
+  if (!admitsKey(value.trim())) {
     throw new ConfigError(keyRefusedText(value.trim()));
   }
   return value.trim();
 }
 
 /**
- * Create one gateway instance. `apiKey` and `baseUrl` are required and
- * are the only credentials the instance uses; a missing value fails here.
+ * Create one gateway instance for one merchant. clientId, clientSecret,
+ * subscriptionKey, merchantSerialNumber and environment are required and are
+ * the only credentials the instance uses; a missing value fails here.
  */
-export function createExampleGateway(options: ExampleGatewayOptions) {
-  let apiKey: string | undefined;
-  let guard: SecretRedactor | undefined;
+export function createVippsMobilePayGateway(options: VippsGatewayOptions) {
+  const given = options as Partial<VippsGatewayOptions> | undefined;
   // What the host gave, admitted or not: every error is masked against it.
-  const given: unknown = (options as Partial<ExampleGatewayOptions> | undefined)?.apiKey;
-  const secrets = typeof given === 'string' ? [given, given.trim()] : [];
+  const secrets = SECRET_OPTIONS.flatMap(name => {
+    const value: unknown = given?.[name];
+    return typeof value === 'string' ? [value, value.trim()] : [];
+  });
+  let guard: SecretRedactor | undefined;
   try {
-    // Admission first, before a redactor is built from the key.
-    apiKey = requiredCredential(options, 'apiKey');
-    guard = new SecretRedactor().addSecret(apiKey);
-    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of the key.
+    const admitted = Object.fromEntries(SECRET_OPTIONS.map(name => [name, requiredSecret(given, name)])) as Record<SecretOption, string>;
+    guard = new SecretRedactor();
+    for (const name of SECRET_OPTIONS) guard.addSecret(admitted[name]);
+    // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(keyRefusedText(''));
     }
-    const gateway = buildGateway(options, apiKey);
+    const gateway = buildGateway(options, admitted);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
-      throw new ConfigError(keyRefusedText(apiKey));
+      throw new ConfigError(keyRefusedText(''));
     }
     return gateway;
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     let message = raw;
-    if (guard && apiKey !== undefined) {
-      // Redacted, then checked whole as the very last step: a message that still holds a piece of the key becomes
-      // the fixed refusal.
+    if (guard) {
       message = guard.redact(raw);
-      if (leaksSecret(message, guard)) message = keyRefusedText(apiKey);
+      if (leaksSecret(message, guard)) message = keyRefusedText('');
     }
-    // A fresh error in final form (src/key-admission.ts, sealedError): no cause, a stack without frames, and name,
-    // message and stack masked against the key. Then the sink check on the finished object.
+    // A fresh error in final form: no cause, a stack without frames, and name, message and stack masked against
+    // every key given. Then the sink check on the finished object.
     const final = sealedError(error instanceof ConfigError ? new ConfigError(message) : new Error(message), ...secrets);
-    if (guard && apiKey !== undefined && leaksSecret(final, guard)) {
-      throw sealedError(new ConfigError(keyRefusedText(apiKey)), ...secrets);
+    if (guard && leaksSecret(final, guard)) {
+      throw sealedError(new ConfigError(keyRefusedText('')), ...secrets);
     }
     throw final;
   }
 }
 
-function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
-  const baseUrl = requiredCredential(options, 'baseUrl');
-  const { policy: hostPolicy, ...clientOptions } = options;
-  const policy =
-    hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, EXAMPLE_TOOLS.map(tool => tool.name));
+function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption, string>) {
+  const {
+    policy: hostPolicy,
+    clientId: _clientId,
+    clientSecret: _clientSecret,
+    subscriptionKey: _subscriptionKey,
+    merchantSerialNumber,
+    environment,
+    ...clientOptions
+  } = options;
+  if (environment !== 'test' && environment !== 'production') {
+    throw new ConfigError('createVippsMobilePayGateway requires options.environment: "test" or "production".');
+  }
+  if (typeof merchantSerialNumber !== 'string' || !/^\d{4,10}$/.test(merchantSerialNumber)) {
+    throw new ConfigError('createVippsMobilePayGateway requires options.merchantSerialNumber: 4 to 10 digits.');
+  }
+  const policy = hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, VIPPS_TOOLS.map(tool => tool.name));
   if (policy === undefined) {
-    // In a scope of its own: a gateway created from inside another instance's call (its audit sink or its fetch)
-    // validates against the environment, never against that instance's policy.
+    // In a scope of its own: a gateway created from inside another instance's call validates against the
+    // environment, never against that instance's policy.
     runInCallScope({}, () => validateStartupConfig());
   }
-  const client = new ExampleClient({
+  const client = new VippsMobilePayClient({
     ...clientOptions,
-    apiKey,
-    baseUrl,
+    ...secrets,
+    merchantSerialNumber,
+    environment,
     credentialEnv: {},
     // Under a host's policy nothing is read from the environment, this switch included.
     ...(policy ? { allowCustomBaseUrl: clientOptions.allowCustomBaseUrl ?? false } : {}),
   });
   const redactor: SecretRedactor = client.redactor;
-  // Every call in a scope of its own, with or without a host policy: a call made from inside another
-  // instance's call (its audit sink or its fetch) never runs under that instance's policy, sink or redactor.
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
 
   return {
-    /** Tools enabled on this instance (the policy's or EXAMPLE_DISABLED_TOOLS' disabled tools are left out). */
-    tools: underPolicy(() => exampleGatewayTools.filter(tool => !isToolDisabled(tool.name))),
+    /** Tools offered on this instance: not disabled or outside allowedTools, and usable with its keys. */
+    tools: underPolicy(() =>
+      VIPPS_TOOLS.filter(tool => !isToolDisabled(tool.name) && toolSupportsKeyType(tool, client.keyType)).map(toGatewayDefinition),
+    ),
+    /** The environment and key type of this instance. */
+    environment: client.environment,
+    keyType: client.keyType,
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
-      // redacted: upstream data can echo the key, and so can an error. Redacted first, as data and depth-limited, and
-      // only then copied as JSON, so no key is serialised and no deep value can exhaust the stack.
+      // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.
       return underPolicy(() =>
-        runCall(toolName, input, context).then(
-          // A second pass covers what the first one inserted (the depth placeholder). Then the sink check, as the very
-          // last step: a result that holds a piece of the key anywhere, outer fields included, is withheld whole.
-          result => {
-            const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult;
-            return leaksSecret(final, redactor) ? withheldResult() : final;
-          },
-        ),
+        runCall(toolName, input, context).then(result => {
+          const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult;
+          return leaksSecret(final, redactor) ? withheldResult() : final;
+        }),
       );
     },
   };
@@ -275,22 +392,19 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
     context: GatewayCallContext | undefined,
   ): Promise<GatewayToolResult> {
     try {
-      const name = typeof toolName === 'string' ? toolName.trim() : '';
-      const tool = name ? findTool(`${TOOL_PREFIX}${stripPrefix(name)}`) : undefined;
+      const tool = toolByGatewayName(toolName);
       if (!tool) {
         // Redacted before it is cut short: a cut key would no longer match the redactor.
-        const reason = `Unsupported Example gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
+        const reason = `Unsupported Vipps MobilePay gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
         await auditRejectedCall(String(toolName), input, reason, context);
         return errorResult(redactor.redact(reason));
       }
-
       const parsed = tool.inputSchema.safeParse(input ?? {});
       if (!parsed.success) {
-        const reason = `Invalid input for ${name}: ${z.prettifyError(parsed.error)}`;
+        const reason = `Invalid input for ${stripPrefix(tool.name)}: ${z.prettifyError(parsed.error)}`;
         await auditRejectedCall(tool.name, input, 'invalid input', context);
         return errorResult(redactor.redact(reason));
       }
-
       const data = await executeTool(tool, client, parsed.data as Record<string, unknown>, context ?? undefined);
       const text = tool.returnsUpstreamContent ? `${tool.summary} ${UNTRUSTED_CONTENT_NOTE}` : tool.summary;
       return jsonResult(text, data);
@@ -300,10 +414,9 @@ function buildGateway(options: ExampleGatewayOptions, apiKey: string) {
   }
 }
 
-/** One gateway instance, as returned by createExampleGateway. */
-export type ExampleGateway = ReturnType<typeof createExampleGateway>;
+/** One gateway instance, as returned by createVippsMobilePayGateway. */
+export type VippsMobilePayGateway = ReturnType<typeof createVippsMobilePayGateway>;
 
-/** The data as it came; callTool redacts it and only then copies it as JSON. */
 function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {
   return {
     content: [{ type: 'text', text }],
@@ -312,8 +425,5 @@ function jsonResult(text: string, structuredContent: unknown): GatewayToolResult
 }
 
 function errorResult(text: string): GatewayToolResult {
-  return {
-    isError: true,
-    content: [{ type: 'text', text }],
-  };
+  return { isError: true, content: [{ type: 'text', text }] };
 }

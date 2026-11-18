@@ -3,7 +3,7 @@ import { request as httpRequest } from 'node:http';
 import { type AddressInfo, connect, createServer as createNetServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ExampleClient } from '../src/example/client.js';
+import { VippsMobilePayClient } from '../src/vipps/client.js';
 import { createServer } from '../src/server.js';
 import type { HttpConfig } from '../src/transports/http-helpers.js';
 import { type RunningHttpServer, startHttpServer } from '../src/transports/http-server.js';
@@ -49,9 +49,13 @@ const mcpHeaders = {
 };
 
 function fakeMcpServer() {
-  const client = new ExampleClient({
-    apiKey: 'test',
-    baseUrl: 'https://api.vendor.test',
+  const client = new VippsMobilePayClient({
+    clientId: 'aaaa-bbbb-cccc-dddd',
+    clientSecret: 'aaaa-bbbb-cccc-eeee',
+    subscriptionKey: 'aaaa-bbbb-cccc-ffff',
+    merchantSerialNumber: '123456',
+    environment: 'test',
+    credentialEnv: {},
     fetchImpl: async () => {
       throw new Error('network access is not allowed in tests');
     },
@@ -289,7 +293,7 @@ describe('HTTP transport entry point', () => {
     return new Promise((resolve, reject) => {
       const childEnv: NodeJS.ProcessEnv = { ...process.env };
       for (const name of Object.keys(childEnv)) {
-        if (name.startsWith('MCP_') || name.startsWith('EXAMPLE_') || name === 'HOST' || name === 'PORT') {
+        if (name.startsWith('MCP_') || name.startsWith('VIPPS_') || name === 'HOST' || name === 'PORT') {
           delete childEnv[name];
         }
       }
@@ -315,10 +319,11 @@ describe('HTTP transport entry point', () => {
     [{ MCP_ALLOW_ANY_ORIGIN: 'true' }, /MCP_ALLOW_ANY_ORIGIN/],
     [{ MCP_HTTP_TOKEN: 'too-short' }, /at least 32/],
     [{ PORT: 'abc' }, /PORT/],
-    [{ EXAMPLE_TIMEOUT_MS: 'abc' }, /EXAMPLE_TIMEOUT_MS/],
-    [{ EXAMPLE_ENABLE_WRITES: 'maybe' }, /EXAMPLE_ENABLE_WRITES/],
-    [{ EXAMPLE_DISABLED_TOOLS: 'no_such_tool' }, /EXAMPLE_DISABLED_TOOLS/],
-    [{ EXAMPLE_BASE_URL: 'http://api.vendor.test' }, /https:\/\//],
+    [{ VIPPS_TIMEOUT_MS: 'abc' }, /VIPPS_TIMEOUT_MS/],
+    [{ VIPPS_ENABLE_WRITES: 'maybe' }, /VIPPS_ENABLE_WRITES/],
+    [{ VIPPS_DISABLED_TOOLS: 'no_such_tool' }, /VIPPS_DISABLED_TOOLS/],
+    [{ VIPPS_BASE_URL: 'http://api.vendor.test' }, /https:\/\//],
+    [{ VIPPS_KEY_TYPE: 'partner' }, /production/],
   ])('refuses to start with %o', async (env, message) => {
     const result = await runEntry(env);
     expect(result.code).toBe(1);
