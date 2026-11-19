@@ -53,6 +53,11 @@ const BASE_PATTERNS: readonly RegExp[] = [
   headerPattern('ocp-apim-subscription-key'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
+  // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters. A
+  // short word after "basic" ("basic plan") is left alone; a longer one is masked, a false positive we accept.
+  /\b(bearer|basic)\s+[A-Za-z0-9._~+/-]{8,}=*/gi,
+  // A JSON Web Token anywhere: three base64url segments, the first a JSON header ("eyJ").
+  /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
   /(clientSecret|subscriptionKey|VIPPS_CLIENT_SECRET|VIPPS_SUBSCRIPTION_KEY|VIPPS_CLIENT_ID|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
 
@@ -69,12 +74,15 @@ export class SecretRedactor {
   private readonly fragments = new Set<string>();
   private readonly patterns: RegExp[] = [...BASE_PATTERNS];
 
-  /** Redact this value and every piece of it. Values shorter than MIN_SECRET_LENGTH are ignored. */
+  /**
+   * Redact this value and every piece of it, also base64- and base64url-encoded (as a Basic credential or an echo
+   * would carry it). Values shorter than MIN_SECRET_LENGTH are ignored.
+   */
   addSecret(value: string | undefined): this {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
-    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1), ...base64Forms(value)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
@@ -160,6 +168,17 @@ export class SecretRedactor {
     }
     return out;
   }
+}
+
+/**
+ * The base64 and base64url forms of a secret, without padding: of the value alone and of `value:`, the start of a
+ * Basic credential. Every piece of them is redacted like a piece of the value.
+ */
+function base64Forms(value: string): string[] {
+  return [value, `${value}:`].flatMap(text => {
+    const encoded = Buffer.from(text, 'utf8').toString('base64').replace(/=+$/, '');
+    return [encoded, encoded.replace(/\+/g, '-').replace(/\//g, '_')];
+  });
 }
 
 function applyPatterns(value: string, patterns: readonly RegExp[]): string {

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The audit writes the caller only as a pseudonym (`hmac:` and 16 hex characters, random key per process) and never the host's request id: every call gets the server's own.
+- A rejected call (unknown tool or invalid input) logs nothing the caller wrote as text: an unknown tool is `unknown_tool`, the reason is fixed (`unsupported tool`, `invalid input`), and of the input only the field names in the tool's schema are kept, with a count of the others.
+- Keys are also redacted in their base64 and base64url forms, alone and as the start of a Basic credential. `bearer` and `basic` values in any case (8 or more token characters) and JSON Web Tokens are masked in every text, as in `mcp-server-pleo`.
+- README: results pass on no known personal field of the payer or the subscriber, but texts the merchant chose (a reference, a product name) can still hold personal data. The 0.1.2 entry below said "no personal data"; that holds for the fields named there, not for such texts.
+- Tests for agreement answers that are not agreements (single and list) and for events answers in every malformed form.
+
 ## 0.1.2
 
 - No personal data of the payer or the subscriber: `get_payment` passes on only the payment's references, state, amounts and the payment method's type, and each event's references, name, amount, time, key and outcome. `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub` and the card number prefix are left out. `get_agreement` and `list_agreements` pass on only the agreement's terms and state, never `sub`, `userinfoUrl` or a phone number. A deep allow-list with a type for every field on every level (src/vipps/views.ts): a nested object passes only through its own list, so personal data placed inside an allowed field (`amount.userDetails`, `pricing.userDetails`, `campaign.userinfoUrl`) is left out too, and a field Vipps MobilePay adds later is left out until it is added there. A payment answer without a reference and a state, or an agreement without an id, is refused with a fixed text instead of returned empty. An events answer that is not a list of events becomes a fixed error text; an `error` text in Vipps MobilePay's own answer is never passed on.

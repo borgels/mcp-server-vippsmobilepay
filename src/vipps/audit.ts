@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -13,7 +13,7 @@ export interface AuditEvent {
   /** Shared by all events of one tool call (start/finish/error). */
   requestId: string;
   tool: string;
-  /** Caller identity supplied by an embedding host, when available. */
+  /** Caller identity supplied by an embedding host, when available. Written only as callerPseudonym(caller). */
   caller?: string;
   action: 'start' | 'finish' | 'error' | 'policy_denied' | 'rejected';
   target?: Record<string, unknown>;
@@ -48,6 +48,18 @@ export function auditErrorSummary(
 
 export function newRequestId(): string {
   return randomUUID();
+}
+
+/** The key of the caller pseudonyms: random per process, never written anywhere. */
+const CALLER_KEY = randomBytes(32);
+
+/**
+ * The caller as `hmac:` and 16 hex characters: the same caller gives the same pseudonym within the process. The
+ * caller is the host's text, often a mail address, so it is never written in clear.
+ */
+export function callerPseudonym(caller: string | undefined): string | undefined {
+  if (caller === undefined || caller === '') return undefined;
+  return `hmac:${createHmac('sha256', CALLER_KEY).update(caller, 'utf8').digest('hex').slice(0, 16)}`;
 }
 
 /**
@@ -101,7 +113,8 @@ export async function writeAuditEvent(
       timestamp: new Date().toISOString(),
       requestId: event.requestId,
       tool: event.tool,
-      caller: event.caller,
+      // Only as a pseudonym: the caller is the host's text, often a mail address.
+      caller: callerPseudonym(event.caller),
       action: event.action,
       target: event.target,
       status: event.status,

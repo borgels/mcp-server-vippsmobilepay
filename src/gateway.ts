@@ -406,13 +406,13 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       if (!tool) {
         // Redacted before it is cut short: a cut key would no longer match the redactor.
         const reason = `Unsupported Vipps MobilePay gateway tool: ${redactor.redact(String(toolName)).slice(0, 100)}`;
-        await auditRejectedCall(String(toolName), input, reason, context);
+        await auditRejectedCall(undefined, input, 'unsupported tool', context);
         return errorResult(redactor.redact(reason));
       }
       const parsed = tool.inputSchema.safeParse(input ?? {});
       if (!parsed.success) {
         const reason = `Invalid input for ${stripPrefix(tool.name)}: ${z.prettifyError(parsed.error)}`;
-        await auditRejectedCall(tool.name, input, 'invalid input', context);
+        await auditRejectedCall(tool, input, 'invalid input', context);
         return errorResult(redactor.redact(reason));
       }
       const data = await executeTool(tool, client, parsed.data as Record<string, unknown>, context ?? undefined);

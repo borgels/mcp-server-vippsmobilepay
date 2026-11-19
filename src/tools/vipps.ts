@@ -523,9 +523,12 @@ export function registerTools(server: McpServer, client: RedactingClient): void 
 
 /** Optional call context supplied by an embedding host. */
 export interface CallContext {
-  /** Caller identity, recorded in audit events. */
+  /** Caller identity. The audit stores it only as a pseudonym (`hmac:` and 16 hex characters, per process). */
   caller?: string;
-  /** Request id to reuse in audit events, for correlation with the host's own log. */
+  /**
+   * The host's request id. Accepted for compatibility and not written: the audit's request id is the server's own,
+   * one per call, so no text of the host reaches the record through it.
+   */
   requestId?: string;
 }
 
@@ -535,11 +538,11 @@ function contextString(value: unknown, max: number): string | undefined {
   return trimmed ? trimmed.slice(0, max) : undefined;
 }
 
-/** Normalise a host-supplied context; malformed values are ignored. */
+/** Normalise a host-supplied context; malformed values are ignored. The request id is always the server's own. */
 export function normaliseCallContext(context: unknown): { requestId: string; caller?: string } {
   const value = (context && typeof context === 'object' ? context : {}) as Record<string, unknown>;
   return {
-    requestId: contextString(value.requestId, 200) ?? newRequestId(),
+    requestId: newRequestId(),
     caller: contextString(value.caller, 320),
   };
 }
@@ -614,26 +617,34 @@ export async function executeTool(
   }
 }
 
-const MAX_REJECTED_FIELDS = 20;
-const MAX_REJECTED_FIELD_LENGTH = 64;
+/** The tool name in the audit record of a call to a tool this server does not have. */
+export const UNKNOWN_TOOL = 'unknown_tool';
 
-/** Audit a call rejected before execution (unknown tool or invalid input); field names only. */
-export async function auditRejectedCall(toolName: string, input: unknown, reason: string, context?: unknown): Promise<void> {
+/** Why a call was rejected before it ran: a fixed text, never the caller's. */
+export type RejectedReason = 'unsupported tool' | 'invalid input';
+
+/**
+ * Audit a call rejected before execution. Nothing the caller wrote is logged as text: an unknown tool is recorded
+ * as UNKNOWN_TOOL, and of the input only the field names the tool's own schema has, plus how many others there were.
+ */
+export async function auditRejectedCall(
+  tool: ToolDefinition | undefined,
+  input: unknown,
+  reason: RejectedReason,
+  context?: unknown,
+): Promise<void> {
   const { requestId, caller } = normaliseCallContext(context);
-  const fields =
-    input && typeof input === 'object' && !Array.isArray(input)
-      ? Object.keys(input)
-          .sort()
-          .slice(0, MAX_REJECTED_FIELDS)
-          .map(key => redactInScope(key).slice(0, MAX_REJECTED_FIELD_LENGTH))
-      : [];
+  const keys = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : [];
+  const known = new Set(tool ? Object.keys(tool.inputSchema.shape) : []);
+  const fields = keys.filter(key => known.has(key)).sort();
+  const unknownFields = keys.length - fields.length;
   await writeAuditEvent({
     requestId,
-    tool: redactInScope(toolName).slice(0, 100),
+    tool: tool ? tool.name : UNKNOWN_TOOL,
     caller,
     action: 'rejected',
-    target: { fields },
-    reason: redactInScope(reason).slice(0, 200),
+    target: unknownFields > 0 ? { fields, unknownFields } : { fields },
+    reason,
   });
 }
 

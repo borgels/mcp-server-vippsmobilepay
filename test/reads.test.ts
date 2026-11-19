@@ -281,6 +281,31 @@ describe('ePayment reads', () => {
     }
   });
 
+  it('gives only the fixed text for every malformed events answer, and keeps the payment', async () => {
+    const malformed: unknown[] = [
+      'Ada Lovelace',
+      { events: [] },
+      ['AUTHORIZED'],
+      [{ name: 'AUTHORIZED', success: true }, 'Ada Lovelace'],
+      [{ name: 'AUTHORIZED' }, null],
+      [[{ name: 'AUTHORIZED' }]],
+      42,
+    ];
+    for (const body of malformed) {
+      const { gw } = gateway({
+        'GET /epayment/v1/payments/fjord-order-10042': { body: payment() },
+        'GET /epayment/v1/payments/fjord-order-10042/events': { body },
+      });
+      const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042' });
+      expect(result.isError, JSON.stringify(body)).toBeUndefined();
+      expect(result.structuredContent, JSON.stringify(body)).toMatchObject({
+        payment: { reference: 'fjord-order-10042' },
+        events: { error: 'Vipps MobilePay answered the events in an unexpected form.' },
+      });
+      expect(JSON.stringify(result), JSON.stringify(body)).not.toContain('Ada');
+    }
+  });
+
   it('refuses a reference outside the documented pattern before any request', async () => {
     const { gw, calls } = gateway();
     for (const reference of ['short', '../../management', 'fjord order 1', 'x'.repeat(65)]) {
@@ -314,6 +339,26 @@ describe('Recurring reads', () => {
       const all = JSON.stringify(result);
       for (const word of ['c06c4afe', 'userinfo', '4512345678', 'Ada', 'ada@example.test']) expect(all, `${tool} ${word}`).not.toContain(word);
       expect(all, tool).toContain('Abonnement');
+    }
+  });
+
+  it('refuses an agreement answer that is not an agreement, instead of an empty result', async () => {
+    for (const body of [[], 'Ada Lovelace', 42, { status: 'ACTIVE' }, { id: 42, status: 'ACTIVE' }, { id: { name: 'Ada' } }]) {
+      const { gw } = gateway({ 'GET /recurring/v3/agreements/agr_7TqP2m': { body } });
+      const result = await gw.callTool('get_agreement', { agreementId: 'agr_7TqP2m' });
+      expect(result.isError, JSON.stringify(body)).toBe(true);
+      expect(JSON.stringify(result), JSON.stringify(body)).toContain('unexpected form');
+      expect(JSON.stringify(result), JSON.stringify(body)).not.toContain('Ada');
+    }
+  });
+
+  it('refuses an agreement list that is not a list, or holds something that is not an agreement', async () => {
+    for (const body of [{ agreements: [] }, 'Ada Lovelace', [{ id: 'agr_5kSeqz', status: 'ACTIVE' }, { status: 'ACTIVE', name: 'Ada' }], [null], ['agr_5kSeqz']]) {
+      const { gw } = gateway({ 'GET /recurring/v3/agreements': { body } });
+      const result = await gw.callTool('list_agreements', {});
+      expect(result.isError, JSON.stringify(body)).toBe(true);
+      expect(JSON.stringify(result), JSON.stringify(body)).toContain('unexpected form');
+      expect(JSON.stringify(result), JSON.stringify(body)).not.toContain('Ada');
     }
   });
 

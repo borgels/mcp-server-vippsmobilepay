@@ -122,3 +122,54 @@ describe('no piece of a key leaves an instance', () => {
     expect(leaks(error?.message)).toEqual([]);
   });
 });
+
+describe('base64 forms of the keys and credential-shaped text', () => {
+  const b64 = (text: string) => Buffer.from(text, 'utf8').toString('base64');
+  const b64url = (text: string) => b64(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  it('masks a key echoed base64- or base64url-encoded, alone or as a Basic credential', async () => {
+    const echoes = [
+      b64(KEYS.clientSecret),
+      b64url(KEYS.subscriptionKey),
+      b64(`${KEYS.clientId}:${KEYS.clientSecret}`),
+      b64url(`${KEYS.clientId}:`),
+    ];
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-b64-0001', state: 'AUTHORIZED', pspReference: echoes.join(' ') });
+      },
+      policy: {},
+    });
+    const result = await gw.callTool('get_payment', { reference: 'echo-b64-0001', includeEvents: false });
+    const all = JSON.stringify(result);
+    for (const echo of echoes) {
+      expect(all).not.toContain(echo.slice(0, 12));
+    }
+  });
+
+  it('masks Bearer and Basic values in any case, and JSON Web Tokens, in text', async () => {
+    const basic = Buffer.from('user:pass').toString('base64');
+    const jwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiJ0ZXN0In0', 'c2lnbmF0dXJlLXRlc3Q'].join('.');
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-cred-0001', state: 'AUTHORIZED', pspReference: `bearer abcdefgh12345678 BASIC ${basic} ${jwt}` });
+      },
+      policy: {},
+    });
+    const all = JSON.stringify(await gw.callTool('get_payment', { reference: 'echo-cred-0001', includeEvents: false }));
+    expect(all).not.toMatch(/abcdefgh12345678|eyJzdWIi/);
+    expect(all).not.toContain(basic);
+  });
+});
