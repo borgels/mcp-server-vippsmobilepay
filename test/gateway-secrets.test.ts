@@ -53,7 +53,7 @@ const upstream: typeof fetch = async (input, init) => {
   if (init?.method === 'POST') return json({ echo: KEYS.clientSecret, [KEYS.subscriptionKey]: TOKEN });
   switch (reference) {
     case 'echo-whole-1':
-      return json({ reference: KEYS.clientSecret, nested: { [KEYS.clientId]: [KEYS.subscriptionKey.slice(2, 14)] }, token: TOKEN });
+      return json({ reference: KEYS.clientSecret, state: TOKEN, nested: { [KEYS.clientId]: [KEYS.subscriptionKey.slice(2, 14)] }, token: TOKEN });
     case 'echo-error-1':
       return json({ detail: `Rejected ${KEYS.clientSecret}`, title: TOKEN }, 400);
     case 'redirect-01':

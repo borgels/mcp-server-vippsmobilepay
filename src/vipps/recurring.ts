@@ -3,6 +3,7 @@ import type { UpstreamClient } from './client.js';
 import { ChangeRefusedError } from './payments.js';
 import { TooMuchDataError } from './reports.js';
 import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
+import { agreementView } from './views.js';
 
 /**
  * Recurring API (v3): agreements and their charges; refund or cancel one
@@ -69,7 +70,8 @@ export async function listAgreements(
         if (seen.has(id)) continue;
         seen.add(id);
       }
-      agreements.push(agreement);
+      // Through the allow-list in views.ts: never the user's id or userinfo address.
+      agreements.push(agreementView(agreement));
     }
   };
   for (let pageNumber = 1; pageNumber <= MAX_AGREEMENT_PAGES; pageNumber += 1) {
@@ -90,7 +92,7 @@ export async function listAgreements(
 }
 
 export async function getAgreement(client: UpstreamClient, input: { agreementId: string }): Promise<unknown> {
-  return client.get(agreementPath(input.agreementId));
+  return agreementView(await client.get(agreementPath(input.agreementId)));
 }
 
 export async function listCharges(
