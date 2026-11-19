@@ -318,7 +318,8 @@ describe('MCP server', () => {
 
   it('redacts keys and the token that upstream echoes in an MCP result, values and object keys alike', async () => {
     const { TOKEN } = await import('./helpers.js');
-    const echo = { reference: KEYS.clientSecret, [KEYS.subscriptionKey]: TOKEN, nested: { [KEYS.clientId]: KEYS.clientSecret.slice(2, 14) } };
+    // In fields the agreement view passes on (src/vipps/views.ts), so the redaction is what removes them.
+    const echo = { id: 'agr_7TqP2m', productName: KEYS.clientSecret, pricing: { [KEYS.subscriptionKey]: TOKEN, nested: { [KEYS.clientId]: KEYS.clientSecret.slice(2, 14) } } };
     const { mcpClient } = await connect({ 'GET /recurring/v3/agreements/agr_7TqP2m': { body: echo } });
     const result = await mcpClient.callTool({ name: 'vipps_get_agreement', arguments: { agreementId: 'agr_7TqP2m' } });
     const text = JSON.stringify(result);
@@ -327,7 +328,7 @@ describe('MCP server', () => {
       for (let i = 0; i + 6 <= secret.length; i += 1) expect(text).not.toContain(secret.slice(i, i + 6));
     }
     expect(text).not.toContain(TOKEN);
-    expect(JSON.parse(texts(result)[0] ?? 'null')).toMatchObject({ reference: '‹redacted›' });
+    expect(JSON.parse(texts(result)[0] ?? 'null')).toMatchObject({ productName: '‹redacted›' });
   });
 
   it('leaves out the Report API tools with partner keys', async () => {

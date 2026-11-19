@@ -208,7 +208,30 @@ describe('ePayment reads', () => {
       'GET /epayment/v1/payments/fjord-order-10042/events': { body: events },
     });
     const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042' });
-    expect(result.structuredContent).toEqual({ payment: payment(), events });
+    const { profile: _profile, ...own } = payment();
+    expect(result.structuredContent).toEqual({ payment: own, events });
+  });
+
+  it('passes on no personal data of the payer: names, phone, e-mail, address and user id are left out', async () => {
+    const personal = {
+      profile: { sub: 'c06c4afe-d9e1-4c5d-939a-177d752a0944' },
+      userDetails: { firstName: 'Ada', lastName: 'Lovelace', mobileNumber: '4512345678', email: 'ada@example.test' },
+      shippingDetails: { address: { addressLine1: 'Fjordvej 1', postCode: '8000', city: 'Aarhus' } },
+      paymentMethod: { type: 'WALLET', cardBin: '540185' },
+      redirectUrl: 'https://pay.example.test/session',
+    };
+    const events = [{ reference: 'fjord-order-10042', name: 'AUTHORIZED', amount: { currency: 'DKK', value: 49_900 }, success: true, userDetails: { firstName: 'Ada' } }];
+    const { gw } = gateway({
+      'GET /epayment/v1/payments/fjord-order-10042': { body: payment(personal) },
+      'GET /epayment/v1/payments/fjord-order-10042/events': { body: events },
+    });
+    const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042' });
+    const all = JSON.stringify(result);
+    for (const word of ['Ada', 'Lovelace', '4512345678', 'ada@example.test', 'Fjordvej', 'c06c4afe', '540185', 'pay.example.test']) {
+      expect(all, word).not.toContain(word);
+    }
+    expect(result.structuredContent).toMatchObject({ payment: { state: 'AUTHORIZED', paymentMethod: { type: 'WALLET' } } });
+    expect(all).toContain('49900');
   });
 
   it('keeps the payment when the events cannot be read, with the status only', async () => {
@@ -231,6 +254,29 @@ describe('ePayment reads', () => {
 });
 
 describe('Recurring reads', () => {
+  it('passes on an agreement\'s terms and state, never the user id or userinfo address', async () => {
+    const agreement = {
+      id: 'agr_5kSeqz',
+      status: 'ACTIVE',
+      productName: 'Abonnement',
+      pricing: { type: 'LEGACY', amount: 4_900, currency: 'DKK' },
+      interval: { unit: 'MONTH', count: 1 },
+      sub: 'c06c4afe-d9e1-4c5d-939a-177d752a0944',
+      userinfoUrl: 'https://api.example.test/userinfo/c06c4afe',
+      phoneNumber: '4512345678',
+    };
+    const { gw } = gateway({
+      'GET /recurring/v3/agreements/agr_5kSeqz': { body: agreement },
+      'GET /recurring/v3/agreements': { body: [agreement] },
+    });
+    for (const [tool, input] of [['get_agreement', { agreementId: 'agr_5kSeqz' }], ['list_agreements', {}]] as const) {
+      const result = await gw.callTool(tool, input);
+      const all = JSON.stringify(result);
+      for (const word of ['c06c4afe', 'userinfo', '4512345678']) expect(all, `${tool} ${word}`).not.toContain(word);
+      expect(all, tool).toContain('Abonnement');
+    }
+  });
+
   it('pages through agreements and stops at the first short page', async () => {
     const page = (n: number, size: number) => Array.from({ length: size }, (_, i) => ({ id: `agr_${n}_${i}`, status: 'ACTIVE' }));
     const { gw, calls } = gateway({

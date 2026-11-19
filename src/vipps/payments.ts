@@ -2,6 +2,7 @@ import { nestedFailureText } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
+import { paymentEventsView, paymentView } from './views.js';
 
 /**
  * ePayment API: read one payment and its events; capture, refund or cancel it.
@@ -31,7 +32,8 @@ function paymentPath(reference: string): string {
 
 export async function getPayment(client: UpstreamClient, input: { reference: string; includeEvents?: boolean }): Promise<unknown> {
   const path = paymentPath(input.reference);
-  const payment = await client.get(path);
+  // The payment and its events through the allow-lists in views.ts: never the payer's name, phone, e-mail or address.
+  const payment = paymentView(await client.get(path));
   if (input.includeEvents === false) {
     return { payment };
   }
@@ -41,7 +43,7 @@ export async function getPayment(client: UpstreamClient, input: { reference: str
     body => body,
     (error: unknown) => ({ error: nestedFailureText(error) }),
   );
-  return { payment, events };
+  return { payment, events: paymentEventsView(events) };
 }
 
 /** An Amount object's value in minor units, or undefined. */
