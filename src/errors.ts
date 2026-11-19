@@ -61,6 +61,10 @@ const BASE_PATTERNS: readonly RegExp[] = [
  * separator, because base64 padding (`=`, `==`) is part of the value.
  */
 const CREDENTIAL_PATTERNS: readonly RegExp[] = [
+  // Bearer or Basic, in any case, before a value that holds the marker of an earlier redaction: the scheme word and the
+  // whole value up to a space, quote, comma or brace, whatever its length (a short tail after the marker is still part
+  // of the credential).
+  /\b(bearer|basic)\s+[^\s"',}]*‹redacted›[^\s"',}]*/gi,
   // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters,
   // padding included. A short word after "basic" ("basic plan") is left alone; a longer one is masked, a false
   // positive we accept.

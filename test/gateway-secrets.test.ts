@@ -222,3 +222,38 @@ describe('credential values that hold a known key (review of #10, round 2)', () 
     expect(r.redact('plain qzxwabcd12345678 text')).toBe('plain ‹redacted› text');
   });
 });
+
+describe('a scheme word before a value that holds the marker (review of #10, round 3)', () => {
+  const values = ['Basic ‹redacted›cGFzcw==', 'basic ‹redacted›abcdef', 'BEARER ‹redacted›abcdef', 'Bearer ‹redacted›x'];
+  const masked = ['Basic ‹redacted›', 'basic ‹redacted›', 'BEARER ‹redacted›', 'Bearer ‹redacted›'];
+
+  it('masks the whole value, whatever the length of the tail after the marker', async () => {
+    const { SecretRedactor, redactSecrets } = await import('../src/errors.js');
+    values.forEach((text, i) => {
+      expect(new SecretRedactor().redact(text), text).toBe(masked[i]);
+      expect(new SecretRedactor().addSecret('qzxwabcd12345678').redact(text), text).toBe(masked[i]);
+      expect(redactSecrets(text), text).toBe(masked[i]);
+    });
+    expect(redactSecrets('"Bearer ‹redacted›x", next')).toBe('"Bearer ‹redacted›", next');
+    expect(redactSecrets('a basic plan')).toBe('a basic plan');
+  });
+
+  it('masks it through the gateway, in structuredContent and in the text block', async () => {
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-mark-0001', state: 'AUTHORIZED', pspReference: values.join(' | ') });
+      },
+      policy: {},
+    });
+    const result = await gw.callTool('get_payment', { reference: 'echo-mark-0001', includeEvents: false });
+    const payment = (result.structuredContent as { payment: { pspReference: string } }).payment;
+    expect(payment.pspReference).toBe(masked.join(' | '));
+    expect(JSON.stringify(result.content)).not.toMatch(/cGFzcw|abcdef|‹redacted›x/);
+  });
+});
