@@ -173,3 +173,29 @@ describe('base64 forms of the keys and credential-shaped text', () => {
     expect(all).not.toContain(basic);
   });
 });
+
+describe('credential values with base64 padding (review of #10)', () => {
+  it('masks the whole Basic or Bearer value with = and == padding, never keeping the part before the padding', async () => {
+    const { SecretRedactor, redactSecrets } = await import('../src/errors.js');
+    const one = Buffer.from('qzxw:efg').toString('base64'); // 8 bytes: one '='
+    const two = Buffer.from('qzxw:ef').toString('base64'); // 7 bytes: '=='
+    expect(one).toMatch(/[^=]=$/);
+    expect(two).toMatch(/==$/);
+    const cases = [
+      `Basic ${one}`,
+      `basic ${two}`,
+      `BASIC ${two} and more`,
+      'bearer qzxwabcd12345678=',
+      'Bearer qzxwabcd12345678==',
+      `Authorization: Basic ${two}`,
+      `"authorization": "Bearer qzxwabcd12345678=="`,
+    ];
+    for (const text of cases) {
+      for (const out of [new SecretRedactor().redact(text), redactSecrets(text)]) {
+        expect(out, text).toContain('‹redacted›');
+        expect(out, text).not.toMatch(/qzxw|cXp4d|=/);
+      }
+    }
+    expect(redactSecrets('client_secret=qzxw=cd:ef')).toBe('client_secret= ‹redacted›');
+  });
+});

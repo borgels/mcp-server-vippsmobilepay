@@ -53,13 +53,33 @@ const BASE_PATTERNS: readonly RegExp[] = [
   headerPattern('ocp-apim-subscription-key'),
   // Any scheme word (Bearer, Basic, Token, ...) followed by the credentials.
   /["']?authorization["']?\s*[:=]\s*["']?(?:[a-z][\w-]*\s+)?[^"',\s}]+/gi,
-  // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters. A
-  // short word after "basic" ("basic plan") is left alone; a longer one is masked, a false positive we accept.
+  /(clientSecret|subscriptionKey|VIPPS_CLIENT_SECRET|VIPPS_SUBSCRIPTION_KEY|VIPPS_CLIENT_ID|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
+];
+
+/**
+ * Credentials without a name in front: each match is replaced whole (only a scheme word is kept), never split at a
+ * separator, because base64 padding (`=`, `==`) is part of the value.
+ */
+const CREDENTIAL_PATTERNS: readonly RegExp[] = [
+  // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters,
+  // padding included. A short word after "basic" ("basic plan") is left alone; a longer one is masked, a false
+  // positive we accept.
   /\b(bearer|basic)\s+[A-Za-z0-9._~+/-]{8,}=*/gi,
   // A JSON Web Token anywhere: three base64url segments, the first a JSON header ("eyJ").
   /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
-  /(clientSecret|subscriptionKey|VIPPS_CLIENT_SECRET|VIPPS_SUBSCRIPTION_KEY|VIPPS_CLIENT_ID|access_token)["']?\s*[:=]\s*["']?[^"',\s}]+/gi,
 ];
+
+/** Every credential match replaced whole: `Bearer ‹redacted›`, `basic ‹redacted›`, or `‹redacted›` for a JWT. */
+function applyCredentialPatterns(value: string): string {
+  return CREDENTIAL_PATTERNS.reduce(
+    (current, pattern) =>
+      current.replace(pattern, match => {
+        const scheme = /^(bearer|basic)\s/i.exec(match)?.[1];
+        return scheme ? `${scheme} ‹redacted›` : '‹redacted›';
+      }),
+    value,
+  );
+}
 
 /**
  * Redacts the secrets of one client, and so of one gateway or server
@@ -137,7 +157,7 @@ export class SecretRedactor {
     for (const secret of this.secrets) {
       result = result.split(secret).join('‹redacted›');
     }
-    return applyPatterns(this.redactFragments(result), this.patterns);
+    return applyPatterns(applyCredentialPatterns(this.redactFragments(result)), this.patterns);
   }
 
   /** Every run of text covered by a FRAGMENT_LENGTH-character piece of a secret becomes one ‹redacted›. */
@@ -255,7 +275,7 @@ export function formatUnknownError(error: unknown, redactor?: SecretRedactor): s
  * patterns are applied: no secret values are known outside an instance.
  */
 export function redactSecrets(value: string, redactor?: SecretRedactor): string {
-  return redactor ? redactor.redact(value) : applyPatterns(value, BASE_PATTERNS);
+  return redactor ? redactor.redact(value) : applyPatterns(applyCredentialPatterns(value), BASE_PATTERNS);
 }
 
 /** Origin and path of a URL, without query string or fragment (which may carry signatures). */
