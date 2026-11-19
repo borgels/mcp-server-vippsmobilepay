@@ -50,6 +50,8 @@ A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `open
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 
+**Personal data in results.** The known personal fields of the payer and the subscriber are left out: `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub`, `userinfoUrl`, phone numbers and the card number prefix. Payments, events and agreements pass through a typed allow-list (`src/vipps/views.ts`), so a field Vipps MobilePay adds later is left out until it is listed. This does not make the results free of personal data: a payment reference, a product name or a description is text the merchant or an integration chose, and it can hold a name or another personal detail. Treat results as data that may contain personal data.
+
 ## Keys and authentication
 
 The server uses the Access Token API (`POST /accesstoken/get`, standard authentication) with these headers, and sends the token as `Authorization: Bearer` together with the subscription key and MSN on every API call:
@@ -149,7 +151,7 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 |---|---|---|
 | `VIPPS_ENABLE_WRITES` | `false` | Enable the write tools. |
 | `VIPPS_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `vipps_` prefix. |
-| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ledger ids, dates, amounts and currency in clear text, payment references, agreement and charge ids and idempotency keys as `sha256:` pseudonyms, a refund description hashed, duration, status and the caller passed by an embedding host. Write tools refuse to run if the log cannot be written. |
+| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ledger ids, dates, amounts and currency in clear text, payment references, agreement and charge ids and idempotency keys as `sha256:` pseudonyms, a refund description hashed, duration, status, and the caller passed by an embedding host as a pseudonym only (`hmac:` and 16 hex characters with a random key per process). The request id is the server's own. A call rejected before it runs (an unknown tool or invalid input) is recorded with a fixed reason, the tool as `unknown_tool` when it does not exist, and of the input only the field names the tool's schema has, plus a count of the others. Write tools refuse to run if the log cannot be written. |
 
 ### HTTP transport
 
@@ -209,6 +211,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 
   The identifiers are pseudonyms because the caller chooses them: a reference may be any text of the allowed characters, a person's name among them. The same identifier always gets the same pseudonym, so log lines can be matched; give a `pseudonymKey` (a secret of the host) so that a guessable reference such as an order number cannot be found from its hash. Names and free text are never log fields (a refund's `description` is sent to Vipps MobilePay and only hashed in the audit log). `resolveVippsChange(tool, input, { pseudonymKey })` validates the input as `callTool` does, the operation key included, and returns the values.
 - **For a host such as letmcp.** Create the operation key when the change is drafted, keep it with the draft and in the log before the call, and call the tool with that same key when the person approves it and on every retry. Log `resolveVippsChange(...).change.values`, never the raw input.
+- **Call context.** `callTool(name, input, { caller, requestId })`: the audit writes `caller` only as a pseudonym (`hmac:` and 16 hex characters, with a key that is random per process, so the same caller can be followed within one process and not across restarts). The host's `requestId` is accepted and not written; each call gets the server's own request id, shared by its start, finish and error records.
 - **Several merchants in one process.** Each instance keeps its own access token and redacts with its own keys; nothing is kept in process-wide state.
 
 ## Threat model

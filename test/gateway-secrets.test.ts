@@ -122,3 +122,138 @@ describe('no piece of a key leaves an instance', () => {
     expect(leaks(error?.message)).toEqual([]);
   });
 });
+
+describe('base64 forms of the keys and credential-shaped text', () => {
+  const b64 = (text: string) => Buffer.from(text, 'utf8').toString('base64');
+  const b64url = (text: string) => b64(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  it('masks a key echoed base64- or base64url-encoded, alone or as a Basic credential', async () => {
+    const echoes = [
+      b64(KEYS.clientSecret),
+      b64url(KEYS.subscriptionKey),
+      b64(`${KEYS.clientId}:${KEYS.clientSecret}`),
+      b64url(`${KEYS.clientId}:`),
+    ];
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-b64-0001', state: 'AUTHORIZED', pspReference: echoes.join(' ') });
+      },
+      policy: {},
+    });
+    const result = await gw.callTool('get_payment', { reference: 'echo-b64-0001', includeEvents: false });
+    const all = JSON.stringify(result);
+    for (const echo of echoes) {
+      expect(all).not.toContain(echo.slice(0, 12));
+    }
+  });
+
+  it('masks Bearer and Basic values in any case, and JSON Web Tokens, in text', async () => {
+    const basic = Buffer.from('user:pass').toString('base64');
+    const jwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiJ0ZXN0In0', 'c2lnbmF0dXJlLXRlc3Q'].join('.');
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-cred-0001', state: 'AUTHORIZED', pspReference: `bearer abcdefgh12345678 BASIC ${basic} ${jwt}` });
+      },
+      policy: {},
+    });
+    const all = JSON.stringify(await gw.callTool('get_payment', { reference: 'echo-cred-0001', includeEvents: false }));
+    expect(all).not.toMatch(/abcdefgh12345678|eyJzdWIi/);
+    expect(all).not.toContain(basic);
+  });
+});
+
+describe('credential values with base64 padding (review of #10)', () => {
+  it('masks the whole Basic or Bearer value with = and == padding, never keeping the part before the padding', async () => {
+    const { SecretRedactor, redactSecrets } = await import('../src/errors.js');
+    const one = Buffer.from('qzxw:efg').toString('base64'); // 8 bytes: one '='
+    const two = Buffer.from('qzxw:ef').toString('base64'); // 7 bytes: '=='
+    expect(one).toMatch(/[^=]=$/);
+    expect(two).toMatch(/==$/);
+    const cases = [
+      `Basic ${one}`,
+      `basic ${two}`,
+      `BASIC ${two} and more`,
+      'bearer qzxwabcd12345678=',
+      'Bearer qzxwabcd12345678==',
+      `Authorization: Basic ${two}`,
+      `"authorization": "Bearer qzxwabcd12345678=="`,
+    ];
+    const expected = [
+      'Basic ‹redacted›',
+      'basic ‹redacted›',
+      'BASIC ‹redacted› and more',
+      'bearer ‹redacted›',
+      'Bearer ‹redacted›',
+      'Authorization: ‹redacted›',
+      '"authorization": ‹redacted›"',
+    ];
+    cases.forEach((text, i) => {
+      for (const out of [new SecretRedactor().redact(text), redactSecrets(text)]) expect(out, text).toBe(expected[i]);
+    });
+    expect(redactSecrets('client_secret=qzxw=cd:ef')).toBe('client_secret= ‹redacted›');
+  });
+});
+
+describe('credential values that hold a known key (review of #10, round 2)', () => {
+  it('masks the whole Basic, Bearer or JWT value even when a known key sits inside it', async () => {
+    const { SecretRedactor } = await import('../src/errors.js');
+    const r = new SecretRedactor().addSecret('qzxwabcd12345678');
+    const basic = Buffer.from('qzxwabcd12345678:othersecret').toString('base64');
+    expect(r.redact(`Basic ${basic}`)).toBe('Basic ‹redacted›');
+    expect(r.redact('Bearer qzxwabcd12345678tailtoken')).toBe('Bearer ‹redacted›');
+    expect(r.redact('Bearer headtokenqzxwabcd12345678==')).toBe('Bearer ‹redacted›');
+    const jwt = ['eyJhbGciOiJIUzI1NiJ9', Buffer.from('{"sub":"qzxwabcd12345678"}').toString('base64url'), 'qzxwabcd12345678sig'].join('.');
+    expect(r.redact(`token ${jwt} end`)).toBe('token ‹redacted› end');
+    // A value a previous redaction already marked is still masked whole.
+    expect(r.redact('Basic ‹redacted›pvdGhlcnNlY3JldA==')).toBe('Basic ‹redacted›');
+    // The known key on its own is still replaced.
+    expect(r.redact('plain qzxwabcd12345678 text')).toBe('plain ‹redacted› text');
+  });
+});
+
+describe('a scheme word before a value that holds the marker (review of #10, round 3)', () => {
+  const values = ['Basic ‹redacted›cGFzcw==', 'basic ‹redacted›abcdef', 'BEARER ‹redacted›abcdef', 'Bearer ‹redacted›x'];
+  const masked = ['Basic ‹redacted›', 'basic ‹redacted›', 'BEARER ‹redacted›', 'Bearer ‹redacted›'];
+
+  it('masks the whole value, whatever the length of the tail after the marker', async () => {
+    const { SecretRedactor, redactSecrets } = await import('../src/errors.js');
+    values.forEach((text, i) => {
+      expect(new SecretRedactor().redact(text), text).toBe(masked[i]);
+      expect(new SecretRedactor().addSecret('qzxwabcd12345678').redact(text), text).toBe(masked[i]);
+      expect(redactSecrets(text), text).toBe(masked[i]);
+    });
+    expect(redactSecrets('"Bearer ‹redacted›x", next')).toBe('"Bearer ‹redacted›", next');
+    expect(redactSecrets('a basic plan')).toBe('a basic plan');
+  });
+
+  it('masks it through the gateway, in structuredContent and in the text block', async () => {
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'test',
+      maxAttempts: 1,
+      sleep: async () => undefined,
+      fetchImpl: async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/accesstoken/get') return json({ access_token: TOKEN, expires_in: '3600' });
+        return json({ reference: 'echo-mark-0001', state: 'AUTHORIZED', pspReference: values.join(' | ') });
+      },
+      policy: {},
+    });
+    const result = await gw.callTool('get_payment', { reference: 'echo-mark-0001', includeEvents: false });
+    const payment = (result.structuredContent as { payment: { pspReference: string } }).payment;
+    expect(payment.pspReference).toBe(masked.join(' | '));
+    expect(JSON.stringify(result.content)).not.toMatch(/cGFzcw|abcdef|‹redacted›x/);
+  });
+});

@@ -57,6 +57,36 @@ const BASE_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
+ * Credentials without a name in front: each match is replaced whole (only a scheme word is kept), never split at a
+ * separator, because base64 padding (`=`, `==`) is part of the value.
+ */
+const CREDENTIAL_PATTERNS: readonly RegExp[] = [
+  // Bearer or Basic, in any case, before a value that holds the marker of an earlier redaction: the scheme word and the
+  // whole value up to a space, quote, comma or brace, whatever its length (a short tail after the marker is still part
+  // of the credential).
+  /\b(bearer|basic)\s+[^\s"',}]*‹redacted›[^\s"',}]*/gi,
+  // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters,
+  // padding included. A short word after "basic" ("basic plan") is left alone; a longer one is masked, a false
+  // positive we accept.
+  // A marker left by an earlier redaction counts as part of the value, so the rest of the value is masked too.
+  /\b(bearer|basic)\s+(?:[A-Za-z0-9._~+/-]|‹redacted›){8,}=*/gi,
+  // A JSON Web Token anywhere: three base64url segments, the first a JSON header ("eyJ").
+  /\beyJ(?:[A-Za-z0-9_-]|‹redacted›)*\.(?:[A-Za-z0-9_-]|‹redacted›)+\.(?:[A-Za-z0-9_-]|‹redacted›)*/g,
+];
+
+/** Every credential match replaced whole: `Bearer ‹redacted›`, `basic ‹redacted›`, or `‹redacted›` for a JWT. */
+function applyCredentialPatterns(value: string): string {
+  return CREDENTIAL_PATTERNS.reduce(
+    (current, pattern) =>
+      current.replace(pattern, match => {
+        const scheme = /^(bearer|basic)\s/i.exec(match)?.[1];
+        return scheme ? `${scheme} ‹redacted›` : '‹redacted›';
+      }),
+    value,
+  );
+}
+
+/**
  * Redacts the secrets of one client, and so of one gateway or server
  * instance: the exact values (raw, URL-encoded and JSON-escaped), every
  * fragment of FRAGMENT_LENGTH characters or more of them, and the values of
@@ -69,12 +99,15 @@ export class SecretRedactor {
   private readonly fragments = new Set<string>();
   private readonly patterns: RegExp[] = [...BASE_PATTERNS];
 
-  /** Redact this value and every piece of it. Values shorter than MIN_SECRET_LENGTH are ignored. */
+  /**
+   * Redact this value and every piece of it, also base64- and base64url-encoded (as a Basic credential or an echo
+   * would carry it). Values shorter than MIN_SECRET_LENGTH are ignored.
+   */
   addSecret(value: string | undefined): this {
     if (!value || value.length < MIN_SECRET_LENGTH) {
       return this;
     }
-    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])) {
+    for (const form of new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1), ...base64Forms(value)])) {
       this.secrets.add(form);
       for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) {
         this.fragments.add(form.slice(i, i + FRAGMENT_LENGTH));
@@ -125,11 +158,24 @@ export class SecretRedactor {
   }
 
   redact(value: string): string {
-    let result = value;
-    for (const secret of this.secrets) {
-      result = result.split(secret).join('‹redacted›');
+    // Credential-shaped text first, while it is whole: a known key replaced inside a Basic value or a token would
+    // break the match and leave the rest of the value. Then the known keys and their pieces, then the patterns again
+    // (they also take the marker as part of a value), until nothing changes.
+    let result = this.applyAllPatterns(value);
+    for (let round = 0; round < 4; round += 1) {
+      let next = result;
+      for (const secret of this.secrets) {
+        next = next.split(secret).join(REDACTION_MARKER);
+      }
+      next = this.applyAllPatterns(this.redactFragments(next));
+      if (next === result) break;
+      result = next;
     }
-    return applyPatterns(this.redactFragments(result), this.patterns);
+    return result;
+  }
+
+  private applyAllPatterns(text: string): string {
+    return applyPatterns(applyCredentialPatterns(text), this.patterns);
   }
 
   /** Every run of text covered by a FRAGMENT_LENGTH-character piece of a secret becomes one ‹redacted›. */
@@ -160,6 +206,17 @@ export class SecretRedactor {
     }
     return out;
   }
+}
+
+/**
+ * The base64 and base64url forms of a secret, without padding: of the value alone and of `value:`, the start of a
+ * Basic credential. Every piece of them is redacted like a piece of the value.
+ */
+function base64Forms(value: string): string[] {
+  return [value, `${value}:`].flatMap(text => {
+    const encoded = Buffer.from(text, 'utf8').toString('base64').replace(/=+$/, '');
+    return [encoded, encoded.replace(/\+/g, '-').replace(/\//g, '_')];
+  });
 }
 
 function applyPatterns(value: string, patterns: readonly RegExp[]): string {
@@ -236,7 +293,7 @@ export function formatUnknownError(error: unknown, redactor?: SecretRedactor): s
  * patterns are applied: no secret values are known outside an instance.
  */
 export function redactSecrets(value: string, redactor?: SecretRedactor): string {
-  return redactor ? redactor.redact(value) : applyPatterns(value, BASE_PATTERNS);
+  return redactor ? redactor.redact(value) : applyPatterns(applyCredentialPatterns(value), BASE_PATTERNS);
 }
 
 /** Origin and path of a URL, without query string or fragment (which may carry signatures). */

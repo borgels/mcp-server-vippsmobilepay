@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Ajv } from 'ajv';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { callerPseudonym } from '../src/vipps/audit.js';
 import {
   createVippsMobilePayGateway,
   vippsGatewayTools,
@@ -232,8 +233,7 @@ describe('host policy', () => {
     );
     expect(records.map(record => record.action)).toEqual(['start', 'finish']);
     expect(records[0]).toMatchObject({
-      requestId: 'req-1',
-      caller: 'person@fjordbakeriet.test',
+      caller: callerPseudonym('person@fjordbakeriet.test'),
       tool: 'vipps_refund_charge',
       target: {
         agreementId: pseudonym('agr_7TqP2m'),
@@ -243,7 +243,10 @@ describe('host policy', () => {
         currency: 'DKK',
       },
     });
-    expect(JSON.stringify(records)).not.toMatch(/TEST-PERSON|agr_7TqP2m|chr-5kSeqz/);
+    expect(JSON.stringify(records)).not.toMatch(/TEST-PERSON|agr_7TqP2m|chr-5kSeqz|person@|req-1/);
+    // The server's own request id, the same for the start and the finish of one call.
+    expect(records[0]?.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(records[1]?.requestId).toBe(records[0]?.requestId);
 
     const refusing = gateway(
       { 'POST /epayment/v1/payments/fjord-order-10042/cancel': { body: {} } },
@@ -336,5 +339,30 @@ describe('MCP server', () => {
     const names = (await mcpClient.listTools()).tools.map(tool => tool.name);
     expect(names).not.toContain('vipps_list_ledgers');
     expect(names).toContain('vipps_list_agreements');
+  });
+});
+
+describe('the audit of rejected calls and of the caller', () => {
+  it('writes the caller only as a pseudonym and never the host\'s request id', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const { gw } = gateway(
+      { 'GET /recurring/v3/agreements/agr_7TqP2m': { body: { id: 'agr_7TqP2m', status: 'ACTIVE' } } },
+      { policy: { audit: record => void records.push(record) } },
+    );
+    await gw.callTool('get_agreement', { agreementId: 'agr_7TqP2m' }, { caller: 'ada@example.test', requestId: 'host-ada-example' });
+    const all = JSON.stringify(records);
+    expect(all).not.toMatch(/ada@example\.test|host-ada-example/);
+    expect(records[0]?.caller).toMatch(/^hmac:[0-9a-f]{16}$/);
+  });
+
+  it('logs no tool or field name the caller wrote, only the tool\'s own field names and a count', async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const { gw } = gateway({}, { policy: { audit: record => void records.push(record) } });
+    await gw.callTool('ada_lovelace_tool', { 'ada@example.test': 1 }, { caller: 'ada@example.test' });
+    await gw.callTool('get_agreement', { agreementId: 'x', 'Ada Lovelace': 'y', 'phone 4512345678': 1 } as never);
+    expect(records.map(record => record.action)).toEqual(['rejected', 'rejected']);
+    expect(records[0]).toMatchObject({ tool: 'unknown_tool', reason: 'unsupported tool', target: { fields: [], unknownFields: 1 } });
+    expect(records[1]).toMatchObject({ tool: 'vipps_get_agreement', reason: 'invalid input', target: { fields: ['agreementId'], unknownFields: 2 } });
+    expect(JSON.stringify(records)).not.toMatch(/ada|Ada|4512345678/);
   });
 });
