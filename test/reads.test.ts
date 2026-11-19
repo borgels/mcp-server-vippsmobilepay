@@ -244,6 +244,43 @@ describe('ePayment reads', () => {
     expect(JSON.stringify(result)).not.toContain('internal trace');
   });
 
+  it('passes on no personal data placed inside allowed fields, and keeps only typed values', async () => {
+    const who = { firstName: 'Ada', email: 'ada@example.test' };
+    const body = payment({
+      amount: { currency: 'DKK', value: 49_900, userDetails: who },
+      aggregate: { authorizedAmount: { currency: 'DKK', value: 49_900 }, shippingDetails: { address: 'Fjordvej 1' }, capturedAmount: 'Ada' },
+      paymentMethod: { type: { name: 'Ada' } },
+      state: 'AUTHORIZED',
+    });
+    const { gw } = gateway({
+      'GET /epayment/v1/payments/fjord-order-10042': { body },
+      'GET /epayment/v1/payments/fjord-order-10042/events': { body: [{ name: 'AUTHORIZED', amount: { value: 1, userDetails: who }, success: true }] },
+    });
+    const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042' });
+    const all = JSON.stringify(result);
+    for (const word of ['Ada', 'ada@example.test', 'Fjordvej', 'userDetails', 'shippingDetails']) expect(all, word).not.toContain(word);
+    expect(result.structuredContent).toMatchObject({ payment: { amount: { currency: 'DKK', value: 49_900 }, paymentMethod: {} } });
+  });
+
+  it('never passes on an error text the events answer itself carries, only our fixed text', async () => {
+    const { gw } = gateway({
+      'GET /epayment/v1/payments/fjord-order-10042': { body: payment() },
+      'GET /epayment/v1/payments/fjord-order-10042/events': { body: { error: 'Ada Lovelace ada@example.test http://10.0.0.1/internal' } },
+    });
+    const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042' });
+    expect(JSON.stringify(result)).not.toMatch(/Ada|example\.test|10\.0\.0\.1/);
+    expect(result.structuredContent).toMatchObject({ events: { error: 'Vipps MobilePay answered the events in an unexpected form.' } });
+  });
+
+  it('refuses a payment answer that is not a payment, instead of an empty result', async () => {
+    for (const body of [[], 'text', { title: 'not a payment' }, { reference: 'fjord-order-10042' }]) {
+      const { gw } = gateway({ 'GET /epayment/v1/payments/fjord-order-10042': { body } });
+      const result = await gw.callTool('get_payment', { reference: 'fjord-order-10042', includeEvents: false });
+      expect(result.isError, JSON.stringify(body)).toBe(true);
+      expect(JSON.stringify(result)).toContain('unexpected form');
+    }
+  });
+
   it('refuses a reference outside the documented pattern before any request', async () => {
     const { gw, calls } = gateway();
     for (const reference of ['short', '../../management', 'fjord order 1', 'x'.repeat(65)]) {
@@ -264,7 +301,10 @@ describe('Recurring reads', () => {
       sub: 'c06c4afe-d9e1-4c5d-939a-177d752a0944',
       userinfoUrl: 'https://api.example.test/userinfo/c06c4afe',
       phoneNumber: '4512345678',
+      pricing2: { userDetails: { firstName: 'Ada' } },
+      campaign: { type: 'PRICE_CAMPAIGN', price: 100, userinfoUrl: 'https://api.example.test/userinfo/c06c4afe', explanation: { name: 'Ada' } },
     };
+    (agreement as Record<string, unknown>).pricing = { ...agreement.pricing, userDetails: { firstName: 'Ada', email: 'ada@example.test' } };
     const { gw } = gateway({
       'GET /recurring/v3/agreements/agr_5kSeqz': { body: agreement },
       'GET /recurring/v3/agreements': { body: [agreement] },
@@ -272,7 +312,7 @@ describe('Recurring reads', () => {
     for (const [tool, input] of [['get_agreement', { agreementId: 'agr_5kSeqz' }], ['list_agreements', {}]] as const) {
       const result = await gw.callTool(tool, input);
       const all = JSON.stringify(result);
-      for (const word of ['c06c4afe', 'userinfo', '4512345678']) expect(all, `${tool} ${word}`).not.toContain(word);
+      for (const word of ['c06c4afe', 'userinfo', '4512345678', 'Ada', 'ada@example.test']) expect(all, `${tool} ${word}`).not.toContain(word);
       expect(all, tool).toContain('Abonnement');
     }
   });

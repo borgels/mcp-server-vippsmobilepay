@@ -2,7 +2,7 @@ import { nestedFailureText } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
-import { paymentEventsView, paymentView } from './views.js';
+import { paymentEventsView, paymentView, UNEXPECTED_EVENTS } from './views.js';
 
 /**
  * ePayment API: read one payment and its events; capture, refund or cancel it.
@@ -37,13 +37,16 @@ export async function getPayment(client: UpstreamClient, input: { reference: str
   if (input.includeEvents === false) {
     return { payment };
   }
-  // A combined read: the payment is returned even when its events cannot be read. The failure is kept as
-  // nestedFailureText (the status, or a fixed text), never as the error's own message.
-  const events = await client.get(`${path}/events`).then(
-    body => body,
-    (error: unknown) => ({ error: nestedFailureText(error) }),
+  // A combined read: the payment is returned even when its events cannot be read. Our own failure text is built
+  // here and kept apart from Vipps MobilePay's answer: a failed read gives nestedFailureText (the status, or a fixed
+  // text), an answer that is not a list of events gives a fixed text, and nothing of the answer is passed on then.
+  const read = await client.get(`${path}/events`).then(
+    body => ({ ok: true as const, body }),
+    (error: unknown) => ({ ok: false as const, failure: nestedFailureText(error) }),
   );
-  return { payment, events: paymentEventsView(events) };
+  if (!read.ok) return { payment, events: { error: read.failure } };
+  const events = paymentEventsView(read.body);
+  return { payment, events: events ?? { error: UNEXPECTED_EVENTS } };
 }
 
 /** An Amount object's value in minor units, or undefined. */
