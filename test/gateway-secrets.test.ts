@@ -190,12 +190,35 @@ describe('credential values with base64 padding (review of #10)', () => {
       `Authorization: Basic ${two}`,
       `"authorization": "Bearer qzxwabcd12345678=="`,
     ];
-    for (const text of cases) {
-      for (const out of [new SecretRedactor().redact(text), redactSecrets(text)]) {
-        expect(out, text).toContain('‹redacted›');
-        expect(out, text).not.toMatch(/qzxw|cXp4d|=/);
-      }
-    }
+    const expected = [
+      'Basic ‹redacted›',
+      'basic ‹redacted›',
+      'BASIC ‹redacted› and more',
+      'bearer ‹redacted›',
+      'Bearer ‹redacted›',
+      'Authorization: ‹redacted›',
+      '"authorization": ‹redacted›"',
+    ];
+    cases.forEach((text, i) => {
+      for (const out of [new SecretRedactor().redact(text), redactSecrets(text)]) expect(out, text).toBe(expected[i]);
+    });
     expect(redactSecrets('client_secret=qzxw=cd:ef')).toBe('client_secret= ‹redacted›');
+  });
+});
+
+describe('credential values that hold a known key (review of #10, round 2)', () => {
+  it('masks the whole Basic, Bearer or JWT value even when a known key sits inside it', async () => {
+    const { SecretRedactor } = await import('../src/errors.js');
+    const r = new SecretRedactor().addSecret('qzxwabcd12345678');
+    const basic = Buffer.from('qzxwabcd12345678:othersecret').toString('base64');
+    expect(r.redact(`Basic ${basic}`)).toBe('Basic ‹redacted›');
+    expect(r.redact('Bearer qzxwabcd12345678tailtoken')).toBe('Bearer ‹redacted›');
+    expect(r.redact('Bearer headtokenqzxwabcd12345678==')).toBe('Bearer ‹redacted›');
+    const jwt = ['eyJhbGciOiJIUzI1NiJ9', Buffer.from('{"sub":"qzxwabcd12345678"}').toString('base64url'), 'qzxwabcd12345678sig'].join('.');
+    expect(r.redact(`token ${jwt} end`)).toBe('token ‹redacted› end');
+    // A value a previous redaction already marked is still masked whole.
+    expect(r.redact('Basic ‹redacted›pvdGhlcnNlY3JldA==')).toBe('Basic ‹redacted›');
+    // The known key on its own is still replaced.
+    expect(r.redact('plain qzxwabcd12345678 text')).toBe('plain ‹redacted› text');
   });
 });

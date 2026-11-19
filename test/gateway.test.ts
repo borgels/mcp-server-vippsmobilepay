@@ -366,4 +366,3 @@ describe('the audit of rejected calls and of the caller', () => {
     expect(JSON.stringify(records)).not.toMatch(/ada|Ada|4512345678/);
   });
 });
-

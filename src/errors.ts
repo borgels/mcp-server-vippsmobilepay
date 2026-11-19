@@ -64,9 +64,10 @@ const CREDENTIAL_PATTERNS: readonly RegExp[] = [
   // Bearer or Basic in any case, when what follows looks like a token: 8 or more base64 or base64url characters,
   // padding included. A short word after "basic" ("basic plan") is left alone; a longer one is masked, a false
   // positive we accept.
-  /\b(bearer|basic)\s+[A-Za-z0-9._~+/-]{8,}=*/gi,
+  // A marker left by an earlier redaction counts as part of the value, so the rest of the value is masked too.
+  /\b(bearer|basic)\s+(?:[A-Za-z0-9._~+/-]|‹redacted›){8,}=*/gi,
   // A JSON Web Token anywhere: three base64url segments, the first a JSON header ("eyJ").
-  /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g,
+  /\beyJ(?:[A-Za-z0-9_-]|‹redacted›)*\.(?:[A-Za-z0-9_-]|‹redacted›)+\.(?:[A-Za-z0-9_-]|‹redacted›)*/g,
 ];
 
 /** Every credential match replaced whole: `Bearer ‹redacted›`, `basic ‹redacted›`, or `‹redacted›` for a JWT. */
@@ -153,11 +154,24 @@ export class SecretRedactor {
   }
 
   redact(value: string): string {
-    let result = value;
-    for (const secret of this.secrets) {
-      result = result.split(secret).join('‹redacted›');
+    // Credential-shaped text first, while it is whole: a known key replaced inside a Basic value or a token would
+    // break the match and leave the rest of the value. Then the known keys and their pieces, then the patterns again
+    // (they also take the marker as part of a value), until nothing changes.
+    let result = this.applyAllPatterns(value);
+    for (let round = 0; round < 4; round += 1) {
+      let next = result;
+      for (const secret of this.secrets) {
+        next = next.split(secret).join(REDACTION_MARKER);
+      }
+      next = this.applyAllPatterns(this.redactFragments(next));
+      if (next === result) break;
+      result = next;
     }
-    return applyPatterns(applyCredentialPatterns(this.redactFragments(result)), this.patterns);
+    return result;
+  }
+
+  private applyAllPatterns(text: string): string {
+    return applyPatterns(applyCredentialPatterns(text), this.patterns);
   }
 
   /** Every run of text covered by a FRAGMENT_LENGTH-character piece of a secret becomes one ‹redacted›. */
