@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+- Gateway error results carry failure metadata: when the upstream API
+  answered with an HTTP error, the result has `failure: { httpStatus,
+  requestId? }`, so a host can count failures by status without reading
+  their text. `requestId` is the vendor's own id from a response header
+  (`REQUEST_ID_HEADERS`: the common request-id headers), kept only
+  when it is a hex id of 8 to 64 characters (one run of hex digits,
+  or groups of four or more joined by single hyphens, as in a UUID) and does not hold the
+  shape of a personal number. It is checked again after redaction, so an id
+  that shared a piece with the key is dropped. Never the body, the vendor's
+  error code or message. The shared helpers are in `src/errors.ts`
+  (`vendorRequestId`, `requestIdFrom`, `failureMetadata`). An HTTP error
+  from the Access Token API counts too, and so does a failed read of the
+  events when a capture or refund is then refused (the HTTP error is the
+  refusal's cause; nothing is sent).
 
 - The audit writes the caller only as a pseudonym (`hmac:` and 16 hex characters, random key per process) and never the host's request id: every call gets the server's own.
 - A rejected call (unknown tool or invalid input) logs nothing the caller wrote as text: an unknown tool is `unknown_tool`, the reason is fixed (`unsupported tool`, `invalid input`), and of the input only the field names in the tool's schema are kept, with a count of the others.

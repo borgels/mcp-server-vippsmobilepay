@@ -1,5 +1,5 @@
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { VippsHttpError, describeUrl, parseRetryAfterMs, SecretRedactor } from '../errors.js';
+import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
@@ -488,6 +488,7 @@ export class VippsMobilePayClient implements UpstreamClient {
         status: response.status,
         url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
+        requestId: requestIdFrom(response.headers),
         tokenRequest,
       });
     }
