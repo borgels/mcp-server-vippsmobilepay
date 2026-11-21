@@ -13,7 +13,9 @@
   that shared a piece with the key is dropped. Never the body, the vendor's
   error code or message. The shared helpers are in `src/errors.ts`
   (`vendorRequestId`, `requestIdFrom`, `failureMetadata`). An HTTP error
-  from the Access Token API counts too.
+  from the Access Token API counts too, and so does a failed read of the
+  events when a capture or refund is then refused (the HTTP error is the
+  refusal's cause; nothing is sent).
 
 - The audit writes the caller only as a pseudonym (`hmac:` and 16 hex characters, random key per process) and never the host's request id: every call gets the server's own.
 - A rejected call (unknown tool or invalid input) logs nothing the caller wrote as text: an unknown tool is `unknown_tool`, the reason is fixed (`unsupported tool`, `invalid input`), and of the input only the field names in the tool's schema are kept, with a count of the others.

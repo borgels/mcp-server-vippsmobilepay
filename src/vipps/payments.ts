@@ -1,4 +1,4 @@
-import { nestedFailureText } from '../errors.js';
+import { nestedFailureText, VippsHttpError } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
@@ -14,10 +14,13 @@ import { paymentEventsView, paymentView, UNEXPECTED_EVENTS } from './views.js';
  * amount from ever being sent.
  */
 
-/** A change refused by this server before anything was sent. */
+/**
+ * A change refused by this server before anything was sent. When a read from Vipps MobilePay failed on the way, its
+ * HTTP error is the cause (the gateway gives its status and request id as failure metadata; the text is ours).
+ */
 export class ChangeRefusedError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'ChangeRefusedError';
   }
 }
@@ -119,10 +122,18 @@ async function earlierEvent(
   client: UpstreamClient,
   input: MoneyChangeInput,
   name: 'CAPTURED' | 'REFUNDED',
-): Promise<{ name: string; amount: { currency: MerchantCurrency; value: number }; timestamp: string | null } | undefined> {
-  // When the events cannot be read, the change is refused as before: nothing is sent either way.
-  const events = await client.get(`${paymentPath(input.reference)}/events`).catch(() => undefined);
-  if (!Array.isArray(events)) return undefined;
+): Promise<{
+  done?: { name: string; amount: { currency: MerchantCurrency; value: number }; timestamp: string | null };
+  readError?: VippsHttpError;
+}> {
+  // When the events cannot be read, the change is refused as before: nothing is sent either way. An HTTP error of
+  // that read is kept, so the refusal can carry it as its cause.
+  let readError: VippsHttpError | undefined;
+  const events = await client.get(`${paymentPath(input.reference)}/events`).catch((error: unknown) => {
+    if (error instanceof VippsHttpError) readError = error;
+    return undefined;
+  });
+  if (!Array.isArray(events)) return { readError };
   for (const entry of events) {
     const event = asRecord(entry);
     const amount = asRecord(event.amount);
@@ -134,10 +145,10 @@ async function earlierEvent(
       amount.currency === input.currency
     ) {
       const timestamp = typeof event.timestamp === 'string' && /^[\dT:.+Z-]{10,40}$/.test(event.timestamp) ? event.timestamp : null;
-      return { name, amount: { currency: input.currency, value: input.amount }, timestamp };
+      return { done: { name, amount: { currency: input.currency, value: input.amount }, timestamp } };
     }
   }
-  return undefined;
+  return {};
 }
 
 export async function capturePayment(client: UpstreamClient, input: MoneyChangeInput): Promise<unknown> {
@@ -148,10 +159,11 @@ export async function capturePayment(client: UpstreamClient, input: MoneyChangeI
   checkCurrency(figures, input.currency);
   const capturable = figures.authorized - figures.captured - figures.cancelled;
   if (input.amount > capturable) {
-    const done = await earlierEvent(client, input, 'CAPTURED');
+    const { done, readError } = await earlierEvent(client, input, 'CAPTURED');
     if (done) return { idempotencyKey: input.idempotencyKey, alreadyDone: true, event: done };
     throw new ChangeRefusedError(
       `Refused: ${input.amount} is more than the ${Math.max(0, capturable)} (minor units) left to capture. Nothing was sent.`,
+      readError ? { cause: readError } : undefined,
     );
   }
   const payment = await client.post(
@@ -167,10 +179,11 @@ export async function refundPayment(client: UpstreamClient, input: MoneyChangeIn
   checkCurrency(figures, input.currency);
   const refundable = figures.captured - figures.refunded;
   if (input.amount > refundable) {
-    const done = await earlierEvent(client, input, 'REFUNDED');
+    const { done, readError } = await earlierEvent(client, input, 'REFUNDED');
     if (done) return { idempotencyKey: input.idempotencyKey, alreadyDone: true, event: done };
     throw new ChangeRefusedError(
       `Refused: ${input.amount} is more than the ${Math.max(0, refundable)} (minor units) captured and not yet refunded. Nothing was sent.`,
+      readError ? { cause: readError } : undefined,
     );
   }
   const payment = await client.post(

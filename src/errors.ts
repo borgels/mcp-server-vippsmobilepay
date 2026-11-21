@@ -323,12 +323,21 @@ export interface FailureMetadata {
   requestId?: string;
 }
 
-/** The failure metadata of an error: an HTTP error from the upstream API gives its status and request id. */
+/**
+ * The failure metadata of an error: an HTTP error from the upstream API gives its status and request id, also when
+ * it is the direct cause of our own error (a capture or refund refused after a failed read of the events).
+ */
 export function failureMetadata(error: unknown): FailureMetadata | undefined {
-  if (!(error instanceof VippsHttpError)) return undefined;
-  const status = error.status;
+  const http =
+    error instanceof VippsHttpError
+      ? error
+      : error instanceof Error && error.cause instanceof VippsHttpError
+        ? error.cause
+        : undefined;
+  if (http === undefined) return undefined;
+  const status = http.status;
   if (!Number.isInteger(status) || status < 100 || status > 599) return undefined;
-  const requestId = vendorRequestId(error.requestId);
+  const requestId = vendorRequestId(http.requestId);
   return requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId };
 }
 

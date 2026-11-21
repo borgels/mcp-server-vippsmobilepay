@@ -2,7 +2,7 @@
 // only), for a host that counts failures without reading their text. Never the body, the vendor's code or message.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { failureMetadata, requestIdFrom, VippsHttpError, vendorRequestId } from '../src/errors.js';
-import { BASE, gateway } from './helpers.js';
+import { BASE, gateway, payment } from './helpers.js';
 
 const UUID = '3f2b8c1e-9a4d-4e6f-8b7a-1c2d3e4f5a6b';
 const REFERENCE = 'order-1001';
@@ -70,6 +70,9 @@ describe('vendorRequestId', () => {
     });
     expect(failureMetadata(new Error('boom'))).toBeUndefined();
     expect(failureMetadata('boom')).toBeUndefined();
+    const http = new VippsHttpError({ status: 503, url: `${BASE}/epayment/v1/payments/x/events`, requestId: UUID });
+    expect(failureMetadata(new Error('ours', { cause: http }))).toEqual({ httpStatus: 503, requestId: UUID });
+    expect(failureMetadata(new Error('ours', { cause: new Error('boom') }))).toBeUndefined();
   });
 });
 
@@ -132,6 +135,38 @@ describe('gateway error results', () => {
       },
     ).gw;
     expect((await offline.callTool('get_payment', { reference: REFERENCE })).failure).toBeUndefined();
+  });
+
+  it('carry the status of a failed events read when a capture or refund is refused, and nothing is sent', async () => {
+    const reference = 'fjord-order-10042';
+    const path = `/epayment/v1/payments/${reference}`;
+    for (const tool of ['capture_payment', 'refund_payment']) {
+      const { gw, calls } = gateway(
+        {
+          [`GET ${path}`]: { body: payment() },
+          [`GET ${path}/events`]: { status: 503, body: VENDOR_BODY, headers: { 'x-request-id': UUID } },
+        },
+        { policy: { enableWrites: true } },
+      );
+      const result = await gw.callTool(tool, { reference, amount: 60_000, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toMatch(/^Refused: /);
+      expect(result.failure).toEqual({ httpStatus: 503, requestId: UUID });
+      expect(JSON.stringify(result)).not.toContain('Jane Doe');
+      expect(calls.filter(call => call.method === 'POST' && call.path.startsWith('/epayment/'))).toHaveLength(0);
+    }
+  });
+
+  it('have no metadata when a capture is refused after the events were read', async () => {
+    const reference = 'fjord-order-10042';
+    const path = `/epayment/v1/payments/${reference}`;
+    const { gw } = gateway(
+      { [`GET ${path}`]: { body: payment() }, [`GET ${path}/events`]: { body: [] } },
+      { policy: { enableWrites: true } },
+    );
+    const result = await gw.callTool('capture_payment', { reference, amount: 60_000, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' });
+    expect(result.isError).toBe(true);
+    expect(result.failure).toBeUndefined();
   });
 
   it('are absent on a successful result', async () => {
