@@ -14,7 +14,7 @@ import {
   type InstancePolicy,
 } from './vipps/policy.js';
 import { ConfigError } from './config-env.js';
-import { formatUnknownError, redactDeep, SecretRedactor } from './errors.js';
+import { failureMetadata, formatUnknownError, redactDeep, SecretRedactor, vendorRequestId, type FailureMetadata } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
@@ -74,10 +74,19 @@ export interface GatewayToolDefinition {
   inputSchema: GatewayJsonObject;
 }
 
+/**
+ * Metadata about a failed call, on an error result whose cause is known: the HTTP status the upstream API answered
+ * with, and the vendor's own request id when a response header gives one as a UUID or hex id. For a host that counts
+ * failures without reading their text. Never the response body, the vendor's error code or message, or the input.
+ */
+export type GatewayFailure = FailureMetadata;
+
 export interface GatewayToolResult {
   content: Array<{ type: 'text'; text: string }>;
   structuredContent?: GatewayJsonValue;
   isError?: boolean;
+  /** On an error result from the upstream API only: its HTTP status and request id (see GatewayFailure). */
+  failure?: GatewayFailure;
 }
 
 export type GatewayCallContext = CallContext;
@@ -389,7 +398,9 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.
       return underPolicy(() =>
         runCall(toolName, input, context).then(result => {
-          const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult;
+          const final = withFailureInForm(
+            JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult,
+          );
           return leaksSecret(final, redactor) ? withheldResult() : final;
         }),
       );
@@ -419,7 +430,7 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       const text = tool.returnsUpstreamContent ? `${tool.summary} ${UNTRUSTED_CONTENT_NOTE}` : tool.summary;
       return jsonResult(text, data);
     } catch (error) {
-      return errorResult(formatUnknownError(error, redactor));
+      return errorResult(formatUnknownError(error, redactor), failureMetadata(error));
     }
   }
 }
@@ -434,6 +445,23 @@ function jsonResult(text: string, structuredContent: unknown): GatewayToolResult
   };
 }
 
-function errorResult(text: string): GatewayToolResult {
-  return { isError: true, content: [{ type: 'text', text }] };
+function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult {
+  return {
+    isError: true,
+    content: [{ type: 'text', text }],
+    ...(failure ? { failure } : {}),
+  };
+}
+
+/**
+ * The failure metadata as it must be after redaction: on an error result only, a status of 100-599 and a request id
+ * still in the form of one (redaction can have changed it). Anything else is dropped, never passed on.
+ */
+function withFailureInForm(result: GatewayToolResult): GatewayToolResult {
+  const { failure, ...rest } = result;
+  if (!result.isError || failure === undefined || failure === null || typeof failure !== 'object') return rest;
+  const status = failure.httpStatus;
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return rest;
+  const requestId = vendorRequestId(failure.requestId);
+  return { ...rest, failure: requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId } };
 }

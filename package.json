@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-vippsmobilepay",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "mcpName": "io.github.borgels/mcp-server-vippsmobilepay",
   "description": "Unofficial MCP server for the Vipps MobilePay APIs: settlements and ledger entries, ePayment payments and Recurring agreements, with opt-in capture, refund and cancel.",
   "type": "module",
