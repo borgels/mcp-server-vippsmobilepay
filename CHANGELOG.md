@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- The write tools (capture, refund and cancel of payments and charges) are no
+  longer annotated `destructiveHint: true`, and their `riskLevel` in the
+  gateway catalog is `write` (was `destructive`): each adds an operation to a
+  payment or charge and deletes or overwrites nothing. They still move or
+  release money and cannot be undone, which `requiresConfirmation` and
+  `change.movesMoney` say: a host should have a person confirm each call
+  outside the chat. Writes stay off by default. Nothing else changes.
+
 ## 0.3.1
 
 - Licensor and copyright holder corrected to Borgels Services ApS in `LICENSE`,
