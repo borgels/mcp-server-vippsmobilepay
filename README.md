@@ -25,11 +25,11 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 | `vipps_get_agreement` | read | One Recurring agreement. |
 | `vipps_list_charges` | read | The charges of one agreement, optionally by status. |
 | `vipps_get_charge` | read | One charge of an agreement. |
-| `vipps_capture_payment` | destructive | Capture all or part of an authorized payment. |
-| `vipps_refund_payment` | destructive | Refund all or part of a captured payment. |
-| `vipps_cancel_payment` | destructive | Cancel a payment; the reserved, uncaptured amount is released. |
-| `vipps_refund_charge` | destructive | Refund all or part of a charged Recurring charge. |
-| `vipps_cancel_charge` | destructive | Cancel a pending, due, reserved or partially captured charge; what is reserved and not captured is released. |
+| `vipps_capture_payment` | write (confirm) | Capture all or part of an authorized payment. |
+| `vipps_refund_payment` | write (confirm) | Refund all or part of a captured payment. |
+| `vipps_cancel_payment` | write (confirm) | Cancel a payment; the reserved, uncaptured amount is released. |
+| `vipps_refund_charge` | write (confirm) | Refund all or part of a charged Recurring charge. |
+| `vipps_cancel_charge` | write (confirm) | Cancel a pending, due, reserved or partially captured charge; what is reserved and not captured is released. |
 
 **Before a write.** Capture and refund read the payment (or charge) first and refuse, without sending anything, when the currency differs from the payment's or the amount is more than can be captured or refunded. Capture needs an `AUTHORIZED` payment; cancelling a charge needs a cancellable status. The payment's or charge's amounts must be whole, non-negative minor units that add up (nothing captured beyond what was authorized, nothing refunded beyond what was captured), and its currency one of NOK, DKK and EUR; otherwise the change is refused with a fixed text.
 
@@ -200,7 +200,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 - **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required; a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
 - **Host policy.** `policy` takes `enableWrites` (default false), `disabledTools`, `allowedTools` (an allow-list: when given, only these tools are offered, reads included; it must name known tools and must not be empty) and `audit`, a function that receives each audit record (a write does not run if the sink throws on its start record). Unknown tool names and malformed values throw at creation. An instance with `policy` reads none of `VIPPS_ENABLE_WRITES`, `VIPPS_DISABLED_TOOLS`, `VIPPS_AUDIT_LOG` or `VIPPS_ALLOW_CUSTOM_BASE_URL`.
 - **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating payments or charges, capturing a Recurring charge, and any other DELETE.
-- **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `destructive`), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney: true` and `logFields`, each with the one type its value must have:
+- **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `write`; no tool is `destructive`, as none deletes or overwrites anything), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney: true` and `logFields`, each with the one type its value must have:
 
   | Type | Fields | Value |
   |---|---|---|
@@ -234,7 +234,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 ## Security model
 
 - **One identity per instance.** Every caller acts with the rights of the configured keys. Per-user authorization belongs to the host or a gateway in front of the server.
-- **Writes are off by default** and annotated destructive. Read-only tools get a client that refuses POST and DELETE. When an audit log or sink is configured, a write does not run unless its start record is written.
+- **Writes are off by default.** They are not annotated destructive (each adds a capture, refund or cancellation and deletes nothing), but each moves or releases money and cannot be undone: `requiresConfirmation` is true for every write, and a host should have a person confirm each call outside the chat. Read-only tools get a client that refuses POST and DELETE. When an audit log or sink is configured, a write does not run unless its start record is written.
 - **The keys stay on the Vipps MobilePay hosts.** Redirects are never followed, and the base URL must be `api.vipps.no` or `apitest.vipps.no` over https (or loopback).
 - **The HTTP transport fails closed**: token required off loopback, constant-time comparison, throttled failures, `Origin` and `Host` checks, capped bodies.
 
