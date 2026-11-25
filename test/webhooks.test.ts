@@ -196,22 +196,24 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
 };
 
 describe('the secret, swept through every result', () => {
-  it('is never in what any tool or host function returns or throws, once registered', async () => {
+  // Varied: the secret's form, and an id that is ordinary. (An id holding the secret, and a secret that is a key, are
+  // withheld at registration; see 'what a registration answer gives on'.)
+  it.each([UUID_SIGNING_VALUE, SIGNING_VALUE, 'c0ffee00-1234-4bcd-8ef0-a1b2c3d4e5f6'])('is never in what any tool or host function returns or throws, once registered (%#)', async SWEPT => {
     let status = 200;
     let registered = false;
     // After the registration every answer carries the secret wherever a text can stand: values, a key, a header.
     const answer = (url: URL) => {
       if (!registered && url.pathname === '/webhooks/v1/webhooks') {
         registered = true;
-        return { body: { id: REGISTRATION_ID, secret: UUID_SIGNING_VALUE } };
+        return { body: { id: REGISTRATION_ID, secret: SWEPT } };
       }
       return {
         status,
-        headers: { 'x-request-id': UUID_SIGNING_VALUE },
+        headers: { 'x-request-id': SWEPT },
         body:
           url.pathname === '/webhooks/v1/webhooks'
-            ? { id: REGISTRATION_ID, secret: UUID_SIGNING_VALUE, webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${UUID_SIGNING_VALUE}`, events: [UUID_SIGNING_VALUE] }] }
-            : payment({ reference: UUID_SIGNING_VALUE, pspReference: UUID_SIGNING_VALUE, [UUID_SIGNING_VALUE]: UUID_SIGNING_VALUE, note: UUID_SIGNING_VALUE }),
+            ? { id: REGISTRATION_ID, secret: SWEPT, webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${SWEPT}`, events: [SWEPT] }] }
+            : payment({ reference: SWEPT, pspReference: SWEPT, [SWEPT]: SWEPT, note: SWEPT }),
       };
     };
     const routes = new Proxy({} as Record<string, unknown>, {
@@ -219,7 +221,7 @@ describe('the secret, swept through every result', () => {
     });
     const records: unknown[] = [];
     const { gw } = gateway(routes as never, { policy: { enableWrites: true, audit: record => void records.push(record) } });
-    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(UUID_SIGNING_VALUE);
+    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(SWEPT);
     const seen: unknown[] = [];
     for (status of [200, 400, 500]) {
       for (const tool of vippsGatewayTools) {
@@ -229,12 +231,64 @@ describe('the secret, swept through every result', () => {
       seen.push(await gw.listWebhooks().catch((e: unknown) => String(e)));
       // A new registration gives its secret on, as asked; only that field may hold it.
       const again = await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.authorized.v1']).catch((e: unknown) => String(e));
-      seen.push(typeof again === 'string' ? again : { ...again, secret: again.secret === UUID_SIGNING_VALUE ? 'the one asked for' : again.secret });
+      seen.push(typeof again === 'string' ? again : { ...again, secret: again.secret === SWEPT ? 'the one asked for' : again.secret });
       seen.push(await gw.removeWebhook(REGISTRATION_ID).catch((e: unknown) => String(e)));
     }
     expect(seen.length).toBe(3 * (vippsGatewayTools.length + 3));
     const text = JSON.stringify([seen, records]);
-    expect(text).not.toContain(UUID_SIGNING_VALUE);
-    expect(text).not.toContain(UUID_SIGNING_VALUE.slice(9, 23));
+    expect(text).not.toContain(SWEPT);
+    expect(text).not.toContain(SWEPT.slice(9, 23));
+  });
+});
+
+describe('what a registration answer gives on', () => {
+  const register = async (answer: Record<string, unknown>) => {
+    const records: unknown[] = [];
+    const { gw } = gateway(
+      {
+        'POST /webhooks/v1/webhooks': { body: answer },
+        'GET /webhooks/v1/webhooks': { body: { webhooks: [{ id: REGISTRATION_ID, url: ADDRESS, events: [] }] } },
+      },
+      { policy: { audit: record => void records.push(record) } },
+    );
+    const result = await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1']).catch((e: unknown) => e as Error);
+    const listed = await gw.listWebhooks().catch((e: unknown) => String(e));
+    return { gw, result, text: JSON.stringify([result instanceof Error ? result.message : result, listed, records]) };
+  };
+
+  // Several made-up registration values, in the forms Vipps MobilePay's guides show.
+  const values = [UUID_SIGNING_VALUE, SIGNING_VALUE, 'c0ffee00-1234-4bcd-8ef0-a1b2c3d4e5f6', 'Zx9_Ym8-Wv7_Ut6-Sr5_Qp4'];
+
+  it('withholds an id that is, or holds, the new secret, whatever the secret', async () => {
+    for (const value of values) {
+      for (const id of [value, `reg-${value}`.slice(0, 64), `${value.slice(0, 20)}-x`]) {
+        if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) continue;
+        const { result, text } = await register({ id, secret: value });
+        expect(result, `${id} / ${value}`).toBeInstanceOf(Error);
+        expect(text, `${id} / ${value}`).not.toContain(value);
+        expect(text, `${id} / ${value}`).not.toContain(value.slice(2, 14));
+      }
+    }
+  });
+
+  it('withholds a secret that is, or shares a piece with, one of the instance\'s keys', async () => {
+    for (const key of [KEYS.clientSecret, KEYS.clientId, KEYS.subscriptionKey]) {
+      for (const secret of [key, `${key.slice(0, 12)}-new-value-zzzz`, `prefix-${key}`]) {
+        const { result, text } = await register({ id: REGISTRATION_ID, secret });
+        expect(result, secret.slice(0, 4)).toBeInstanceOf(Error);
+        expect(text).not.toContain(key);
+        expect(text).not.toContain(key.slice(0, 12));
+      }
+    }
+  });
+
+  it('gives a new secret on once, and the same secret again on a repeat, and masks it everywhere else', async () => {
+    for (const value of values) {
+      const { gw, result, text } = await register({ id: REGISTRATION_ID, secret: value });
+      expect(result).toEqual({ id: REGISTRATION_ID, secret: value });
+      // Only the field asked for holds it.
+      expect(text.split(value).length - 1).toBe(1);
+      expect(await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).toEqual({ id: REGISTRATION_ID, secret: value });
+    }
   });
 });

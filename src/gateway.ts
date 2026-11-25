@@ -416,6 +416,11 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
+  /** The instance's own keys only: a registration secret must share no piece with them. */
+  const keysOnly = new SecretRedactor();
+  for (const name of SECRET_OPTIONS) keysOnly.addSecret(secrets[name]);
+  /** The registration secrets this instance has given on: the same one again is a repeat, not a leak. */
+  const givenSigningValues = new Set<string>();
   /**
    * What a host function returns, as a tool result is returned: with this instance's secrets redacted everywhere, then
    * the sink check. A value that still holds a piece of a secret is withheld whole, as a failure in our own words.
@@ -456,14 +461,19 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
      * key (Vipps MobilePay does not document it for this API).
      */
     registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
-      // The secret is the one value given on unmasked: it is what the host asked for, and a repeat of the registration may
-      // give the same one again. Everything else of the answer (the id) goes through the same check as any other value.
-      // From then on the secret is masked like the keys: in every later error, failure metadata, result, host value and
-      // audit record.
+      // The secret is the one value given on unmasked, because it is what the host asked for, and only when it is new to
+      // this instance's keys: one that shares a piece with a key is withheld (it may be an echo of the key). The same
+      // secret as an earlier registration of this instance is a repeat and goes on. It is masked from here on, before
+      // the rest of the answer is checked, so an id that holds it is withheld too; and from then on everywhere: every
+      // later error, failure metadata, result, host value and audit record.
       return hostCall(async () => {
         const registration = await underPolicy(() => registerPaymentEvents(client, address, events));
-        const { id } = guarded({ id: registration.id });
+        const repeat = givenSigningValues.has(registration.secret);
+        if (!repeat && leaksSecret(registration.secret, keysOnly)) throw new Error(HOST_ANSWER_WITHHELD);
         redactor.addSecret(registration.secret);
+        givenSigningValues.add(registration.secret);
+        const { id } = guarded({ id: registration.id });
+        if (id !== registration.id) throw new Error(HOST_ANSWER_WITHHELD);
         return { id, secret: registration.secret };
       }, undefined, false);
     },
