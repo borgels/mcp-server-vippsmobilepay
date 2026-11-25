@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased: payment requests
+## 0.6.0
+
+A new write tool, `create_payment`, and three changes a host must look at
+before taking this version in, which is why it is 0.6.0:
+
+- the answers of `capture_payment`, `refund_payment` and `cancel_payment` pass
+  an allow-list, so a field outside it is no longer passed on;
+- `get_payment` passes on an event's `idempotencyKey` only for a capture, a
+  refund and a cancellation;
+- in the gateway catalog `change.action` can be `create` and
+  `change.movesMoney` is a boolean, so a host that has typed it as `true`
+  must widen the type.
+
+The details are in the entries below.
 
 - New write tool `create_payment`: ask a customer to pay with an ePayment
   payment request, as a link (`WEB_REDIRECT`), as a QR code (`QR`) or sent to
