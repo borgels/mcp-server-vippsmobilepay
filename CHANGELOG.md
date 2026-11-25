@@ -48,8 +48,18 @@
   the form of a JSON Web Token, which the redaction would otherwise mask; the
   check that withholds a result holding a piece of the instance's keys still
   applies to it.
-- The capture, refund and cancel tools are unchanged, their caller-chosen
-  `idempotencyKey` included.
+- The audit logs the description of a payment request as `descriptionHmac`,
+  a keyed hash that cannot be tested against a guess without the client
+  secret. A refund's description is still logged as `descriptionSha256`.
+- The state of a payment is read as a text, as the specification types it and
+  as the test environment answers. A list with exactly one documented state,
+  as the specification's example writes it, is read as that state; any other
+  form is no state. This holds for `get_payment`, for the check before a
+  capture, for the answer to a capture, a refund and a cancellation, and for
+  `create_payment`.
+- The input and the operation of the capture, refund and cancel tools are
+  unchanged, their caller-chosen `idempotencyKey` included. Their answers are
+  filtered, as said above.
 
 ## 0.5.0
 

@@ -59,8 +59,15 @@ const NOON = Date.parse('2026-11-25T12:00:00Z');
 const IN_TWO_WEEKS = '2026-12-09T12:00:00Z';
 const later = { ...byLink, orderLines, expiresAt: IN_TWO_WEEKS } as const;
 
-/** The description is logged like a refund's: only as its SHA-256. */
-const DESCRIPTION_HASH = createHash('sha256').update('Kagebord til lørdag').digest('hex');
+/** A keyed hash as the client makes it: a key for the one purpose, derived from the client secret. */
+const hashWith =
+  (secret: string) =>
+  (purpose: KeyedHashPurpose, text: string): string =>
+    createHmac('sha256', createHmac('sha256', secret).update(`mcp-server-vippsmobilepay ${purpose} v1`).digest()).update(text).digest('hex');
+/** The description is logged only as a keyed hash of it. */
+const DESCRIPTION_HMAC = hashWith(KEYS.clientSecret)('audit-text', 'Kagebord til lørdag').slice(0, 32);
+/** What it was logged as before, and what a refund's description still is: a hash anyone can test a guess against. */
+const DESCRIPTION_SHA256 = createHash('sha256').update('Kagebord til lørdag').digest('hex');
 
 const posts = (calls: Call[]) => apiCalls(calls).filter(call => call.method === 'POST' && call.path === '/epayment/v1/payments');
 const keysOf = (calls: Call[]) => posts(calls).map(call => call.headers['Idempotency-Key']);
@@ -318,7 +325,16 @@ describe('create_payment creates a request', () => {
     expectNothingLeaks(result, [token('a-read'), token('a-test')]);
     // The audit: start and finish, with the reference as a pseudonym and neither number, text, address nor key.
     expect(records.map(record => record.action)).toEqual(['start', 'finish']);
-    expect(records[0]?.target).toEqual({ reference: pseudonym(REFERENCE), amount: 24_900, currency: 'DKK', delivery: 'phone', descriptionSha256: DESCRIPTION_HASH });
+    expect(records[0]?.target).toEqual({ reference: pseudonym(REFERENCE), amount: 24_900, currency: 'DKK', delivery: 'phone', descriptionHmac: DESCRIPTION_HMAC });
+    // Not the hash without a key, whole or in part, and not a keyed hash made for another purpose.
+    expectNothingLeaks(records, [
+      DESCRIPTION_SHA256,
+      DESCRIPTION_SHA256.slice(0, 32),
+      DESCRIPTION_SHA256.slice(0, 16),
+      'descriptionSha256',
+      hashWith(KEYS.clientSecret)('request-fingerprint', 'Kagebord til lørdag').slice(0, 32),
+      createHmac('sha256', KEYS.clientSecret).update('Kagebord til lørdag').digest('hex').slice(0, 32),
+    ]);
     expectNothingLeaks(records, ['Kagebord', REFERENCE, ...marksOf(calls), 'landing.example']);
   });
 
@@ -358,7 +374,7 @@ describe('create_payment creates a request', () => {
       currency: 'DKK',
       delivery: 'link',
       expiresAt: input.expiresAt,
-      descriptionSha256: DESCRIPTION_HASH,
+      descriptionHmac: DESCRIPTION_HMAC,
     });
     expectNothingLeaks(records, ['Kagebord', 'Levering', 'F-2026-0412', 'fjordbakeriet.example', 'landing.example', token('a-test')]);
   });
@@ -553,12 +569,6 @@ describe('a customer link and redaction', () => {
 });
 
 describe('the fingerprint and the key of a request', () => {
-  /** A keyed hash as the client makes it, with a made-up secret. */
-  const hashWith =
-    (secret: string) =>
-    (purpose: KeyedHashPurpose, text: string): string =>
-      createHmac('sha256', createHmac('sha256', secret).update(`mcp-server-vippsmobilepay ${purpose} v1`).digest()).update(text).digest('hex');
-
   it('are the same for the same content, whatever the order of the fields, and the key fits the header', () => {
     const hash = hashWith('notreal-secret-one');
     const one = { merchantSerialNumber: '212345', request: { reference: REFERENCE, amount: { value: 1, currency: 'DKK' } } };

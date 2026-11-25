@@ -1,7 +1,7 @@
 import { nestedFailureText, VippsHttpError } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
-import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
+import { stateText, isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
 import { modificationView, paymentEventsView, paymentView, UNEXPECTED_EVENTS } from './views.js';
 
 /**
@@ -72,7 +72,7 @@ async function paymentFigures(client: UpstreamClient, reference: string): Promis
   const aggregate = asRecord(payment.aggregate);
   const currency = asRecord(payment.amount).currency;
   const figures = {
-    state: typeof payment.state === 'string' ? payment.state : '',
+    state: stateText(payment.state) ?? '',
     currency: typeof currency === 'string' ? currency : '',
     authorized: amountValue(aggregate.authorizedAmount),
     captured: amountValue(aggregate.capturedAmount),

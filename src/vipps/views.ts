@@ -1,4 +1,4 @@
-import { isDerivedIdempotencyKey } from './values.js';
+import { isDerivedIdempotencyKey, stateText } from './values.js';
 
 /**
  * What the read tools pass on of a payment, its events and an agreement: a
@@ -85,9 +85,16 @@ export class UnexpectedAnswerError extends Error {
 /** The fixed text of an events answer that is not a list of events. */
 export const UNEXPECTED_EVENTS = 'Vipps MobilePay answered the events in an unexpected form.';
 
+/** The answer with its state as a text (stateText), when it holds one in the other documented form. */
+function withStateText(answer: unknown): unknown {
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return answer;
+  const record = answer as Record<string, unknown>;
+  return typeof record.state === 'string' ? record : { ...record, state: stateText(record.state) };
+}
+
 /** A payment through the allow-list. Refused unless it has a reference and a state. */
 export function paymentView(payment: unknown): Record<string, unknown> {
-  const out = typed(payment, PAYMENT) as Record<string, unknown> | undefined;
+  const out = typed(withStateText(payment), PAYMENT) as Record<string, unknown> | undefined;
   if (!out || typeof out.reference !== 'string' || typeof out.state !== 'string') throw new UnexpectedAnswerError('the payment');
   return out;
 }
@@ -100,7 +107,7 @@ export function paymentView(payment: unknown): Record<string, unknown> {
  * is not on the list is left out, and an answer that is no object is empty.
  */
 export function modificationView(answer: unknown): Record<string, unknown> {
-  return (typed(answer, PAYMENT) as Record<string, unknown> | undefined) ?? {};
+  return (typed(withStateText(answer), PAYMENT) as Record<string, unknown> | undefined) ?? {};
 }
 
 /**

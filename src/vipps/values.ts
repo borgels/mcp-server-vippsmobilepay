@@ -132,8 +132,26 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
+/** The states of an ePayment payment (the specification's State). */
+export const PAYMENT_STATES = ['CREATED', 'ABORTED', 'EXPIRED', 'AUTHORIZED', 'TERMINATED'] as const;
+export type PaymentState = (typeof PAYMENT_STATES)[number];
+
+/**
+ * The state of a payment as a text. The specification types it as a text,
+ * and Vipps MobilePay's test environment answers with one; the
+ * specification's own example writes it as a list with one state
+ * (`["AUTHORIZED"]`). A text is taken as it is. A list is taken only when it
+ * holds exactly one of the documented states, and is then that state.
+ * Anything else is no state.
+ */
+export function stateText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.length === 1) return PAYMENT_STATES.find(state => state === value[0]);
+  return undefined;
+}
+
 /** What a keyed hash is used for. Each use has its own key, so one value says nothing of another. */
-export type KeyedHashPurpose = 'request-fingerprint' | 'idempotency-key';
+export type KeyedHashPurpose = 'request-fingerprint' | 'idempotency-key' | 'audit-text';
 
 /** Characters of a keyed hash that are used: 128 bits, as hex. */
 const MARK_LENGTH = 32;

@@ -2,7 +2,16 @@ import { CustomerLink, VippsHttpError, withNote } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { ChangeRefusedError } from './payments.js';
-import { derivedIdempotencyKey, requestFingerprint, timestampMs, type KeyedHashPurpose, type MerchantCurrency } from './values.js';
+import {
+  derivedIdempotencyKey,
+  PAYMENT_STATES,
+  requestFingerprint,
+  stateText,
+  timestampMs,
+  type KeyedHashPurpose,
+  type MerchantCurrency,
+  type PaymentState,
+} from './values.js';
 
 /**
  * ePayment API: a new payment request (create_payment).
@@ -213,9 +222,6 @@ function createNote(status: number, input: CreatePaymentInput, now: number): str
     .join(' ');
 }
 
-const PAYMENT_STATES = ['CREATED', 'ABORTED', 'EXPIRED', 'AUTHORIZED', 'TERMINATED'] as const;
-type PaymentState = (typeof PAYMENT_STATES)[number];
-
 /** What is known of the request at Vipps MobilePay after a call. */
 interface Outcome {
   /** Vipps MobilePay answered the create request of this call with success. */
@@ -257,7 +263,8 @@ async function readBack(client: UpstreamClient, input: CreatePaymentInput, finge
     asRecord(payment.paymentMethod).type === 'WALLET' &&
     asRecord(payment.metadata)[FINGERPRINT_FIELD] === fingerprint;
   if (!proven) return { kind: 'other' };
-  return { kind: 'ours', state: PAYMENT_STATES.find(state => state === payment.state), landingPage: CustomerLink.from(payment.redirectUrl) };
+  const text = stateText(payment.state);
+  return { kind: 'ours', state: PAYMENT_STATES.find(state => state === text), landingPage: CustomerLink.from(payment.redirectUrl) };
 }
 
 const WAITING = 'The request waits for the customer to approve it. get_payment shows the state.';

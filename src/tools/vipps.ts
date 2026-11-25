@@ -148,6 +148,8 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   change?: VippsChangeSpec;
   /** Cross-field checks the schema shape cannot express. Returns a refusal or undefined. */
   check?: (input: Record<string, unknown>) => string | undefined;
+  /** The audit logs a free text of this tool (description) as a keyed hash, not as a hash anyone can test a guess against. */
+  keyedAuditText?: boolean;
   handler: (client: UpstreamClient, input: z.infer<z.ZodObject<S>>) => Promise<unknown>;
 }
 
@@ -418,6 +420,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       delivery: 'delivery',
     }),
     check: input => checkCreatePayment(input),
+    keyedAuditText: true,
     handler: async (client, input) => createPayment(client, input),
   }),
   defineTool({
@@ -651,7 +654,7 @@ export async function executeTool(
   context?: CallContext,
 ): Promise<unknown> {
   const { requestId, caller } = normaliseCallContext(context);
-  const target = auditTarget(input);
+  const target = auditTarget(input, tool.keyedAuditText ? text => client.keyedHash('audit-text', text) : undefined);
   const { redactor } = client;
 
   let policy = checkToolPolicy(tool.name, tool.annotations.readOnlyHint);

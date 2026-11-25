@@ -63,7 +63,7 @@ Where the two values go, and where they do not (`test/create-payment.test.ts`, "
 | The answer of `get_payment` | Neither. A payment passes an allow-list without `metadata`. An event passes on its `idempotencyKey` only when it is a capture, a refund or a cancellation (`CAPTURED`, `REFUNDED`, `CANCELLED`, `TERMINATED`), whose key the caller chose; a key in the form this server derives is passed on under no event. |
 | The answers of `capture_payment`, `refund_payment` and `cancel_payment` | Neither. What Vipps MobilePay answers a change with passes the same allow-list as a payment. |
 | Errors | Neither. The texts are this server's own, and the vendor's body is never read. |
-| The audit, `resolveVippsChange` and the console | Neither. The audit holds the named input fields; neither value is an input. |
+| The audit, `resolveVippsChange` and the console | Neither. The audit holds the named input fields; neither value is an input. The description is logged as a third keyed hash (`descriptionHmac`), made with a key of its own. |
 
 **After the client secret is replaced** the same input gives another key and another fingerprint. A request made before is then no longer recognised: the same call is refused as a conflict, and nothing of the payment is returned. It is not created a second time, since the reference is used; `get_payment` shows it. A request made after the replacement is recognised as before.
 
@@ -219,7 +219,7 @@ Configuration is read from the environment (see `.env.example`). Invalid numbers
 |---|---|---|
 | `VIPPS_ENABLE_WRITES` | `false` | Enable the write tools. |
 | `VIPPS_DISABLED_TOOLS` | – | Comma-separated tool names to disable, with or without the `vipps_` prefix. |
-| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ledger ids, dates, amounts and currency in clear text, payment references, agreement and charge ids and idempotency keys as `sha256:` pseudonyms, a description hashed, the delivery and deadline of a payment request in clear text (never its phone number, return address or order lines), duration, status, and the caller passed by an embedding host as a pseudonym only (`hmac:` and 16 hex characters with a random key per process). The request id is the server's own. A call rejected before it runs (an unknown tool or invalid input) is recorded with a fixed reason, the tool as `unknown_tool` when it does not exist, and of the input only the field names the tool's schema has, plus a count of the others. Write tools refuse to run if the log cannot be written. |
+| `VIPPS_AUDIT_LOG` | – | Path of a JSONL audit log: one record per tool call start, finish and error, with ledger ids, dates, amounts and currency in clear text, payment references, agreement and charge ids and idempotency keys as `sha256:` pseudonyms, a description hashed (a refund's with SHA-256, a payment request's with a keyed hash that cannot be tested against a guess without the client secret), the delivery and deadline of a payment request in clear text (never its phone number, return address or order lines), duration, status, and the caller passed by an embedding host as a pseudonym only (`hmac:` and 16 hex characters with a random key per process). The request id is the server's own. A call rejected before it runs (an unknown tool or invalid input) is recorded with a fixed reason, the tool as `unknown_tool` when it does not exist, and of the input only the field names the tool's schema has, plus a count of the others. Write tools refuse to run if the log cannot be written. |
 
 ### HTTP transport
 
@@ -311,16 +311,28 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
-## Not verified against Vipps MobilePay
+## Verified and not verified against Vipps MobilePay
 
-The client follows the published OpenAPI specifications (Access Token 2.0.0, Report 2.0, ePayment 1.8.5, Recurring 3.2.3) and is tested against mocked HTTP only. Not yet tried against the test environment:
+The client follows the published OpenAPI specifications (Access Token 2.0.0, Report 2.0, ePayment 1.8.5, Recurring 3.2.3) and is tested against mocked HTTP.
 
+**Observed in the test environment** (25 November 2026, one payment request of 100 minor units in DKK as a link, created with `metadata` and read back; only statuses, field names and yes or no were recorded, never a value):
+
+- `POST /epayment/v1/payments` answered HTTP 201 with `redirectUrl` and `reference`.
+- `GET /epayment/v1/payments/{reference}`, at once and three seconds later, answered HTTP 200 with `aggregate`, `amount`, `metadata`, `paymentMethod.type`, `profile` (empty), `pspReference`, `redirectUrl`, `reference` and `state`. The `metadata` given at the creation came back unchanged, which is what the proof in `create_payment` rests on. `state` was a text (`CREATED`), and the payment method `WALLET`.
+- The events of the payment were one `CREATED` event, and it held the `Idempotency-Key` of the create request. `get_payment` does not pass that key on.
+- The identical request again under the same key was answered with HTTP 201 and the same `redirectUrl`: the first answer again.
+- The same reference under another key, with the same content and with another amount, was refused with HTTP 409 (`application/problem+json`).
+- A reference that no payment has was answered with HTTP 404.
+- The link was an https address with no path and one query parameter, `token`, in the form of a JSON Web Token, 866 characters in all, and the `redirectUrl` read back was the same as the one in the answer to the create request.
+
+**Not tried:**
+
+- production, where none of the above has been observed;
+- a QR code (`QR`), a request to a phone number (`PUSH_MESSAGE`, on an approved sales unit), and a request with `expiresAt` on a sales unit that has it enabled;
+- for how long an `Idempotency-Key` is remembered, and what the same request is answered with after that (`create_payment` handles a refusal with HTTP 400 as well as 409);
+- a `state` written as a list. The specification types it as a text and its example shows a list with one state (`["AUTHORIZED"]`); the test environment answered with a text. A list with exactly one documented state is read as that state, and any other form is no state (`test/payment-state.test.ts`);
 - the paging of `GET /recurring/v3/agreements` with `pageNumber` and `pageSize`, and `Continuation-Token` on the charge list;
 - an `Idempotency-Key` on `POST .../cancel` (the ePayment specification does not list it for cancel);
-- what a repeated `Idempotency-Key` on `POST /epayment/v1/payments` is answered with (the first answer again, or a refusal), for how long a key is remembered, and whether a reference already used is refused with HTTP 400 or 409; `create_payment` handles each of these, and reads the payment after either status;
-- that `metadata` given when a payment is created comes back when it is read (the specification says it "is passed through in the `GetPaymentResponse` object"); if it did not, every `create_payment` whose payment is read back would end as an error after the request was accepted, and a repeated request as a conflict: never as another request's payment taken for this one;
-- whether the events of a payment hold the `Idempotency-Key` of the request that created it; the key is not passed on either way;
-- the form of the customer's link (`redirectUrl`), `PUSH_MESSAGE` on an approved sales unit, and a request with `expiresAt` on a sales unit that has it enabled;
 - partner keys (production only, so they cannot be tried in the test environment);
 - the Report API with the merchant's own keys for every kind of sales unit.
 

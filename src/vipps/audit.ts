@@ -181,14 +181,28 @@ const ID_FIELDS = [
  */
 const PSEUDONYM_FIELDS = ['reference', 'agreementId', 'chargeId', 'idempotencyKey'] as const;
 
-/** Free-text fields are hashed so user-written text does not land in the log. */
+/**
+ * Free-text fields are hashed so user-written text does not land in the log:
+ * `<field>Sha256`. A hash without a key does not hide a short text from
+ * someone who tries candidates, so a tool can ask for a keyed one instead
+ * (auditTarget's `keyedText`): `<field>Hmac`, which cannot be tested against
+ * a guess without the client secret.
+ */
 const FREE_TEXT_FIELDS = ['description'] as const;
+
+/** Characters of a keyed hash of a free text that are logged: 128 bits, as hex. */
+const KEYED_TEXT_LENGTH = 32;
 
 /** Write payload objects: only their field names are logged. None of the tools takes one. */
 const PAYLOAD_FIELDS = [] as const;
 
-/** Build the audit `target` for a tool input. Values not listed above are not logged. */
-export function auditTarget(input: unknown): Record<string, unknown> | undefined {
+/**
+ * Build the audit `target` for a tool input. Values not listed above are not
+ * logged. With `keyedText` a free text is logged as that keyed hash of it,
+ * and never as a hash without a key; when the keyed hash cannot be made (no
+ * keys), nothing of the text is logged.
+ */
+export function auditTarget(input: unknown, keyedText?: (text: string) => string): Record<string, unknown> | undefined {
   if (!input || typeof input !== 'object') {
     return undefined;
   }
@@ -210,7 +224,15 @@ export function auditTarget(input: unknown): Record<string, unknown> | undefined
 
   for (const field of FREE_TEXT_FIELDS) {
     if (typeof value[field] === 'string' && value[field] !== '') {
-      target[`${field}Sha256`] = hashValue(value[field] as string);
+      if (keyedText === undefined) {
+        target[`${field}Sha256`] = hashValue(value[field] as string);
+        continue;
+      }
+      try {
+        target[`${field}Hmac`] = keyedText(value[field] as string).slice(0, KEYED_TEXT_LENGTH);
+      } catch {
+        // No keys to make it with: the call fails on that, and the text is left out.
+      }
     }
   }
 

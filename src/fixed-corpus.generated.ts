@@ -455,6 +455,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "api.vipps.no",
   "apitest.vipps.no",
   "application/json",
+  "audit-text",
   "base64",
   "bigint",
   "boolean",
