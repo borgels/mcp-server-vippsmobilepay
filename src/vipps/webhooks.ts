@@ -70,7 +70,9 @@ function isPublicName(hostname: string): boolean {
 
 /**
  * The address must be the host's own and public: https on the default port, a public name, no credentials, no
- * fragment. An IP literal, a single label and a local or internal name are refused before anything is sent.
+ * fragment. An IP literal, a single label and a local or internal name are refused before anything is sent. The check is
+ * on the name's form only: it does not resolve the name or prove who owns it, so it is no full guard against a public
+ * name that points inward. Vipps MobilePay sends to the address, not this server.
  */
 function checkedAddress(value: unknown): string {
   if (typeof value !== 'string' || value.length > 2048) throw new Error('Refused: the address for events must be an https URL. Nothing was sent.');
@@ -80,7 +82,7 @@ function checkedAddress(value: unknown): string {
   } catch {
     throw new Error('Refused: the address for events must be an https URL. Nothing was sent.');
   }
-  if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.href !== value) {
+  if (url.protocol !== 'https:' || url.username || url.password || url.hash || value.includes('#') || url.href !== value) {
     throw new Error('Refused: the address for events must be an https URL. Nothing was sent.');
   }
   if (url.port !== '' || !isPublicName(url.hostname)) {

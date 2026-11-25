@@ -12,7 +12,9 @@
   quoted, since it may hold the secret. The secret is masked by the instance
   from then on, like its keys. The address must be https on a public host
   name: IP literals, single labels, non-default ports and local or internal
-  names are refused before anything is sent. The events are sent sorted, so
+  names are refused before anything is sent (by the name's form, without a
+  DNS lookup). Every value a host function returns goes through the same
+  redaction and leak check as a tool result. The events are sent sorted, so
   the same set always gives the same request and operation key.
 - All four `Vipps-System-*` headers are sent on every request, as Vipps
   MobilePay requires of partners and plugins. An embedding host can give its

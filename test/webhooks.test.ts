@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { VIPPS_PAYMENT_EVENTS, vippsGatewayTools } from '../src/gateway.js';
+import { VIPPS_PAYMENT_EVENTS, vippsGatewayTools, type GatewayJsonObject } from '../src/gateway.js';
 import { isAllowedRequest } from '../src/vipps/client.js';
-import { apiCalls, gateway, KEYS } from './helpers.js';
+import { apiCalls, fakeToken, gateway, KEYS, payment } from './helpers.js';
 
 const originalEnv = { ...process.env };
 beforeEach(() => {
@@ -14,7 +14,7 @@ afterEach(() => {
 const ADDRESS = 'https://events.example.com/fjordbakeriet';
 const REGISTRATION_ID = 'reg-fjord-one';
 // Made up for the test, in the form Vipps MobilePay gives a registration's secret.
-const WEBHOOK_SECRET = 'notreal-webhook-signing-secret';
+const WEBHOOK_SECRET = 'whsig_QmvZrLpTxKwYbN';
 /** A made-up secret in the form of a UUID, as Vipps MobilePay's guide shows one. */
 const UUID_SECRET = '7a1b2c3d-0e9f-4a8b-9c7d-6e5f4a3b2c1d';
 
@@ -78,7 +78,7 @@ describe('webhook registration for the host', () => {
     const { gw } = gateway({
       'POST /webhooks/v1/webhooks': { body: { id: REGISTRATION_ID, secret: UUID_SECRET } },
       'GET /epayment/v1/payments/fjord-order-10042': { status: 500, body: { detail: UUID_SECRET }, headers: { 'x-request-id': UUID_SECRET } },
-      'GET /epayment/v1/payments/fjord-order-10043': { body: { reference: 'fjord-order-10043', note: UUID_SECRET } },
+      'GET /epayment/v1/payments/fjord-order-10043': { body: payment({ reference: 'fjord-order-10043', pspReference: UUID_SECRET }) },
       'DELETE /webhooks/v1/webhooks/reg-fjord-two': { status: 503, headers: { 'x-request-id': UUID_SECRET } },
     }, { policy: { audit: record => void records.push(record) } });
     expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(UUID_SECRET);
@@ -86,12 +86,41 @@ describe('webhook registration for the host', () => {
     expect(failed.isError).toBe(true);
     expect(JSON.stringify(failed)).not.toContain(UUID_SECRET);
     expect(failed.failure?.requestId).toBeUndefined();
-    // An answer that holds it is never passed on with it.
-    expect(JSON.stringify(await gw.callTool('get_payment', { reference: 'fjord-order-10043' }))).not.toContain(UUID_SECRET);
+    // An answer that holds it is never passed on with it, and the call itself still succeeds.
+    const read = await gw.callTool('get_payment', { reference: 'fjord-order-10043' });
+    expect(read.isError).not.toBe(true);
+    expect(JSON.stringify(read)).not.toContain(UUID_SECRET);
     const removal = await gw.removeWebhook('reg-fjord-two').catch((e: unknown) => e as Error);
     expect(String((removal as Error).message)).not.toContain(UUID_SECRET);
     expect(records.length).toBeGreaterThan(0);
     expect(JSON.stringify(records)).not.toContain(UUID_SECRET);
+  });
+
+  it('masks the secret in the list of registrations too, as in any other value it returns', async () => {
+    const { gw } = gateway({
+      'POST /webhooks/v1/webhooks': { body: { id: REGISTRATION_ID, secret: UUID_SECRET } },
+      'GET /webhooks/v1/webhooks': {
+        body: { webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?k=${UUID_SECRET}`, events: [UUID_SECRET, 'epayments.payment.captured.v1'] }] },
+      },
+    });
+    await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1']);
+    const listed = await gw.listWebhooks();
+    expect(listed).toHaveLength(1);
+    expect(JSON.stringify(listed)).not.toContain(UUID_SECRET);
+    expect(JSON.stringify(listed)).not.toContain(UUID_SECRET.slice(9, 23));
+  });
+
+  it('masks a key in the list of registrations, as in a tool result', async () => {
+    const { gw } = gateway({
+      'GET /webhooks/v1/webhooks': { body: { webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?c=${KEYS.clientSecret}`, events: [] }] } },
+    });
+    expect(JSON.stringify(await gw.listWebhooks())).not.toContain(KEYS.clientSecret);
+  });
+
+  it('refuses an empty fragment too', async () => {
+    const { gw, calls } = gateway();
+    await expect(gw.registerPaymentEvents('https://events.example.com/x#', ['epayments.payment.captured.v1'])).rejects.toThrow(/https URL/);
+    expect(apiCalls(calls)).toEqual([]);
   });
 
   it('refuses an address that is not https, or an unknown event, before anything is sent', async () => {
@@ -139,5 +168,73 @@ describe('webhook registration for the host', () => {
     expect(VIPPS_PAYMENT_EVENTS).toContain('epayments.payment.authorized.v1');
     expect(isAllowedRequest('DELETE', '/webhooks/v1/webhooks')).toBe(false);
     expect(isAllowedRequest('POST', '/webhooks/v1/webhooks/x')).toBe(false);
+  });
+});
+
+/** A sample input per tool: the sweep below fails for a tool without one, so a new tool is swept too. */
+const SAMPLES: Record<string, GatewayJsonObject> = {
+  check_connection: {},
+  list_ledgers: {},
+  get_funds_summary: { ledgerId: '302321', fromDate: '2026-11-01', toDate: '2026-11-02' },
+  list_transactions: { ledgerId: '302321', fromDate: '2026-11-01', toDate: '2026-11-01', topic: 'fees' },
+  get_payment: { reference: 'fjord-order-10042' },
+  list_agreements: { status: 'STOPPED' },
+  get_agreement: { agreementId: 'agr_7TqP2m' },
+  list_charges: { agreementId: 'agr_7TqP2m' },
+  get_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz' },
+  find_charge: { chargeId: 'chr-5kSeqz' },
+  get_receipt: { reference: 'fjord-order-10042' },
+  list_sales_units: {},
+  get_sales_unit: {},
+  list_qr_codes: {},
+  create_payment: { reference: 'fjord-order-10077', amount: 24_900, currency: 'DKK', description: 'Kagebord', delivery: 'link', returnUrl: 'https://fjordbakeriet.example.com/tak' },
+  capture_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },
+  refund_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },
+  cancel_payment: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' },
+  refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren', idempotencyKey: 'op-0001-aaaa' },
+  cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
+};
+
+describe('the secret, swept through every result', () => {
+  it('is never in what any tool or host function returns or throws, once registered', async () => {
+    let status = 200;
+    let registered = false;
+    // After the registration every answer carries the secret wherever a text can stand: values, a key, a header.
+    const answer = (url: URL) => {
+      if (!registered && url.pathname === '/webhooks/v1/webhooks') {
+        registered = true;
+        return { body: { id: REGISTRATION_ID, secret: UUID_SECRET } };
+      }
+      return {
+        status,
+        headers: { 'x-request-id': UUID_SECRET },
+        body:
+          url.pathname === '/webhooks/v1/webhooks'
+            ? { id: REGISTRATION_ID, secret: UUID_SECRET, webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${UUID_SECRET}`, events: [UUID_SECRET] }] }
+            : payment({ reference: UUID_SECRET, pspReference: UUID_SECRET, [UUID_SECRET]: UUID_SECRET, note: UUID_SECRET }),
+      };
+    };
+    const routes = new Proxy({} as Record<string, unknown>, {
+      get: (_target, key) => (key === 'POST /accesstoken/get' ? undefined : answer),
+    });
+    const records: unknown[] = [];
+    const { gw } = gateway(routes as never, { policy: { enableWrites: true, audit: record => void records.push(record) } });
+    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(UUID_SECRET);
+    const seen: unknown[] = [];
+    for (status of [200, 400, 500]) {
+      for (const tool of vippsGatewayTools) {
+        expect(SAMPLES, `a sample for ${tool.name}`).toHaveProperty(tool.name);
+        seen.push(await gw.callTool(tool.name, SAMPLES[tool.name]!));
+      }
+      seen.push(await gw.listWebhooks().catch((e: unknown) => String(e)));
+      // A new registration gives its secret on, as asked; only that field may hold it.
+      const again = await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.authorized.v1']).catch((e: unknown) => String(e));
+      seen.push(typeof again === 'string' ? again : { ...again, secret: again.secret === UUID_SECRET ? 'the one asked for' : again.secret });
+      seen.push(await gw.removeWebhook(REGISTRATION_ID).catch((e: unknown) => String(e)));
+    }
+    expect(seen.length).toBe(3 * (vippsGatewayTools.length + 3));
+    const text = JSON.stringify([seen, records]);
+    expect(text).not.toContain(UUID_SECRET);
+    expect(text).not.toContain(UUID_SECRET.slice(9, 23));
   });
 });

@@ -370,6 +370,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "The Vipps MobilePay Access Token API answered without a usable access token.",
   "The access token was refused. The keys may be wrong, expired or revoked.",
   "The agreement has more than ",
+  "The answer from Vipps MobilePay was withheld: it held a piece of a key of this instance.",
   "The charges of one Recurring agreement, optionally with one status. Reads every page; refuses rather than truncates.",
   "The currency must be the one the sales unit is registered with.",
   "The ePayment reference (8-64 letters, digits or dashes).",
