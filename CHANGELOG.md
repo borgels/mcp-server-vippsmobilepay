@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.4.1
+## 0.5.0
+
+The answers of `list_transactions` and `get_funds_summary` change shape, which
+is why this is 0.5.0: a consumer that reads `openDates` or `period` must be
+updated. `openDates` no longer holds dates that were not read (they are in
+`futureDates`), and `period` is `null` when no date was read. The details are
+in the second entry.
 
 - `list_transactions` and `get_funds_summary` read every page of a ledger date
   that Vipps MobilePay has not closed yet. A page that said `tryLater` used to
