@@ -61,7 +61,7 @@ What a second call is answered with (`test/create-payment.test.ts` has a test pe
 | The same input after the request was cancelled, declined or expired | `alreadyExists: true`, the state (`TERMINATED`, `ABORTED`, `EXPIRED`), no link; a new request needs another reference. |
 | The same reference with anything else changed (amount, phone number, text, delivery, return address, deadline, order lines) | Refused as a conflict. Nothing is created and nothing of the existing payment is returned. |
 | The same content with another reference | A second request: a new reference is what makes a request new. |
-| The same input after a refusal that created nothing (HTTP 429, 423) | Created, under the same key. |
+| The same input after a refusal that created nothing (HTTP 429) | Created, under the same key. |
 
 A QR code's address is given only in the answer to the request that creates it; a payment read back has the landing page address (the specification's `redirectUrl`), which is passed on as the `link` of a link request and never as a `qrCode`. A QR request that is found again therefore has `qrCode: null` and a note saying so.
 
