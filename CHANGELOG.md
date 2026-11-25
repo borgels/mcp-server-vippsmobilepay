@@ -18,9 +18,12 @@
   before anything is sent. `list_sales_units` is for the merchant's own keys
   only; with partner keys it would list the sales units of every merchant of
   the partner.
-- Every answer of the new tools passes a typed allow-list. A list in an
-  answer is passed on whole or not at all: one order line, event or QR code
-  in another form fails the call.
+- Every answer of the new tools passes a typed allow-list that is read
+  strictly, on every level and for every item of a list: a field that is not
+  known is left out, and a known field in another type, or an object without
+  a field it needs, refuses the whole answer. No item of a list is ever an
+  empty object, and no list is cut short. The README lists what each object
+  needs. The older reads are unchanged here.
 - The address of a QR code's image is passed on whole, as the link of a
   payment request is: it carries a token in the form of a JSON Web Token,
   which the redaction would otherwise mask. A host should treat it as answer

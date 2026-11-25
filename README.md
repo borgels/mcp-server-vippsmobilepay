@@ -118,7 +118,33 @@ A QR code's address is given only in the answer to the request that creates it; 
 
 Vipps MobilePay [has no Management API in the test environment](https://developer.vippsmobilepay.com/docs/APIs/management-api/management-api-faq/#can-i-use-the-management-api-in-the-test-environment), where its requests are answered with HTTP 401 as if the keys were refused. The two sales unit tools are therefore offered in production only: in the test environment they are left out of the tool list and refused before anything is sent (`environments` in the catalog).
 
-Every answer passes a typed allow-list (`src/vipps/views.ts`). A list in an answer is passed on whole or not at all: when one order line, one event or one QR code is not in the documented form, the call fails instead of answering with the rest. The address of a QR code's image is passed on whole, like the link of a payment request; it is public by Vipps MobilePay's own description and is never logged.
+Every answer of these five passes a typed allow-list (`src/vipps/views.ts`) that is read strictly, on every level and for every item of a list:
+
+- a field that is not on the list is left out;
+- a field on the list whose value has another type (or a text longer than is taken) refuses the whole answer, so nothing that was in the answer under a known name disappears from a result;
+- an object without a field it needs refuses the whole answer, so an item of a list is never an empty object;
+- `null` is no value: a field that is null is absent;
+- a list of more than 1 000 items refuses the answer; it is never cut short.
+
+The fields an object needs are those the specification requires and does not allow to be null:
+
+| Object | Needs |
+|---|---|
+| A charge | `id`, `status`, `amount`, `currency` (the specification's own list also names fields it documents as optional) |
+| The summary of a charge | `captured`, `refunded`, `cancelled` |
+| An event in the history of a charge | `occurred`, `event`, `amount`, `success` |
+| The category of an order | `orderDetailsUrl` |
+| A receipt | `orderLines`, `bottomLine` |
+| An order line | `name`, `id`, `totalAmount`, `totalAmountExcludingTax`, `totalTaxAmount` |
+| The unit information of an order line | `quantity` |
+| A sales unit, alone or in the list | `msn`, `name` |
+| The business identifier of a sales unit | `scheme`, `id` |
+| A redirect QR code | `id`, `url` (the image address), `redirectUrl` |
+| A callback QR code | `merchantQrId` (the specification requires nothing; this is its id) |
+
+The bottom line of a receipt, its shipping, payment sources and barcode, and the configuration of a sales unit need nothing: every field of theirs can be null. The older reads (a payment, its events, an agreement, a charge of a known agreement) still leave out a known field in another form; they get the same rule with the Recurring changes.
+
+The address of a QR code's image is passed on whole, like the link of a payment request; it is public by Vipps MobilePay's own description and is never logged. A text there that is not an https address in the form of a link is answered as `imageUrl: null`, never passed on.
 
 **Each sale with its lines and VAT is not here.** Vipps MobilePay's [Sales API](https://developer.vippsmobilepay.com/docs/APIs/sales-api/) gives the order lines and VAT of sales made with a Vippsnummer or MobilePay number and with the point-of-sale product. It is open to accounting partners only, with accounting keys and their own token request, in production only. This server takes the merchant's or a partner's keys, which the Sales API does not accept. A sales unit that takes payment by number also has no API keys of its own. `get_receipt` gives the order lines of a payment that was created through the API with them.
 
