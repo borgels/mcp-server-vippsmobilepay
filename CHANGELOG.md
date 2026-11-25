@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `list_transactions` and `get_funds_summary` read every page of a ledger date
+  that Vipps MobilePay has not closed yet. A page that said `tryLater` used to
+  end the date, also when it said `hasMore`, so an open date with more than
+  one page of entries came back with only the first page. The date is still
+  named in `openDates`, and `complete` is still `false`.
+
 ## 0.4.0
 
 - The write tools (capture, refund and cancel of payments and charges) are no
