@@ -27,7 +27,10 @@ export const UPSTREAM_HOSTS: readonly string[] = ['api.vipps.no', 'apitest.vipps
 /** Header names that carry a credential; redaction follows them by name. */
 export const CREDENTIAL_HEADERS = ['client_id', 'client_secret', 'Ocp-Apim-Subscription-Key', 'Authorization'] as const;
 
-/** The value sent as Vipps-System-Name. */
+/**
+ * This server's name in the Vipps-System-* headers: the system when it runs on its own, and the plugin when a host
+ * gives its own system name (the host is the solution, this server the service it uses).
+ */
 export const SYSTEM_NAME = 'mcp-server-vippsmobilepay';
 
 const MSN_PATTERN = /^\d{4,10}$/;
@@ -35,6 +38,40 @@ const MSN_PATTERN = /^\d{4,10}$/;
 const SYSTEM_HEADER_PATTERN = /^[A-Za-z0-9._-]{1,30}$/;
 /** Idempotency-Key: the Recurring API allows 1-40 characters without '#', '?', '/' or '\'; we allow a strict subset. */
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9-]{8,40}$/;
+
+/**
+ * The four Vipps-System-* headers, always all four: Vipps MobilePay requires them of partners and plugins. A host that
+ * gives its own system name and version is the system, and this server the plugin. On its own this server is both, as
+ * Vipps MobilePay suggests when there is no plugin. A host that gives a plugin name and version instead (the older
+ * use) is the plugin, and this server the system. A name is always given with its version.
+ */
+export function systemHeaders(
+  options: Pick<VippsClientOptions, 'systemName' | 'systemVersion' | 'systemPluginName' | 'systemPluginVersion'>,
+): Record<string, string> {
+  for (const [value, name] of [
+    [options.systemName, 'systemName'],
+    [options.systemVersion, 'systemVersion'],
+    [options.systemPluginName, 'systemPluginName'],
+    [options.systemPluginVersion, 'systemPluginVersion'],
+  ] as const) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
+      throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
+    }
+  }
+  if ((options.systemName === undefined) !== (options.systemVersion === undefined)) {
+    throw new ConfigError('systemName and systemVersion must be given together.');
+  }
+  if ((options.systemPluginName === undefined) !== (options.systemPluginVersion === undefined)) {
+    throw new ConfigError('systemPluginName and systemPluginVersion must be given together.');
+  }
+  return {
+    'Vipps-System-Name': options.systemName ?? SYSTEM_NAME,
+    'Vipps-System-Version': options.systemVersion ?? PACKAGE_VERSION,
+    'Vipps-System-Plugin-Name': options.systemPluginName ?? SYSTEM_NAME,
+    'Vipps-System-Plugin-Version': options.systemPluginVersion ?? PACKAGE_VERSION,
+  };
+}
 
 export interface VippsClientOptions {
   /** client_id. When omitted, read from VIPPS_CLIENT_ID in `credentialEnv`. */
@@ -57,7 +94,14 @@ export interface VippsClientOptions {
   baseUrl?: string;
   /** Allow a base URL outside UPSTREAM_HOSTS (env VIPPS_ALLOW_CUSTOM_BASE_URL=true). */
   allowCustomBaseUrl?: boolean;
-  /** Vipps-System-Plugin-Name, for a host that embeds this package (one word, at most 30 characters). */
+  /**
+   * Vipps-System-Name, for a host that embeds this package: its own solution (one word, at most 30 characters). Given
+   * with systemVersion; this server is then sent as the plugin (see systemHeaders).
+   */
+  systemName?: string;
+  /** Vipps-System-Version of the host's solution (at most 30 characters). */
+  systemVersion?: string;
+  /** Vipps-System-Plugin-Name, for a host that embeds this package as the system (one word, at most 30 characters). */
   systemPluginName?: string;
   /** Vipps-System-Plugin-Version (at most 30 characters). */
   systemPluginVersion?: string;
@@ -330,20 +374,7 @@ export class VippsMobilePayClient implements UpstreamClient {
     this.baseUrl = trimTrailingSlash(override ?? ENVIRONMENT_BASE_URLS[this.environment]);
     assertSafeBaseUrl(this.baseUrl, options.allowCustomBaseUrl ?? readEnvBoolean('VIPPS_ALLOW_CUSTOM_BASE_URL', false, env));
 
-    this.systemHeaders = {
-      'Vipps-System-Name': SYSTEM_NAME,
-      'Vipps-System-Version': PACKAGE_VERSION,
-    };
-    for (const [header, value, name] of [
-      ['Vipps-System-Plugin-Name', options.systemPluginName, 'systemPluginName'],
-      ['Vipps-System-Plugin-Version', options.systemPluginVersion, 'systemPluginVersion'],
-    ] as const) {
-      if (value === undefined) continue;
-      if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
-        throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
-      }
-      this.systemHeaders[header] = value;
-    }
+    this.systemHeaders = systemHeaders(options);
 
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'VIPPS_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);

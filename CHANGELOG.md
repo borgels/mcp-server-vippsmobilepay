@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- All four `Vipps-System-*` headers are sent on every request, as Vipps
+  MobilePay requires of partners and plugins. An embedding host can give its
+  own solution as `systemName` and `systemVersion`; the host is then sent as
+  the system and the server as the plugin (`Vipps-System-Plugin-Name:
+  mcp-server-vippsmobilepay` with the package version). On its own the server
+  sends itself as both. A host that gives `systemPluginName` keeps the older
+  arrangement, with the server as the system.
+- A name is now given with its version: `systemName` without `systemVersion`,
+  or `systemPluginName` without `systemPluginVersion`, is refused at
+  construction.
+
 ## 0.7.1
 
 - Fix: 0.7.0 refused valid keys. A key is refused when it shares six

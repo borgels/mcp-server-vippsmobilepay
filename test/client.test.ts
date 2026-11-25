@@ -27,6 +27,9 @@ describe('authentication', () => {
       'Ocp-Apim-Subscription-Key': KEYS.subscriptionKey,
       'Merchant-Serial-Number': KEYS.merchantSerialNumber,
       'Vipps-System-Name': 'mcp-server-vippsmobilepay',
+      'Vipps-System-Version': PACKAGE_VERSION,
+      'Vipps-System-Plugin-Name': 'acme-host',
+      'Vipps-System-Plugin-Version': '2.1.0',
     });
     // The API call never carries client_id or client_secret.
     expect(api?.headers).not.toHaveProperty('client_secret');
@@ -118,7 +121,38 @@ describe('configuration', () => {
   it('validates the MSN, the environment and the plugin headers without quoting them', () => {
     expect(() => makeClient(fetch, { merchantSerialNumber: 'abc' })).toThrow(/4 to 10 digits/);
     expect(() => makeClient(fetch, { environment: 'staging' as never })).toThrow(/"test" or "production"/);
-    expect(() => makeClient(fetch, { systemPluginName: 'has space' })).toThrow(/systemPluginName/);
+    expect(() => makeClient(fetch, { systemPluginName: 'has space', systemPluginVersion: '1' })).toThrow(/systemPluginName/);
+    expect(() => makeClient(fetch, { systemName: 'acme', systemVersion: 'x'.repeat(31) })).toThrow(/systemVersion/);
+    expect(() => makeClient(fetch, { systemName: 'acme' })).toThrow(/given together/);
+    expect(() => makeClient(fetch, { systemPluginName: 'acme' })).toThrow(/given together/);
+  });
+
+  it('sends all four system headers on every request, with a host as the system and the server as the plugin', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { body: { id: 'agr_1' } } });
+    const client = makeClient(fetchImpl, { systemName: 'Acme', systemVersion: '3.1' });
+    await client.get('/recurring/v3/agreements/agr_1');
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.headers).toMatchObject({
+        'Vipps-System-Name': 'Acme',
+        'Vipps-System-Version': '3.1',
+        'Vipps-System-Plugin-Name': 'mcp-server-vippsmobilepay',
+        'Vipps-System-Plugin-Version': PACKAGE_VERSION,
+      });
+    }
+  });
+
+  it('sends the server as both system and plugin when it runs on its own', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { body: { id: 'agr_1' } } });
+    await makeClient(fetchImpl).get('/recurring/v3/agreements/agr_1');
+    for (const call of calls) {
+      expect(call.headers).toMatchObject({
+        'Vipps-System-Name': 'mcp-server-vippsmobilepay',
+        'Vipps-System-Version': PACKAGE_VERSION,
+        'Vipps-System-Plugin-Name': 'mcp-server-vippsmobilepay',
+        'Vipps-System-Plugin-Version': PACKAGE_VERSION,
+      });
+    }
   });
 
   it('reads the keys from the environment in the standalone server only', async () => {
