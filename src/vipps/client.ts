@@ -212,6 +212,8 @@ export interface UpstreamClient {
   verifyCredentials(): Promise<void>;
   /** The sales unit the keys are used for, when one is configured. Not a secret. */
   readonly merchantSerialNumber?: string;
+  /** The client's clock, in milliseconds since the epoch. */
+  currentTime(): number;
 }
 
 /** A view of the client that only allows GET. */
@@ -226,6 +228,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
     merchantSerialNumber: client.merchantSerialNumber,
+    currentTime: () => client.currentTime(),
   };
 }
 
@@ -347,6 +350,10 @@ export class VippsMobilePayClient implements UpstreamClient {
 
   async getPage<T>(path: string, query?: Record<string, QueryValue>, headers?: Record<string, string>): Promise<ResponsePage<T>> {
     return this.call<T>('GET', path, { query, headers });
+  }
+
+  currentTime(): number {
+    return this.now();
   }
 
   async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {

@@ -61,7 +61,9 @@ The result holds our own fields only: `created`, the reference, the delivery, th
 | Agreements | 10 pages of 500 |
 | Charges of one agreement | 20 pages (`Continuation-Token`) |
 
-A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`; every page it has so far is still read.
+A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`; every page it has so far is still read. A date that has not begun is not requested, since Vipps MobilePay refuses a ledger date more than 24 hours ahead, and is listed in `futureDates`, apart from the open dates. `readFrom` and `readTo` are the first and last date actually read, `complete` is `false` when any date is open or was not read, and `note` says in words what the answer lacks; the gateway's result text carries the same sentence. A period that lies entirely in the future makes no request and says that the period has not begun: `get_funds_summary` then returns `period: null`, not sums of zero.
+
+Vipps MobilePay documents that a ledger date runs from midnight to midnight in the sales unit's time zone, and that a ledger date more than 24 hours in the future is refused; it does not document which clock the 24 hours follow. The server does not know the sales unit's time zone, so it requests a date from the moment it has begun in the market furthest ahead (Finland, `Europe/Helsinki`). For a sales unit in Denmark, Norway or Sweden that is one hour before its own midnight, so its own day is always read and no request is more than two hours early, far inside the 24 hours by any clock. A refusal of a date that was requested is returned as an error; none is taken to mean that the date has not come.
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 

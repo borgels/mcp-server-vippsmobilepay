@@ -431,7 +431,11 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
         return errorResult(redactor.redact(reason));
       }
       const data = await executeTool(tool, client, parsed.data as Record<string, unknown>, context ?? undefined);
-      const text = tool.returnsUpstreamContent ? `${tool.summary} ${UNTRUSTED_CONTENT_NOTE}` : tool.summary;
+      // What the answer lacks and why goes into the text too, not only into the data: a reader of the text alone
+      // must not take a part for the whole.
+      const note = tool.resultNote?.(data);
+      const said = note ? `${tool.summary} ${note}` : tool.summary;
+      const text = tool.returnsUpstreamContent ? `${said} ${UNTRUSTED_CONTENT_NOTE}` : said;
       return jsonResult(text, data);
     } catch (error) {
       return errorResult(formatUnknownError(error, redactor), failureMetadata(error));
