@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - Webhook registration for an embedding host: `registerPaymentEvents`,
   `listWebhooks` and `removeWebhook` on a gateway instance, and
