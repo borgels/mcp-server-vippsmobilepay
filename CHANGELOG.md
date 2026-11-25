@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased: payment requests
+
+- New write tool `create_payment`: ask a customer to pay with an ePayment
+  payment request, as a link (`WEB_REDIRECT`), as a QR code (`QR`) or sent to
+  the customer's phone number (`PUSH_MESSAGE`, only where Vipps MobilePay has
+  approved the sales unit for it), optionally with a deadline of up to 60
+  days (`expiresAt`, where Vipps MobilePay has enabled it for the sales unit;
+  order lines are then required). Off by default like the other writes, and
+  `requiresConfirmation` like them. `POST /epayment/v1/payments` is added to
+  the fixed list of requests; nothing else is.
+- The request's `Idempotency-Key` is not chosen by the caller: the server
+  derives it from the sales unit and the request's own content, so a request
+  repeated after a failure or a lost answer is created once and cannot be
+  repeated under a new key. A second value from the same content, the
+  fingerprint, is sent as `metadata.requestFingerprint`. Both are keyed
+  hashes (HMAC-SHA-256) with keys derived from the client secret, so neither
+  can be made or tested against a guess of the content without it; after the
+  client secret is replaced, a request made before is no longer recognised
+  and is answered as a conflict. Neither value is in an answer, an error or
+  the audit.
+- A payment read back is taken for the request, and its state or link passed
+  on, only when it is proven to be the same request: reference, amount,
+  currency, payment method and fingerprint. A payment that is read and not
+  proven is a refusal with nothing of it, whether Vipps MobilePay accepted or
+  refused the create request. When the payment cannot be read at all after an
+  accepted request, the answer has no state and the address of the
+  acceptance. The README has the tables of every branch and of what a second
+  call is answered with.
+- `get_payment`: an event passes on its `idempotencyKey` only when it is a
+  capture, a refund or a cancellation, whose key the caller chose. The key of
+  the request that created the payment is not passed on.
+- `capture_payment`, `refund_payment` and `cancel_payment`: what Vipps
+  MobilePay answers the change with passes the same allow-list as a payment
+  that is read (reference, pspReference, state, amount, aggregate, payment
+  method). The specification's answer holds nothing else; a field outside the
+  list was passed on before and is now left out.
+- No refusal depends on the clock: whether a deadline is too near or too far
+  is for Vipps MobilePay to refuse, so an identical call made later is still
+  sent. In NOK a request with a deadline needs `productUrl` on every order
+  line.
+- Gateway catalog: `change.action` can be `create`, `change.movesMoney` is a
+  boolean (false for `create_payment`, true for the others as before), and
+  there is a log field type `delivery` (`link`, `qr` or `phone`, in clear).
+  A host that has typed `movesMoney` as `true` must widen it.
+- The customer's link in a result is passed on whole. It carries a token in
+  the form of a JSON Web Token, which the redaction would otherwise mask; the
+  check that withholds a result holding a piece of the instance's keys still
+  applies to it.
+- The audit logs the description of a payment request as `descriptionHmac`,
+  a keyed hash that cannot be tested against a guess without the client
+  secret. A refund's description is still logged as `descriptionSha256`.
+- The state of a payment is read as a text, as the specification types it and
+  as the test environment answers. A list with exactly one documented state,
+  as the specification's example writes it, is read as that state; any other
+  form is no state. This holds for `get_payment`, for the check before a
+  capture, for the answer to a capture, a refund and a cancellation, and for
+  `create_payment`.
+- The input and the operation of the capture, refund and cancel tools are
+  unchanged, their caller-chosen `idempotencyKey` included. Their answers are
+  filtered, as said above.
+
 ## 0.5.0
 
 The answers of `list_transactions` and `get_funds_summary` change shape, which

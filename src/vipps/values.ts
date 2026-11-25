@@ -83,3 +83,109 @@ export function isMinorUnits(value: unknown): value is number {
 export function isMerchantCurrency(value: unknown): value is MerchantCurrency {
   return typeof value === 'string' && (MERCHANT_CURRENCIES as readonly string[]).includes(value);
 }
+
+/**
+ * A customer's phone number as the ePayment API takes it (MSISDN): digits
+ * only, the country code first and no prefix, 9 to 15 digits. A Danish number
+ * 12 34 56 78 is 4512345678.
+ */
+export const PHONE_NUMBER_PATTERN = /^\d{9,15}$/;
+
+/** A point in time written as RFC 3339 with a time zone: 2026-12-15T23:59:59+01:00 or ...Z. */
+const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+/** Milliseconds since the epoch of an RFC 3339 timestamp that exists, or undefined. */
+export function timestampMs(value: unknown): number | undefined {
+  if (typeof value !== 'string' || !TIMESTAMP_PATTERN.test(value) || !isIsoDate(value.slice(0, 10))) return undefined;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : undefined;
+}
+
+/** The characters an address may be written with (RFC 3986): no space, quote, bracket of other kinds or control character. */
+const URL_CHARACTERS = /^[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+$/;
+
+/**
+ * An https address in plain form: at most `maxLength` characters of the URL
+ * character set, a host, and no user name or password in it.
+ */
+export function isHttpsUrl(value: unknown, maxLength: number): value is string {
+  if (typeof value !== 'string' || value.length > maxLength || !value.startsWith('https://') || !URL_CHARACTERS.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname !== '' && url.username === '' && url.password === '';
+  } catch {
+    return false;
+  }
+}
+
+/** The same content as the same text: JSON with the keys of every object in order. `undefined` is left out. */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(entry => canonicalJson(entry === undefined ? null : entry)).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const fields = Object.keys(record)
+      .filter(key => record[key] !== undefined)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${fields.join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/** The states of an ePayment payment (the specification's State). */
+export const PAYMENT_STATES = ['CREATED', 'ABORTED', 'EXPIRED', 'AUTHORIZED', 'TERMINATED'] as const;
+export type PaymentState = (typeof PAYMENT_STATES)[number];
+
+/**
+ * The state of a payment as a text. The specification types it as a text,
+ * and Vipps MobilePay's test environment answers with one; the
+ * specification's own example writes it as a list with one state
+ * (`["AUTHORIZED"]`). A text is taken as it is. A list is taken only when it
+ * holds exactly one of the documented states, and is then that state.
+ * Anything else is no state.
+ */
+export function stateText(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.length === 1) return PAYMENT_STATES.find(state => state === value[0]);
+  return undefined;
+}
+
+/** What a keyed hash is used for. Each use has its own key, so one value says nothing of another. */
+export type KeyedHashPurpose = 'request-fingerprint' | 'idempotency-key' | 'audit-text';
+
+/** Characters of a keyed hash that are used: 128 bits, as hex. */
+const MARK_LENGTH = 32;
+
+/**
+ * The fingerprint of a request this server builds itself: 32 hex characters
+ * of a keyed hash (HMAC-SHA-256) of its content. The same content always
+ * gives the same fingerprint and any other content another. The key is
+ * derived from the client secret and never leaves the client, so content
+ * with few possible values (a phone number) cannot be found from the
+ * fingerprint by trying them: not by Vipps MobilePay's logs, and not by
+ * anyone who reads what Vipps MobilePay returns.
+ */
+export function requestFingerprint(keyedHash: (purpose: KeyedHashPurpose, text: string) => string, content: unknown): string {
+  return keyedHash('request-fingerprint', canonicalJson(content)).slice(0, MARK_LENGTH);
+}
+
+/**
+ * The Idempotency-Key of a request this server builds itself: `kind`, a dash
+ * and a second keyed hash of the same content, made with another key than
+ * the fingerprint. A request repeated after a failure or a lost answer is
+ * then the same request to Vipps MobilePay, and a caller cannot repeat it
+ * under a new key. Whoever sees the key (it can stand in the payment's
+ * events) learns neither the content nor the fingerprint.
+ */
+export function derivedIdempotencyKey(
+  kind: 'create',
+  keyedHash: (purpose: KeyedHashPurpose, text: string) => string,
+  content: unknown,
+): string {
+  return `${kind}-${keyedHash('idempotency-key', canonicalJson(content)).slice(0, MARK_LENGTH)}`;
+}
+
+/** Whether a text has the form of a key this server derives. Such a key is never passed on in an answer. */
+export function isDerivedIdempotencyKey(value: unknown): boolean {
+  return typeof value === 'string' && /^create-[0-9a-f]{32}$/.test(value);
+}

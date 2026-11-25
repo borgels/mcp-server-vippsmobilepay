@@ -1,8 +1,8 @@
 import { nestedFailureText, VippsHttpError } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
-import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
-import { paymentEventsView, paymentView, UNEXPECTED_EVENTS } from './views.js';
+import { stateText, isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
+import { modificationView, paymentEventsView, paymentView, UNEXPECTED_EVENTS } from './views.js';
 
 /**
  * ePayment API: read one payment and its events; capture, refund or cancel it.
@@ -72,7 +72,7 @@ async function paymentFigures(client: UpstreamClient, reference: string): Promis
   const aggregate = asRecord(payment.aggregate);
   const currency = asRecord(payment.amount).currency;
   const figures = {
-    state: typeof payment.state === 'string' ? payment.state : '',
+    state: stateText(payment.state) ?? '',
     currency: typeof currency === 'string' ? currency : '',
     authorized: amountValue(aggregate.authorizedAmount),
     captured: amountValue(aggregate.capturedAmount),
@@ -171,7 +171,8 @@ export async function capturePayment(client: UpstreamClient, input: MoneyChangeI
     { modificationAmount: { currency: input.currency, value: input.amount } },
     { idempotencyKey: input.idempotencyKey },
   );
-  return { idempotencyKey: input.idempotencyKey, payment };
+  // Through the allow-list, like a payment that is read: never the metadata of the request that created the payment.
+  return { idempotencyKey: input.idempotencyKey, payment: modificationView(payment) };
 }
 
 export async function refundPayment(client: UpstreamClient, input: MoneyChangeInput): Promise<unknown> {
@@ -191,7 +192,8 @@ export async function refundPayment(client: UpstreamClient, input: MoneyChangeIn
     { modificationAmount: { currency: input.currency, value: input.amount } },
     { idempotencyKey: input.idempotencyKey },
   );
-  return { idempotencyKey: input.idempotencyKey, payment };
+  // Through the allow-list, like a payment that is read: never the metadata of the request that created the payment.
+  return { idempotencyKey: input.idempotencyKey, payment: modificationView(payment) };
 }
 
 export async function cancelPayment(
@@ -203,5 +205,6 @@ export async function cancelPayment(
     input.cancelTransactionOnly === undefined ? {} : { cancelTransactionOnly: input.cancelTransactionOnly },
     { idempotencyKey: input.idempotencyKey },
   );
-  return { idempotencyKey: input.idempotencyKey, payment };
+  // Through the allow-list, like a payment that is read: never the metadata of the request that created the payment.
+  return { idempotencyKey: input.idempotencyKey, payment: modificationView(payment) };
 }

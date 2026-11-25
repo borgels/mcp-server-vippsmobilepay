@@ -159,7 +159,11 @@ describe('requests', () => {
     expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/capture')).toBe(false);
     expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges')).toBe(false);
     expect(isAllowedRequest('DELETE', '/recurring/v3/agreements/agr_1/charges/chr_1')).toBe(true);
-    expect(isAllowedRequest('POST', '/epayment/v1/payments')).toBe(false);
+    // A new payment request is on the list; nothing else is created.
+    expect(isAllowedRequest('POST', '/epayment/v1/payments')).toBe(true);
+    expect(isAllowedRequest('POST', '/epayment/v1/payments/')).toBe(false);
+    expect(isAllowedRequest('DELETE', '/epayment/v1/payments')).toBe(false);
+    expect(isAllowedRequest('POST', '/epayment/v1/payments/fjord-order-1')).toBe(false);
     expect(isAllowedRequest('GET', '/report/v2/ledgers/abc/funds/dates/2026-11-01')).toBe(false);
   });
 

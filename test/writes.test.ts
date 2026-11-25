@@ -14,6 +14,7 @@ describe('write gate', () => {
   it('refuses every write tool unless the host enables writes, without any request', async () => {
     const { gw, calls } = gateway();
     for (const [tool, input] of [
+      ['create_payment', { reference: 'fjord-order-10077', amount: 100, currency: 'DKK', description: 'Kagebord', delivery: 'qr' }],
       ['capture_payment', { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: KEY }],
       ['refund_payment', { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: KEY }],
       ['cancel_payment', { reference: 'fjord-order-10042', idempotencyKey: KEY }],

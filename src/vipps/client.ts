@@ -1,6 +1,8 @@
+import { createHmac } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
+import type { KeyedHashPurpose } from './values.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
 export type VippsEnvironment = 'test' | 'production';
@@ -97,9 +99,11 @@ export interface ResponsePage<T> {
 /** Options of a request that changes something. */
 export interface WriteOptions {
   /**
-   * Idempotency-Key header. Required: the caller chooses it, logs it before
-   * the request, and sends the same key when it repeats the same change, so
-   * Vipps MobilePay carries the change out once. It is never generated here.
+   * Idempotency-Key header. Required, and never generated here. For a capture,
+   * refund or cancellation the caller chooses it, logs it before the request,
+   * and sends the same key when it repeats the same change, so Vipps MobilePay
+   * carries the change out once. For a new payment the tool derives it from
+   * the request's own content (derivedIdempotencyKey in values.ts).
    */
   idempotencyKey: string;
 }
@@ -161,8 +165,8 @@ const TRANSIENT_NETWORK_CODES = new Set([
  * Every API request this server can make, by method. A path is checked
  * against this list before anything is sent, whichever tool asks: nothing
  * outside it (agreement changes, merchant or sales unit settings, new
- * payments or charges) can be sent, whatever the policy says. Path segments
- * arrive already encoded by encodePathParam.
+ * charges) can be sent, whatever the policy says. Path segments arrive
+ * already encoded by encodePathParam.
  */
 const SEGMENT = '[^/?#]+';
 const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
@@ -177,6 +181,8 @@ const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
   ],
   POST: [
+    // A new payment request (create_payment). The customer approves it in the app before any money moves.
+    /^\/epayment\/v1\/payments$/,
     new RegExp(`^/epayment/v1/payments/${SEGMENT}/(capture|refund|cancel)$`),
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
   ],
@@ -206,8 +212,16 @@ export interface UpstreamClient {
   delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
+  /** The sales unit the keys are used for, when one is configured. Not a secret. */
+  readonly merchantSerialNumber?: string;
   /** The client's clock, in milliseconds since the epoch. */
   currentTime(): number;
+  /**
+   * A keyed hash (HMAC-SHA-256, hex) of a text, with a key derived from the client secret for this one purpose. The
+   * secret and the derived key stay in the client. The same keys give the same hash on every instance; after the
+   * client secret is replaced, the same text gives another hash.
+   */
+  keyedHash(purpose: KeyedHashPurpose, text: string): string;
 }
 
 /** A view of the client that only allows GET. */
@@ -221,7 +235,9 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     post: refuse('POST'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
+    merchantSerialNumber: client.merchantSerialNumber,
     currentTime: () => client.currentTime(),
+    keyedHash: (purpose, text) => client.keyedHash(purpose, text),
   };
 }
 
@@ -347,6 +363,13 @@ export class VippsMobilePayClient implements UpstreamClient {
 
   currentTime(): number {
     return this.now();
+  }
+
+  keyedHash(purpose: KeyedHashPurpose, text: string): string {
+    const { clientSecret } = this.credentials();
+    // One key for each purpose, so a value made for one says nothing of a value made for another.
+    const key = createHmac('sha256', clientSecret).update(`mcp-server-vippsmobilepay ${purpose} v1`).digest();
+    return createHmac('sha256', key).update(text).digest('hex');
   }
 
   async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
