@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { VippsHttpError } from '../src/errors.js';
 import { apiCalls, charge, gateway, KEYS, makeClient, payment, stubFetch, texts, TOKEN, type Reply } from './helpers.js';
 
@@ -22,6 +22,10 @@ function patientClient(routes: Parameters<typeof stubFetch>[0], options: Paramet
   return { client, calls, waits };
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe('throttling (HTTP 429)', () => {
   it('waits as long as Retry-After says in seconds, then reads', async () => {
     let n = 0;
@@ -34,16 +38,30 @@ describe('throttling (HTTP 429)', () => {
   });
 
   it('reads Retry-After as an HTTP date too', async () => {
+    // Only the date is frozen: the wait is then exactly the distance to the date, whatever the machine's speed.
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.parse('2026-11-25T10:00:00Z') });
+    let n = 0;
+    const { client, calls, waits } = patientClient({
+      [`GET ${PAY}`]: () =>
+        (n += 1) === 1 ? { status: 429, headers: { 'retry-after': 'Wed, 25 Nov 2026 10:00:05 GMT' } } : { body: { ok: true } },
+    });
+    await expect(client.get(PAY)).resolves.toEqual({ ok: true });
+    expect(waits).toEqual([5_000]);
+    expect(apiCalls(calls)).toHaveLength(2);
+  });
+
+  it('does not wait for a Retry-After date that has passed, beyond its own backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.parse('2026-11-25T10:00:00Z') });
     let n = 0;
     const { client, waits } = patientClient({
       [`GET ${PAY}`]: () =>
-        (n += 1) === 1 ? { status: 429, headers: { 'retry-after': new Date(Date.now() + 5_000).toUTCString() } } : { body: { ok: true } },
+        (n += 1) === 1 ? { status: 429, headers: { 'retry-after': 'Wed, 25 Nov 2026 09:59:00 GMT' } } : { body: { ok: true } },
     });
     await expect(client.get(PAY)).resolves.toEqual({ ok: true });
     expect(waits).toHaveLength(1);
-    // An HTTP date has whole seconds, and a moment passes between the answer and the reading of it.
-    expect(waits[0]).toBeGreaterThan(2_000);
-    expect(waits[0]).toBeLessThanOrEqual(5_000);
+    // The backoff alone: the base delay of 10 ms and at most as much again.
+    expect(waits[0]).toBeGreaterThanOrEqual(10);
+    expect(waits[0]).toBeLessThan(20);
   });
 
   it('does not wait longer than the retry budget, and says only the status and the wait', async () => {
@@ -126,7 +144,7 @@ describe('a change is sent once', () => {
         expect(sent).toHaveLength(1);
         expect(sent[0]?.headers['Idempotency-Key']).toBe(KEY);
         const said = JSON.stringify(result);
-        for (const secret of [KEYS.clientId, KEYS.clientSecret, KEYS.subscriptionKey, TOKEN, 'Solveig', 'Fjordheim', '12345678901234', 'apitest.vipps.no']) {
+        for (const secret of [KEYS.clientId, KEYS.clientSecret, KEYS.subscriptionKey, TOKEN, 'Solveig', 'Fjordheim', '12345678901234', 'apitest.vipps.no', 'Too Many Requests']) {
           expect(said, secret).not.toContain(secret);
         }
       });
@@ -181,6 +199,26 @@ describe('an empty account', () => {
     expect(listed.structuredContent).toMatchObject({ complete: true, openDates: [], count: 0, items: [] });
   });
 
+  it('gives an open day without entries as an open day, not as a closed one and not as an error', async () => {
+    const { gw, calls } = gateway({
+      [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: { body: { items: [], hasMore: false, tryLater: true } },
+    });
+    const input = { ledgerId: LEDGER, fromDate: '2026-11-03', toDate: '2026-11-03' };
+    const listed = await gw.callTool('list_transactions', input);
+    expect(listed.isError).toBeUndefined();
+    expect(listed.structuredContent).toMatchObject({ complete: false, openDates: ['2026-11-03'], count: 0, items: [] });
+    const summed = await gw.callTool('get_funds_summary', input);
+    expect(summed.isError).toBeUndefined();
+    expect(summed.structuredContent).toMatchObject({
+      complete: false,
+      openDates: ['2026-11-03'],
+      period: { entries: 0, currencies: [], totalsByEntryType: {}, openingBalance: null, closingBalance: null },
+      days: [{ ledgerDate: '2026-11-03', open: true, entries: 0, openingBalance: null, closingBalance: null }],
+    });
+    // One request each: an open day is not asked for again.
+    expect(apiCalls(calls)).toHaveLength(2);
+  });
+
   it('lists no agreements and no charges as empty lists', async () => {
     const { gw } = gateway({
       'GET /recurring/v3/agreements': { body: [] },
@@ -188,10 +226,10 @@ describe('an empty account', () => {
     });
     const agreements = await gw.callTool('list_agreements', {});
     expect(agreements.isError).toBeUndefined();
-    expect(agreements.structuredContent).toMatchObject({ count: 0 });
+    expect(agreements.structuredContent).toMatchObject({ count: 0, agreements: [] });
     const charges = await gw.callTool('list_charges', { agreementId: 'agr_7TqP2m' });
     expect(charges.isError).toBeUndefined();
-    expect(charges.structuredContent).toMatchObject({ agreementId: 'agr_7TqP2m', count: 0 });
+    expect(charges.structuredContent).toMatchObject({ agreementId: 'agr_7TqP2m', count: 0, charges: [] });
   });
 });
 
