@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { VippsHttpError } from '../src/errors.js';
-import { isAllowedRequest, VippsMobilePayClient } from '../src/vipps/client.js';
+import { DEFAULT_PLUGIN_VERSION, isAllowedRequest, VippsMobilePayClient } from '../src/vipps/client.js';
 import { PACKAGE_VERSION } from '../src/version.js';
 import { apiCalls, KEYS, makeClient, stubFetch, TOKEN } from './helpers.js';
 
@@ -124,7 +124,66 @@ describe('configuration', () => {
     expect(() => makeClient(fetch, { systemPluginName: 'has space', systemPluginVersion: '1' })).toThrow(/systemPluginName/);
     expect(() => makeClient(fetch, { systemName: 'acme', systemVersion: 'x'.repeat(31) })).toThrow(/systemVersion/);
     expect(() => makeClient(fetch, { systemName: 'acme' })).toThrow(/given together/);
-    expect(() => makeClient(fetch, { systemPluginName: 'acme' })).toThrow(/given together/);
+    expect(() => makeClient(fetch, { systemPluginVersion: '1.0' })).toThrow(/only with systemPluginName/);
+  });
+
+  it('still takes a plugin name without a version, as before, and sends the documented default version', async () => {
+    const { fetchImpl, calls } = stubFetch({ 'GET /recurring/v3/agreements/agr_1': { body: { id: 'agr_1' } } });
+    await makeClient(fetchImpl, { systemPluginName: 'acme-host' }).get('/recurring/v3/agreements/agr_1');
+    expect(DEFAULT_PLUGIN_VERSION).toBe('0');
+    for (const call of calls) {
+      expect(call.headers).toMatchObject({
+        'Vipps-System-Name': 'mcp-server-vippsmobilepay',
+        'Vipps-System-Version': PACKAGE_VERSION,
+        'Vipps-System-Plugin-Name': 'acme-host',
+        'Vipps-System-Plugin-Version': DEFAULT_PLUGIN_VERSION,
+      });
+    }
+  });
+
+  it('refuses a system header that holds a key or a piece of one, without quoting it, for all four options', () => {
+    const pieces = [KEYS.clientId.slice(0, 30), KEYS.clientSecret.slice(4, 20), KEYS.subscriptionKey.slice(-12), KEYS.clientSecret.slice(10, 16)];
+    for (const piece of pieces) {
+      for (const options of [
+        { systemName: piece, systemVersion: '1' },
+        { systemName: 'acme', systemVersion: piece },
+        { systemPluginName: piece, systemPluginVersion: '1' },
+        { systemPluginName: 'acme', systemPluginVersion: piece },
+      ]) {
+        const error = (() => {
+          try {
+            makeClient(fetch, options);
+          } catch (e) {
+            return e as Error;
+          }
+          return undefined;
+        })();
+        expect(error?.message, JSON.stringify(Object.keys(options))).toMatch(/shares text with the keys/);
+        expect(error?.message).not.toContain(piece);
+      }
+    }
+  });
+
+  it('sends the four system headers on writes and on the retry after a 401', async () => {
+    let answers = 0;
+    const { fetchImpl, calls } = stubFetch({
+      'POST /epayment/v1/payments/fjord-order-1/cancel': () => ((answers += 1) === 1 ? { status: 401 } : { body: { state: 'TERMINATED' } }),
+      'DELETE /recurring/v3/agreements/agr_1/charges/chr_1': { body: {} },
+    });
+    const client = makeClient(fetchImpl, { systemName: 'Acme', systemVersion: '3.1' });
+    await client.post('/epayment/v1/payments/fjord-order-1/cancel', {}, { idempotencyKey: 'key-0001-abcd' });
+    await client.delete('/recurring/v3/agreements/agr_1/charges/chr_1', { idempotencyKey: 'key-0002-abcd' });
+    const writes = apiCalls(calls);
+    expect(writes.map(call => call.method)).toEqual(['POST', 'POST', 'DELETE']);
+    expect(calls.filter(call => call.path === '/accesstoken/get')).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.headers).toMatchObject({
+        'Vipps-System-Name': 'Acme',
+        'Vipps-System-Version': '3.1',
+        'Vipps-System-Plugin-Name': 'mcp-server-vippsmobilepay',
+        'Vipps-System-Plugin-Version': PACKAGE_VERSION,
+      });
+    }
   });
 
   it('sends all four system headers on every request, with a host as the system and the server as the plugin', async () => {

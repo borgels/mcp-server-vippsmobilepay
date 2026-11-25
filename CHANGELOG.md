@@ -9,9 +9,12 @@
   mcp-server-vippsmobilepay` with the package version). On its own the server
   sends itself as both. A host that gives `systemPluginName` keeps the older
   arrangement, with the server as the system.
-- A name is now given with its version: `systemName` without `systemVersion`,
-  or `systemPluginName` without `systemPluginVersion`, is refused at
-  construction.
+- `systemName` is given with `systemVersion`. `systemPluginName` without
+  `systemPluginVersion` still works, as before, and sends the plugin version
+  `0` (`DEFAULT_PLUGIN_VERSION`); `systemPluginVersion` without
+  `systemPluginName` is refused at construction.
+- A Vipps-System-* value that shares text with the instance's keys is refused
+  at construction, without quoting it: the headers are sent in clear.
 
 ## 0.7.1
 
