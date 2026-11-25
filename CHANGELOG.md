@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - `list_transactions` and `get_funds_summary` read every page of a ledger date
   that Vipps MobilePay has not closed yet. A page that said `tryLater` used to
