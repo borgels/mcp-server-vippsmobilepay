@@ -9,7 +9,7 @@ import { createHash, createHmac } from 'node:crypto';
 /** An ePayment reference, as the ePayment API defines it. */
 export const REFERENCE_PATTERN = /^[a-zA-Z0-9-]{8,64}$/;
 
-/** A Recurring agreement or charge id (agr_5kSeqz, chr-123ab). The API does not publish a pattern; this is ours. */
+/** A Recurring agreement or charge id (agr_5kSeqz, chr-Kq7wZp). The API does not publish a pattern; this is ours. */
 export const RECURRING_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** A Report API ledger id (numeric). */

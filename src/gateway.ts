@@ -190,14 +190,22 @@ export type VippsChangeResolution =
  * JSON Schema for a gateway tool, derived from the tool's zod schema.
  * `format` is dropped: validators such as Ajv reject unknown formats in
  * strict mode unless format plugins are installed, and zod already checks
- * these values when the call runs.
+ * these values when the call runs. A numeric bound of six digits or more
+ * (the amount limit, or the safe-integer limit zod adds to an integer) is
+ * dropped too, for the same reason zod still checks it: every text in the
+ * tool list is compared with the keys, and a run of six digits is a piece a
+ * hex key can hold (test/fixed-corpus.test.ts).
  */
 function toGatewayJsonSchema(tool: ToolDefinition): GatewayJsonObject {
   const { $schema: _ignored, ...schema } = z.toJSONSchema(tool.inputSchema, {
     io: 'input',
     unrepresentable: 'any',
     override: ctx => {
-      delete (ctx.jsonSchema as Record<string, unknown>).format;
+      const json = ctx.jsonSchema as Record<string, unknown>;
+      delete json.format;
+      for (const bound of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum']) {
+        if (typeof json[bound] === 'number' && Math.abs(json[bound]) >= 100_000) delete json[bound];
+      }
     },
   }) as Record<string, unknown>;
   return schema as GatewayJsonObject;
@@ -306,7 +314,7 @@ function requiredSecret(options: Partial<VippsGatewayOptions> | undefined, name:
   const value: unknown = options?.[name];
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ConfigError(
-      `createVippsMobilePayGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
+      `createVippsMobilePayGateway requires options.${name}. A gateway inside a host does not read credentials from the environment.`,
     );
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
