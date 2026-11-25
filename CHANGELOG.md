@@ -1,6 +1,34 @@
 # Changelog
 
-## Unreleased: reads
+## Unreleased
+
+### Accounting keys
+
+- A third key type, `keyType: 'accounting'`, for an accounting partner
+  approved by Vipps MobilePay: a client id and a client secret only, in
+  production only, and through the gateway only (the stdio and HTTP servers
+  refuse them, and `VIPPS_KEY_TYPE` cannot name them). The token comes from
+  `POST /miami/v1/token` with Basic credentials and
+  `grant_type=client_credentials`; no subscription key and no MSN is sent.
+- Two new read tools for the Sales API, with accounting keys only:
+  `list_sales` (every sale of a ledger date) and `get_sale` (one sale by
+  `reference` or `pspReference`), each with order lines and VAT. The Report
+  tools work with accounting keys too; every other tool is left out of
+  `tools` and refused before anything is sent.
+- The owner binding: every call with accounting keys must carry
+  `context.owner` (a scheme such as `business:DK:CVR` and a number). The
+  whole ledger list is read for each call, only ledgers whose `owner`
+  matches exactly are kept, and any other ledger id is refused before a
+  report or sales request is sent. Nothing about an organisation is kept
+  between calls; the token is shared.
+- `payoutBankAccount` is never passed on with accounting keys, and the
+  customer fields of the Sales API are left out. Every answer read with
+  accounting keys passes a strict allow-list.
+- `check_connection` with accounting keys is connected only when a ledger of
+  the call's organisation is visible; otherwise its result carries `outcome`:
+  `no_ledger_for_owner`, `keys_refused`, `unavailable` or `owner_missing`.
+
+### Reads
 
 - Five new read tools. `find_charge`: one Recurring charge by its own id,
   when the agreement is not known. `get_receipt`: the order lines with VAT,

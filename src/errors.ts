@@ -250,6 +250,13 @@ const TOKEN_STATUS_HINTS: Record<number, string> = {
   403: 'The keys have no access. Check that they belong to this sales unit and environment.',
 };
 
+/** Hints for the token request of accounting keys (a client id and a client secret, nothing else). */
+const ACCOUNTING_TOKEN_STATUS_HINTS: Record<number, string> = {
+  400: 'The token request was refused. Check the client id and the client secret of the accounting keys.',
+  401: 'The accounting keys were rejected: the client id or the client secret is wrong.',
+  403: 'The accounting keys have no access.',
+};
+
 /**
  * An HTTP error from Vipps MobilePay. It keeps the status and the parsed
  * Retry-After, nothing from the response body: the message is our own.
@@ -263,9 +270,19 @@ export class VippsHttpError extends Error {
   readonly requestId?: string;
   /** True when the Access Token API answered: no API request was sent. */
   readonly tokenRequest: boolean;
+  /** True when the keys are accounting keys: the hints of a token request name those. */
+  readonly accountingKeys: boolean;
 
-  constructor(input: { status: number; url: string; retryAfter?: string; tokenRequest?: boolean; requestId?: string; note?: string }) {
-    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note));
+  constructor(input: {
+    status: number;
+    url: string;
+    retryAfter?: string;
+    tokenRequest?: boolean;
+    requestId?: string;
+    note?: string;
+    accountingKeys?: boolean;
+  }) {
+    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note, input.accountingKeys === true));
     this.name = 'VippsHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
@@ -273,6 +290,7 @@ export class VippsHttpError extends Error {
     this.retryAfter = retryMs === undefined ? undefined : String(Math.ceil(retryMs / 1000));
     this.requestId = vendorRequestId(input.requestId);
     this.tokenRequest = input.tokenRequest === true;
+    this.accountingKeys = input.accountingKeys === true;
   }
 }
 
@@ -357,14 +375,15 @@ export function withNote(error: VippsHttpError, note: string): VippsHttpError {
     retryAfter: error.retryAfter,
     requestId: error.requestId,
     tokenRequest: error.tokenRequest,
+    accountingKeys: error.accountingKeys,
     note,
   });
 }
 
 /** The whole text of an HTTP error: status, our hint, a parsed Retry-After in seconds, and a tool's own note. */
-export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false, note?: string): string {
+export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false, note?: string, accountingKeys = false): string {
   const retryMs = parseRetryAfterMs(retryAfter);
-  const hints = tokenRequest ? TOKEN_STATUS_HINTS : STATUS_HINTS;
+  const hints = !tokenRequest ? STATUS_HINTS : accountingKeys ? ACCOUNTING_TOKEN_STATUS_HINTS : TOKEN_STATUS_HINTS;
   return [
     tokenRequest ? `Vipps MobilePay access token request failed with HTTP ${status}` : `Vipps MobilePay API request failed with HTTP ${status}`,
     Object.hasOwn(hints, status) ? hints[status] : undefined,

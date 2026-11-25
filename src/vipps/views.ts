@@ -1,5 +1,5 @@
 import { CustomerLink } from '../errors.js';
-import { isDerivedIdempotencyKey, stateText } from './values.js';
+import { isDerivedIdempotencyKey, LEDGER_ID_PATTERN, stateText } from './values.js';
 
 /**
  * What the read tools pass on of a payment, its events, an agreement, a
@@ -242,6 +242,97 @@ const CALLBACK_QR_LIST = [
   { [REQUIRED]: ['merchantQrId'], merchantQrId: 'string', locationDescription: 'string', category: 'string', qrContent: 'longString', qrImageUrl: 'longString' },
 ] as const;
 
+/** An organisation as the Report API names it: a scheme such as `business:DK:CVR`, and the number under it. */
+const ORGANISATION = { [REQUIRED]: ['scheme', 'id'], scheme: 'string', id: 'string' } as const;
+
+/**
+ * A ledger of the organisation a call is bound to (`GET /settlement/v1/ledgers`, Ledger), read with accounting
+ * keys. `payoutBankAccount` is not named, so the account the money is paid out to is never passed on, in whole or
+ * in part.
+ */
+const OWN_LEDGER = {
+  [REQUIRED]: ['ledgerId', 'owner'],
+  ledgerId: 'string',
+  currency: 'string',
+  owner: ORGANISATION,
+  settlesForRecipientHandles: ['string'],
+  salesUnits: [{ [REQUIRED]: ['recipientHandle'], name: 'string', recipientHandle: 'string', businessIdentifier: ORGANISATION }],
+} as const;
+
+/**
+ * An entry of the funds or the fees ledger (Report API, Transaction), read with accounting keys. The payer's name,
+ * message and masked phone number (`name`, `message`, `maskedPhoneNo`) are not named: they are not asked for, and
+ * are not passed on if they come.
+ */
+const LEDGER_ENTRIES = [
+  {
+    // The specification requires every field. reference and recipientHandle can be null (then absent).
+    [REQUIRED]: ['pspReference', 'time', 'ledgerDate', 'entryType', 'currency', 'amount', 'balanceBefore', 'balanceAfter'],
+    pspReference: 'string',
+    time: 'string',
+    ledgerDate: 'string',
+    entryType: 'string',
+    reference: 'string',
+    currency: 'string',
+    amount: 'integer',
+    balanceBefore: 'integer',
+    balanceAfter: 'integer',
+    recipientHandle: 'string',
+  },
+] as const;
+
+/**
+ * One page of sales (Sales API, LedgerEventsResponse): a capture or a refund of a sale with its amounts, its order
+ * lines and their VAT. `customer` (the specification gives it an e-mail address, a phone number and a name) is not
+ * named, and neither is `completeness.hasCustomerIdentity`: nothing about the customer is passed on.
+ */
+const SALES_PAGE = {
+  [REQUIRED]: ['items', 'hasMore'],
+  items: [
+    {
+      // The specification requires every field; classification and customer can be null, and customer is not read.
+      [REQUIRED]: ['entryType', 'time', 'orderDate', 'pspReference', 'reference', 'currency', 'paymentType', 'amounts', 'lines', 'completeness'],
+      entryType: 'string',
+      time: 'string',
+      orderDate: 'string',
+      pspReference: 'string',
+      reference: 'string',
+      currency: 'string',
+      paymentType: 'string',
+      classification: { [REQUIRED]: ['solution', 'salesCategory'], solution: 'string', salesCategory: 'string' },
+      amounts: { [REQUIRED]: ['gross', 'net', 'vat'], gross: 'integer', net: 'integer', vat: 'integer' },
+      lines: [
+        {
+          // Every other field of a line can be null in the specification.
+          [REQUIRED]: ['quantity'],
+          lineId: 'string',
+          name: 'string',
+          quantity: 'integer',
+          unitPriceGross: 'integer',
+          unitPriceNet: 'integer',
+          lineTotalGross: 'integer',
+          lineTotalNet: 'integer',
+          vatRate: 'integer',
+          vatAmount: 'integer',
+          category: 'string',
+          discountTotal: 'integer',
+        },
+      ],
+      completeness: { [REQUIRED]: ['hasLineItems', 'hasVatBreakdown'], hasLineItems: 'boolean', hasVatBreakdown: 'boolean' },
+    },
+  ],
+  cursor: 'longString',
+  hasMore: 'boolean',
+} as const;
+
+/** A refusal because a list is longer than this server reads in one call. */
+export class TooMuchDataError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TooMuchDataError';
+  }
+}
+
 /** The refusal of an answer that is not in the form the API documents. Fixed text: nothing of the answer. */
 export class UnexpectedAnswerError extends Error {
   constructor(what: string) {
@@ -258,6 +349,74 @@ function strictly<T>(answer: unknown, type: FieldType, what: string): T {
     if (error instanceof Mismatch) throw new UnexpectedAnswerError(what);
     throw error;
   }
+}
+
+/** An organisation: a scheme and an id. */
+export interface Organisation {
+  readonly scheme: string;
+  readonly id: string;
+}
+
+/**
+ * One page of the ledger list, read with accounting keys: its items, each an object and otherwise as it came, and
+ * the cursor of the next page (the empty text after the last). Vipps MobilePay documents that the cursor is always
+ * there, so a page without one is refused: a list that may have more pages is never taken for the whole list. The
+ * items are read one by one (ledgerOwnerOf, ownLedgerView): a ledger of another organisation is never read further
+ * than its owner.
+ */
+export function ledgerPageView(answer: unknown): { items: Array<Record<string, unknown>>; cursor: string } {
+  const refuse = (): never => {
+    throw new UnexpectedAnswerError('the ledger list');
+  };
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) return refuse();
+  const { items, cursor } = answer as { items?: unknown; cursor?: unknown };
+  if (!Array.isArray(items) || items.length > MAX_LIST_ITEMS) return refuse();
+  if (typeof cursor !== 'string' || cursor.length > MAX_LONG_TEXT) return refuse();
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return refuse();
+  }
+  return { items: items as Array<Record<string, unknown>>, cursor };
+}
+
+/**
+ * The organisation a ledger names as its owner, or undefined when it names none that can be read: no owner, or one
+ * whose scheme or id is missing, empty or no text.
+ */
+export function ledgerOwnerOf(ledger: Record<string, unknown>): Organisation | undefined {
+  const owner = ledger.owner;
+  if (!owner || typeof owner !== 'object' || Array.isArray(owner)) return undefined;
+  const { scheme, id } = owner as { scheme?: unknown; id?: unknown };
+  if (typeof scheme !== 'string' || scheme === '' || scheme.length > MAX_TEXT) return undefined;
+  if (typeof id !== 'string' || id === '' || id.length > MAX_TEXT) return undefined;
+  return { scheme, id };
+}
+
+/**
+ * A ledger of the organisation a call is bound to, read strictly: its id, its currency, its owner and the sales
+ * units it settles for. Refused when anything in it has another form, or its id is not a number of 1 to 20 digits.
+ * `organisations` are the owner and every organisation a sales unit of the ledger names: the caller compares them
+ * and leaves out a ledger that names more than one. The sales units are passed on without theirs.
+ */
+export function ownLedgerView(ledger: unknown): { ledger: Record<string, unknown>; organisations: Organisation[] } {
+  const out = strictly<Record<string, unknown>>(ledger, OWN_LEDGER, 'the ledger list');
+  if (!LEDGER_ID_PATTERN.test(out.ledgerId as string)) throw new UnexpectedAnswerError('the ledger list');
+  const organisations = [out.owner as Organisation];
+  const salesUnits = ((out.salesUnits ?? []) as Array<Record<string, unknown>>).map(unit => {
+    const { businessIdentifier, ...rest } = unit;
+    if (businessIdentifier !== undefined) organisations.push(businessIdentifier as Organisation);
+    return rest;
+  });
+  return { ledger: out.salesUnits === undefined ? out : { ...out, salesUnits }, organisations };
+}
+
+/** The entries of one page of a funds or fees ledger, read strictly (accounting keys). */
+export function ledgerEntriesView(items: unknown): Array<Record<string, unknown>> {
+  return strictly<Array<Record<string, unknown>>>(items, LEDGER_ENTRIES, 'a report');
+}
+
+/** One page of sales, read strictly: the sales, whether there are more, and the cursor of the next page. */
+export function salesPageView(answer: unknown): { items: Array<Record<string, unknown>>; hasMore: boolean; cursor?: string } {
+  return strictly<{ items: Array<Record<string, unknown>>; hasMore: boolean; cursor?: string }>(answer, SALES_PAGE, 'the sales');
 }
 
 /** The fixed text of an events answer that is not a list of events. */

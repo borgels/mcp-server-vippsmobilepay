@@ -16,10 +16,12 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 
 | Tool | Risk | Purpose |
 |---|---|---|
-| `vipps_check_connection` | read | Check that the keys work (requests an access token). |
-| `vipps_list_ledgers` | read | Settlement ledgers with currency and the sales units they settle for. The payout account is shown as its last four characters. Merchant keys only. |
-| `vipps_get_funds_summary` | read | Totals of the funds ledger for up to 31 days, per date and in all: sales, refunds, fees retained, payouts, balance before and after. Merchant keys only. |
-| `vipps_list_transactions` | read | Every entry of the funds or fees ledger for up to 31 days. Merchant keys only. |
+| `vipps_check_connection` | read | Check that the keys work (requests an access token). With accounting keys: connected only when a ledger of the call's organisation is visible. |
+| `vipps_list_ledgers` | read | Settlement ledgers with currency and the sales units they settle for. With the merchant's own keys the payout account is shown as its last four characters; with accounting keys only the organisation's ledgers, and nothing of the payout account. Not with partner keys. |
+| `vipps_get_funds_summary` | read | Totals of the funds ledger for up to 31 days, per date and in all: sales, refunds, fees retained, payouts, balance before and after. Merchant or accounting keys. |
+| `vipps_list_transactions` | read | Every entry of the funds or fees ledger for up to 31 days. Merchant or accounting keys. |
+| `vipps_list_sales` | read | Every sale (capture or refund) of one ledger date, with order lines and VAT. Accounting keys only, production only. |
+| `vipps_get_sale` | read | One sale by the business's `reference` or by Vipps MobilePay's `pspReference`, with order lines and VAT. Accounting keys only, production only. |
 | `vipps_get_payment` | read | One ePayment payment by reference, with its events. |
 | `vipps_list_agreements` | read | Recurring agreements with one status (default `ACTIVE`). |
 | `vipps_get_agreement` | read | One Recurring agreement. |
@@ -146,7 +148,7 @@ The bottom line of a receipt, its shipping, payment sources and barcode, and the
 
 The address of a QR code's image is passed on whole, like the link of a payment request; it is public by Vipps MobilePay's own description and is never logged. A text there that is not an https address in the form of a link is answered as `imageUrl: null`, never passed on.
 
-**Each sale with its lines and VAT is not here.** Vipps MobilePay's [Sales API](https://developer.vippsmobilepay.com/docs/APIs/sales-api/) gives the order lines and VAT of sales made with a Vippsnummer or MobilePay number and with the point-of-sale product. It is open to accounting partners only, with accounting keys and their own token request, in production only. This server takes the merchant's or a partner's keys, which the Sales API does not accept. A sales unit that takes payment by number also has no API keys of its own. `get_receipt` gives the order lines of a payment that was created through the API with them.
+**Each sale with its lines and VAT needs accounting keys.** Vipps MobilePay's [Sales API](https://developer.vippsmobilepay.com/docs/APIs/sales-api/) gives the order lines and VAT of sales made with a Vippsnummer or MobilePay number and with the point-of-sale product, not of ePayment payments. It is open to accounting partners only, with accounting keys, in production only: `list_sales` and `get_sale` work with those keys and no others (see [Accounting keys](#accounting-keys)). A sales unit that takes payment by number has no API keys of its own. With the merchant's own keys, `get_receipt` gives the order lines of a payment that was created through the API with them.
 
 **Cancelling a charge uses DELETE.** The Recurring API cancels a charge with `DELETE /recurring/v3/agreements/{agreementId}/charges/{chargeId}`. It is the only DELETE this server can send, and it deletes no record: the charge remains. A pending, due or reserved charge ends as `CANCELLED`; a partially captured charge ends as `CHARGED`, with the rest released to the customer.
 
@@ -158,6 +160,8 @@ The address of a QR code's image is passed on whole, like the link of a payment 
 | Report entries | 31 days and 200 pages per call; `list_transactions` at most 5 000 entries |
 | Agreements | 10 pages of 500 |
 | Charges of one agreement | 20 pages (`Continuation-Token`) |
+| Ledgers, with accounting keys (the owner binding) | 200 pages |
+| Sales of one ledger date | 100 pages; at most 5 000 entries |
 
 A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`; every page it has so far is still read. A date that has not begun is not requested, since Vipps MobilePay refuses a ledger date more than 24 hours ahead, and is listed in `futureDates`, apart from the open dates. `readFrom` and `readTo` are the first and last date actually read, `complete` is `false` when any date is open or was not read, and `note` says in words what the answer lacks; the gateway's result text carries the same sentence. A period that lies entirely in the future makes no request and says that the period has not begun: `get_funds_summary` then returns `period: null`, not sums of zero.
 
@@ -179,7 +183,62 @@ The token is kept until five minutes before it expires (Vipps MobilePay: one hou
 
 **Environments.** `test` uses `https://apitest.vipps.no` with the test keys; `production` uses `https://api.vipps.no`. The keys are never sent to another host (a loopback URL is allowed for a local mock).
 
-**Partner keys.** Set `VIPPS_KEY_TYPE=partner` (gateway: `keyType: 'partner'`) to use a partner's `client_id`, `client_secret` and subscription key with the merchant's MSN, which is then required. Vipps MobilePay documents partner keys for the main APIs and the Management API, in production only, and not for the Report API; with partner keys the three report tools are not offered, and neither is `list_sales_units`, which would list the sales units of every merchant of the partner. Accounting keys (the Report API for accounting partners, without subscription key and MSN) are not supported yet.
+**Partner keys.** Set `VIPPS_KEY_TYPE=partner` (gateway: `keyType: 'partner'`) to use a partner's `client_id`, `client_secret` and subscription key with the merchant's MSN, which is then required. Vipps MobilePay documents partner keys for the main APIs and the Management API, in production only, and not for the Report API; with partner keys the three report tools are not offered, and neither is `list_sales_units`, which would list the sales units of every merchant of the partner. Accounting keys are described below.
+
+## Accounting keys
+
+An accounting partner approved by Vipps MobilePay has one set of accounting keys: a client id and a client secret, nothing else. With them the partner reads the [Report API](https://developer.vippsmobilepay.com/docs/APIs/report-api/) and the [Sales API](https://developer.vippsmobilepay.com/docs/APIs/sales-api/) for every sales unit whose business has given the partner access in the business portal. The keys exist in production only.
+
+```ts
+const gateway = createVippsMobilePayGateway({
+  clientId: partner.clientId,
+  clientSecret: partner.clientSecret,
+  keyType: 'accounting',
+  environment: 'production',
+  policy: { audit: record => log(record) },
+});
+
+// Every call names the organisation the caller may see, as the Report API names an owner.
+const result = await gateway.callTool('list_sales', { ledgerId: '302321', ledgerDate: '2026-11-03' }, {
+  caller: 'user-17',
+  owner: { scheme: 'business:DK:CVR', id: company.confirmedCvr },
+});
+```
+
+- **Only the gateway.** Accounting keys are taken from the host only, never from `VIPPS_*` variables, and the stdio and HTTP servers refuse them: an MCP call names no organisation. A `subscriptionKey` or `merchantSerialNumber` given with them is refused, and so is the test environment.
+- **Token.** `POST /miami/v1/token` with `Authorization: Basic base64(clientId:clientSecret)` and the form body `grant_type=client_credentials`. No `Ocp-Apim-Subscription-Key` and no `Merchant-Serial-Number` is sent on any request. The token is the partner's, kept until five minutes before it expires and shared by every call of the instance. The Basic form of the keys is a secret of the instance, like the keys themselves.
+- **Tools.** `check_connection`, `list_ledgers`, `get_funds_summary`, `list_transactions`, `list_sales` and `get_sale`. Every other tool is left out of `tools` and refused before anything is sent. The fixed list of requests for these keys holds five GET requests and nothing else: the ledger list, the funds and fees ledgers of a date, and the sales of a ledger by date, by `reference` and by `pspReference`.
+
+**The owner binding.** The token reads every business that has given the partner access, so it says nothing about whose data a call may see. The host does, in `context.owner`: a scheme of the form `business:<country>:<register>` and the number under it, for example the company's confirmed CVR number. The binding (`src/vipps/owner-binding.ts`) works like this:
+
+1. A call without an owner, or with one in another form, is refused before anything is sent, the token request included. The two texts are taken exactly as given: nothing is trimmed or folded.
+2. For every call the whole ledger list is read before anything else: every page, ending on an empty cursor, or on an empty page that gives back the cursor it was asked with. A page with ledgers under a cursor that does not move, a page in another form, and a list that does not end within 200 pages refuse the call: a part of the list is never taken for the whole.
+3. A ledger is the organisation's only when its `owner` has exactly that scheme and exactly that id. The same number under another scheme is another organisation. A ledger whose owner cannot be read, or whose sales unit names another organisation than its owner, is nobody's: it is left out and counted, and the answer says the list may lack ledgers (`ledgersNotAttributed`). A ledger of the organisation in another form than the specification refuses the whole list.
+4. A report or sales request is sent only for a ledger in that set. Any other ledger id is refused with one fixed text, whether it belongs to another organisation or does not exist, and nothing is asked for it. A ledger id, MSN or number from the caller is never proof of anything.
+5. Nothing is kept between calls. The set is read anew for each call and lives only in that call's view of the client; the client, with the token, is shared and never learns an owner or a ledger. No answer is cached. A ledger the organisation stops owning is not readable at the next call.
+
+**What is passed on.** Every answer read with accounting keys passes a typed allow-list that is read strictly: an unknown field is left out, and a known field in another type, or a missing field the specification requires, refuses the whole answer; no list item is ever an empty object. `payoutBankAccount` is never passed on, in whole or in part. Ledger entries leave out the payer's name, message and phone number; sales leave out `customer` and `completeness.hasCustomerIdentity`. VAT rates are in hundredths of a percent (2500 is 25 %), amounts in minor units.
+
+**Connection check.** With accounting keys `check_connection` reads the ledger list. It is connected (`{ connected: true, outcome: 'connected', ledgers }`) only when at least one ledger of the call's organisation is visible. Otherwise the error result carries `structuredContent: { connected: false, outcome }`, with `outcome` one of `no_ledger_for_owner` (the keys work, and the business has not given access, or has given it for another organisation), `keys_refused` (the token request answered 400, 401 or 403, or the ledger list 401 or 403), `unavailable` (anything else) and `owner_missing` (the host named no organisation).
+
+**Ledger dates of sales.** `list_sales` refuses a date that has not begun. The Sales API does not say when a ledger date is closed, so for the two newest dates `complete` is `false` and `note` says that more sales can come.
+
+**Observed in production** (25 November 2026, one token request and one read of the ledger list; only statuses, content types, field names, types and lengths were recorded):
+
+- `POST https://api.vipps.no/miami/v1/token` with Basic credentials, the form body `grant_type=client_credentials` and no subscription key or MSN answered HTTP 200 `application/json` with exactly `access_token` (a text in three dot-separated parts, about 640 characters), `expires_in` (the number 900) and `token_type` (`Bearer`).
+- `GET https://api.vipps.no/settlement/v1/ledgers` answered HTTP 200 `application/json` with exactly `{"cursor":"","items":[]}`: no business had given access yet.
+
+The test environment has neither. Everything else is from the specifications (Report 2.0, Sales 1.0).
+
+**Not verified:**
+
+- a ledger in the list: the form of `owner`, `salesUnits` and `businessIdentifier`, and whether the owner of a Danish company is written `business:DK:CVR`;
+- a list with more than one page, and whether the last page always has an empty cursor;
+- any answer of the Report API funds or fees ledgers with accounting keys;
+- any answer of the Sales API, its paging (`cursor` and `hasMore`), and whether `customer` is always empty as documented;
+- how a request for a ledger the partner may not read is answered;
+- a token request refused for wrong keys (400, 401 or 403), and throttling;
+- the lifetime of a token beyond the one `expires_in` observed.
 
 ## Quick start
 
@@ -312,7 +371,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 // result.structuredContent.idempotencyKey === input.idempotencyKey
 ```
 
-- **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required; a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
+- **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required (with accounting keys: `clientId`, `clientSecret` and `environment: 'production'` only); a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
 - **Host policy.** `policy` takes `enableWrites` (default false), `disabledTools`, `allowedTools` (an allow-list: when given, only these tools are offered, reads included; it must name known tools and must not be empty) and `audit`, a function that receives each audit record (a write does not run if the sink throws on its start record). Unknown tool names and malformed values throw at creation. An instance with `policy` reads none of `VIPPS_ENABLE_WRITES`, `VIPPS_DISABLED_TOOLS`, `VIPPS_AUDIT_LOG` or `VIPPS_ALLOW_CUSTOM_BASE_URL`.
 - **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating charges, capturing a Recurring charge, creating, changing or deleting a QR code, adding or changing a receipt, category or image, ordering a product, reading another merchant, and any other DELETE.
 - **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `write`; no tool is `destructive`, as none deletes or overwrites anything), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `environments` (`test` and `production`; the two sales unit tools work in production only), `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`create`, `capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney` (true when the call itself moves or releases money; false for `create_payment`, which only asks the customer to pay) and `logFields`, each with the one type its value must have:
@@ -327,7 +386,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 
   The identifiers are pseudonyms because the caller chooses them: a reference may be any text of the allowed characters, a person's name among them. The same identifier always gets the same pseudonym, so log lines can be matched; give a `pseudonymKey` (a secret of the host) so that a guessable reference such as an order number cannot be found from its hash. Names, phone numbers and free text are never log fields (a `description` is sent to Vipps MobilePay and only hashed in the audit log). `resolveVippsChange(tool, input, { pseudonymKey })` validates the input as `callTool` does, the operation key included, and returns the values.
 - **For a host that logs and confirms changes.** Create the operation key when the change is drafted, keep it with the draft and in the log before the call, and call the tool with that same key when the person approves it and on every retry. `create_payment` needs no key from the host: repeat it with the same input. Log `resolveVippsChange(...).change.values`, never the raw input. Pass the `link` or `qrCode` of a result on as it is: it holds the customer's token for that one payment, and a host that masks token-shaped text would leave a link that opens nothing.
-- **Call context.** `callTool(name, input, { caller, requestId })`: the audit writes `caller` only as a pseudonym (`hmac:` and 16 hex characters, with a key that is random per process, so the same caller can be followed within one process and not across restarts). The host's `requestId` is accepted and not written; each call gets the server's own request id, shared by its start, finish and error records.
+- **Call context.** `callTool(name, input, { caller, requestId })`: the audit writes `caller` only as a pseudonym (`hmac:` and 16 hex characters, with a key that is random per process, so the same caller can be followed within one process and not across restarts). The host's `requestId` is accepted and not written; each call gets the server's own request id, shared by its start, finish and error records. With accounting keys the context also carries `owner` (see [Accounting keys](#accounting-keys)); it is not written to the audit.
 - **Failure metadata.** An error result has only its text, and, when Vipps MobilePay (the API or the Access Token API) answered with an HTTP error, `failure: { httpStatus, requestId? }`: the status, and the vendor's request id from a response header (`REQUEST_ID_HEADERS` in `src/errors.ts`) only when it is a hex id of 8 to 64 characters (one run of hex digits, or groups of four or more joined by single hyphens, as in a UUID) and does not hold the shape of a personal number. A host can count failures from it without reading their text. Never the response body, the vendor's error code or message.
 - **Several merchants in one process.** Each instance keeps its own access token and redacts with its own keys; nothing is kept in process-wide state.
 
@@ -341,7 +400,7 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 
 - **(a) No key reaches anything persisted or shared:** audit sinks and the audit log file, logs, error texts. Everything a gateway instance returns is redacted with the instance's own keys (the keys and every piece of them of 6 characters or more; the access token as a whole) and then checked at the sink: an output that still holds a piece of a key is replaced by a fixed fallback.
 - **(b) No vendor-controlled free text in errors.** An error carries our own text, the HTTP status and a parsed Retry-After; never a response body, a vendor message or code, or a redirect's `Location`.
-- **(c) Results go only to the merchant whose keys they are.** One gateway instance per merchant; every call runs in a scope of its own.
+- **(c) Results go only to the merchant whose keys they are.** One gateway instance per merchant; every call runs in a scope of its own. With accounting keys one instance serves many organisations, and a call's results come only from ledgers owned by the organisation the host names for that call (see [Accounting keys](#accounting-keys)).
 
 **The customer's link.** The `link` or `qrCode` of a payment request is the one text of Vipps MobilePay passed on with a token in it: the address the customer opens, which is what the request exists to hand over. It is passed on only as an https address of URL characters (no spaces, so no sentence), without a user name or password and at most 4 096 characters; anything else is left out. The masking of token-shaped text is set aside for it, since the customer's token has that shape; the check at the sink is not, so a link that holds a piece of a key or the access token withholds the whole result.
 

@@ -13,8 +13,15 @@ export type VippsEnvironment = 'test' | 'production';
  *   partner   a partner's keys, used with the merchant's Merchant-Serial-Number.
  *             Vipps MobilePay documents partner keys for the ePayment and
  *             Recurring APIs, in production only, and not for the Report API.
+ *   accounting  an accounting partner's keys: a client id and a client secret
+ *             only, in production only. They give access to the Report API and
+ *             the Sales API, for every business that has given the partner
+ *             access in the portal. The token is therefore not one business's:
+ *             every call is bound to the organisation its host names for it
+ *             (src/vipps/owner-binding.ts), and only the gateway entry point
+ *             takes these keys.
  */
-export type VippsKeyType = 'merchant' | 'partner';
+export type VippsKeyType = 'merchant' | 'partner' | 'accounting';
 
 export const ENVIRONMENT_BASE_URLS: Readonly<Record<VippsEnvironment, string>> = Object.freeze({
   test: 'https://apitest.vipps.no',
@@ -47,7 +54,10 @@ export interface VippsClientOptions {
   merchantSerialNumber?: string;
   /** test or production. When omitted, read from VIPPS_ENVIRONMENT (default test). */
   environment?: VippsEnvironment;
-  /** merchant (default) or partner. When omitted, read from VIPPS_KEY_TYPE. */
+  /**
+   * merchant (default), partner or accounting. When omitted, read from VIPPS_KEY_TYPE (merchant or partner only:
+   * accounting keys are never read from the environment).
+   */
   keyType?: VippsKeyType;
   /**
    * Override of the base URL, for a local mock. Must be loopback, or one of
@@ -166,7 +176,8 @@ const TRANSIENT_NETWORK_CODES = new Set([
  * against this list before anything is sent, whichever tool asks: nothing
  * outside it (agreement changes, merchant or sales unit settings, new
  * charges) can be sent, whatever the policy says. Path segments arrive
- * already encoded by encodePathParam.
+ * already encoded by encodePathParam. Accounting keys have a list of their
+ * own (ACCOUNTING_REQUESTS).
  */
 const SEGMENT = '[^/?#]+';
 const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
@@ -203,12 +214,46 @@ const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
   DELETE: [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`)],
 };
 
+/**
+ * Every API request a client with accounting keys can make: the ledger list,
+ * the funds and fees ledgers of a ledger date, and the sales of a ledger (by
+ * ledger date, by the business's reference, by Vipps MobilePay's
+ * reference). All are GET. Nothing of the other list is among them, and the
+ * sales paths are in no other list: the Sales API takes accounting keys only.
+ * The feed of a ledger is not here: it is for keeping a copy, and this
+ * server keeps none.
+ */
+const ACCOUNTING_REQUESTS: readonly RegExp[] = [
+  /^\/settlement\/v1\/ledgers$/,
+  /^\/report\/v2\/ledgers\/\d{1,20}\/(funds|fees)\/dates\/\d{4}-\d{2}-\d{2}$/,
+  /^\/sales\/report\/v1\/ledgers\/\d{1,20}\/dates\/\d{4}-\d{2}-\d{2}$/,
+  new RegExp(`^/sales/report/v1/ledgers/\\d{1,20}/(references|psp-references)/${SEGMENT}$`),
+];
+
 /** A dot segment, or an encoded dot or separator, in a path: never sent. */
 const DOT_OR_ENCODED_SEPARATOR = /(^|\/)\.{1,2}(\/|$)|%2e|%2f|%5c/i;
 
-/** Whether this server may send the request at all (see ALLOWED_REQUESTS). */
-export function isAllowedRequest(method: HttpMethod, path: string): boolean {
+/**
+ * Whether a client with keys of this type may send the request at all (see
+ * ALLOWED_REQUESTS and ACCOUNTING_REQUESTS).
+ */
+export function isAllowedRequest(method: HttpMethod, path: string, keyType: VippsKeyType = 'merchant'): boolean {
+  if (keyType === 'accounting') return method === 'GET' && ACCOUNTING_REQUESTS.some(pattern => pattern.test(path));
   return (ALLOWED_REQUESTS[method] ?? []).some(pattern => pattern.test(path));
+}
+
+/**
+ * The ledgers of one organisation, as a client bound to that organisation
+ * reads them (src/vipps/owner-binding.ts). Read anew for every call and kept
+ * by nothing after it.
+ */
+export interface OwnLedgers {
+  /** The ledgers whose owner is the organisation, through the allow-list. The payout account is not among the fields. */
+  readonly ledgers: ReadonlyArray<Record<string, unknown>>;
+  /** Their ids: the only ledgers the call may ask for. */
+  readonly ids: ReadonlySet<string>;
+  /** Ledgers left out because they could not be attributed to one organisation. They may be this organisation's. */
+  readonly notAttributed: number;
 }
 
 /**
@@ -222,6 +267,11 @@ export interface UpstreamClient {
   delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
+  /**
+   * Accounting keys only: the ledgers of the organisation the call is bound to. Present exactly when the client is
+   * bound to an organisation, and a tool handler with accounting keys never gets a client that is not.
+   */
+  ownLedgers?(): Promise<OwnLedgers>;
   /** The sales unit the keys are used for, when one is configured. Not a secret. */
   readonly merchantSerialNumber?: string;
   /** The client's clock, in milliseconds since the epoch. */
@@ -245,6 +295,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     post: refuse('POST'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
+    ...(client.ownLedgers ? { ownLedgers: () => (client.ownLedgers as () => Promise<OwnLedgers>)() } : {}),
     merchantSerialNumber: client.merchantSerialNumber,
     currentTime: () => client.currentTime(),
     keyedHash: (purpose, text) => client.keyedHash(purpose, text),
@@ -272,6 +323,16 @@ interface CachedToken {
  *
  * Each client owns a SecretRedactor holding its own client_id, client_secret,
  * subscription key and current access token.
+ *
+ * Accounting keys (keyType accounting) authenticate in another way: the
+ * token comes from `POST /miami/v1/token` with the client id and the client
+ * secret as HTTP Basic credentials and the form body
+ * `grant_type=client_credentials`. No Ocp-Apim-Subscription-Key and no
+ * Merchant-Serial-Number is sent, on the token request or on any other, and
+ * the client can send only the requests in ACCOUNTING_REQUESTS. The token
+ * lives 15 minutes and is renewed five minutes before that. It is the
+ * partner's token, not one business's: what a call may read with it is
+ * decided for each call by the owner binding, never by this client.
  */
 export class VippsMobilePayClient implements UpstreamClient {
   readonly redactor: SecretRedactor;
@@ -282,6 +343,8 @@ export class VippsMobilePayClient implements UpstreamClient {
   private readonly clientId?: string;
   private readonly clientSecret?: string;
   private readonly subscriptionKey?: string;
+  /** Accounting keys: the client id and the client secret as HTTP Basic credentials. */
+  private readonly basicCredentials?: string;
   private readonly systemHeaders: Record<string, string>;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
@@ -317,13 +380,31 @@ export class VippsMobilePayClient implements UpstreamClient {
       ['test', 'production'] as const,
       'VIPPS_ENVIRONMENT must be "test" or "production".',
     );
-    this.keyType = choice(
-      options.keyType ?? readEnvString('VIPPS_KEY_TYPE', env) ?? 'merchant',
-      ['merchant', 'partner'] as const,
-      'VIPPS_KEY_TYPE must be "merchant" or "partner".',
-    );
+    // Accounting keys are named by the embedding host only: the environment can say merchant or partner.
+    this.keyType =
+      options.keyType !== undefined
+        ? choice(options.keyType, ['merchant', 'partner', 'accounting'] as const, 'keyType must be "merchant", "partner" or "accounting".')
+        : choice(
+            readEnvString('VIPPS_KEY_TYPE', env) ?? 'merchant',
+            ['merchant', 'partner'] as const,
+            'VIPPS_KEY_TYPE must be "merchant" or "partner".',
+          );
     if (this.keyType === 'partner' && this.environment !== 'production') {
       throw new ConfigError('Partner keys work only in the production environment (VIPPS_ENVIRONMENT=production).');
+    }
+    if (this.keyType === 'accounting') {
+      if (this.environment !== 'production') {
+        throw new ConfigError('Accounting keys work only in the production environment.');
+      }
+      if (this.subscriptionKey !== undefined || this.merchantSerialNumber !== undefined) {
+        throw new ConfigError(
+          'Accounting keys are a client id and a client secret only: give no subscription key and no Merchant-Serial-Number with them.',
+        );
+      }
+      if (this.clientId && this.clientSecret) {
+        this.basicCredentials = Buffer.from(`${this.clientId}:${this.clientSecret}`, 'utf8').toString('base64');
+        this.redactor.addSecret(this.basicCredentials);
+      }
     }
 
     const override = options.baseUrl ?? readEnvString('VIPPS_BASE_URL', env);
@@ -376,7 +457,7 @@ export class VippsMobilePayClient implements UpstreamClient {
   }
 
   keyedHash(purpose: KeyedHashPurpose, text: string): string {
-    const { clientSecret } = this.credentials();
+    const clientSecret = this.keyType === 'accounting' ? this.accountingCredentials().clientSecret : this.credentials().clientSecret;
     // One key for each purpose, so a value made for one says nothing of a value made for another.
     const key = createHmac('sha256', clientSecret).update(`mcp-server-vippsmobilepay ${purpose} v1`).digest();
     return createHmac('sha256', key).update(text).digest('hex');
@@ -416,6 +497,14 @@ export class VippsMobilePayClient implements UpstreamClient {
     return { clientId: this.clientId, clientSecret: this.clientSecret, subscriptionKey: this.subscriptionKey };
   }
 
+  /** Accounting keys: the Basic credentials, or the refusal when a key is missing. */
+  private accountingCredentials(): { clientSecret: string; basic: string } {
+    if (!this.clientId || !this.clientSecret || !this.basicCredentials) {
+      throw new Error('Missing Vipps MobilePay accounting keys: a client id and a client secret.');
+    }
+    return { clientSecret: this.clientSecret, basic: this.basicCredentials };
+  }
+
   private commonHeaders(subscriptionKey: string): Record<string, string> {
     return {
       Accept: 'application/json',
@@ -424,6 +513,20 @@ export class VippsMobilePayClient implements UpstreamClient {
       ...(this.merchantSerialNumber ? { 'Merchant-Serial-Number': this.merchantSerialNumber } : {}),
       ...this.systemHeaders,
     };
+  }
+
+  /** The headers every request with accounting keys has: no subscription key and no Merchant-Serial-Number. */
+  private accountingHeaders(): Record<string, string> {
+    return { Accept: 'application/json', 'User-Agent': USER_AGENT, ...this.systemHeaders };
+  }
+
+  /** The headers of an API request, without the token: by the kind of keys. */
+  private apiHeaders(): Record<string, string> {
+    if (this.keyType === 'accounting') {
+      this.accountingCredentials();
+      return this.accountingHeaders();
+    }
+    return this.commonHeaders(this.credentials().subscriptionKey);
   }
 
   /** The cached token, or a new one. Concurrent callers share one token request. */
@@ -437,15 +540,41 @@ export class VippsMobilePayClient implements UpstreamClient {
     return this.pendingToken;
   }
 
-  private async requestToken(): Promise<CachedToken> {
+  /** The token request, by the kind of keys: where it goes, its headers and its body. */
+  private tokenRequest(): { url: string; init: RequestInit } {
+    if (this.keyType === 'accounting') {
+      const { basic } = this.accountingCredentials();
+      return {
+        url: this.buildUrl('/miami/v1/token'),
+        init: {
+          method: 'POST',
+          headers: {
+            ...this.accountingHeaders(),
+            Authorization: `Basic ${basic}`,
+            'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+          },
+          // Vipps MobilePay: without this line the answer is `invalid_client`.
+          body: 'grant_type=client_credentials',
+        },
+      };
+    }
     const { clientId, clientSecret, subscriptionKey } = this.credentials();
-    const url = this.buildUrl('/accesstoken/get');
-    const headers = {
-      ...this.commonHeaders(subscriptionKey),
-      client_id: clientId,
-      client_secret: clientSecret,
+    return {
+      url: this.buildUrl('/accesstoken/get'),
+      init: {
+        method: 'POST',
+        headers: {
+          ...this.commonHeaders(subscriptionKey),
+          client_id: clientId,
+          client_secret: clientSecret,
+        },
+      },
     };
-    const body = await this.execute('POST', url, { method: 'POST', headers }, true, async response => {
+  }
+
+  private async requestToken(): Promise<CachedToken> {
+    const { url, init } = this.tokenRequest();
+    const body = await this.execute('POST', url, init, true, async response => {
       await this.refuseUnsuccessful(response, 'POST', url, true);
       return readResponseBody(response, this.maxResponseBytes);
     });
@@ -469,7 +598,7 @@ export class VippsMobilePayClient implements UpstreamClient {
     request: { query?: Record<string, QueryValue>; body?: unknown; headers?: Record<string, string>; idempotencyKey?: string },
   ): Promise<ResponsePage<T>> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-    if (!isAllowedRequest(method, normalizedPath)) {
+    if (!isAllowedRequest(method, normalizedPath, this.keyType)) {
       // Our own text: the path is not quoted, it may hold caller input.
       throw new Error(`Refused: this server never sends that ${method} request to Vipps MobilePay.`);
     }
@@ -477,14 +606,13 @@ export class VippsMobilePayClient implements UpstreamClient {
     // Checked again on the final URL, after the URL parser has resolved dot segments and encodings: the list
     // holds for what is sent, not only for what was asked.
     const finalPath = new URL(url).pathname;
-    if (!isAllowedRequest(method, finalPath) || finalPath !== normalizedPath || DOT_OR_ENCODED_SEPARATOR.test(normalizedPath)) {
+    if (!isAllowedRequest(method, finalPath, this.keyType) || finalPath !== normalizedPath || DOT_OR_ENCODED_SEPARATOR.test(normalizedPath)) {
       throw new Error(`Refused: this server never sends that ${method} request to Vipps MobilePay.`);
     }
     for (let attempt = 1; ; attempt += 1) {
       const token = await this.accessToken();
-      const { subscriptionKey } = this.credentials();
       const headers: Record<string, string> = {
-        ...this.commonHeaders(subscriptionKey),
+        ...this.apiHeaders(),
         ...(request.headers ?? {}),
         Authorization: `Bearer ${token.value}`,
       };
@@ -530,6 +658,7 @@ export class VippsMobilePayClient implements UpstreamClient {
         retryAfter: response.headers.get('retry-after') ?? undefined,
         requestId: requestIdFrom(response.headers),
         tokenRequest,
+        accountingKeys: this.keyType === 'accounting',
       });
     }
   }

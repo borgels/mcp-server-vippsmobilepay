@@ -4,7 +4,7 @@ import { vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { VippsMobilePayClient, type VippsClientOptions } from '../src/vipps/client.js';
-import { createVippsMobilePayGateway, type VippsGatewayOptions } from '../src/gateway.js';
+import { createVippsMobilePayGateway, type VippsAccountingGatewayOptions, type VippsGatewayOptions } from '../src/gateway.js';
 import { createServer } from '../src/server.js';
 
 /** The test environment's base URL; requests never leave the process (fetch is stubbed). */
@@ -34,6 +34,18 @@ export const KEYS = {
 
 export const TOKEN = fakeToken('fjordbakeriet');
 
+/** Made-up accounting keys of a made-up accounting partner ("Regnskabshuset"): a client id and a client secret only. */
+export const ACCOUNTING_KEYS = {
+  clientId: fakeKey('regnskabshuset-id', 36),
+  clientSecret: fakeKey('regnskabshuset-secret', 34),
+} as const;
+
+/** The token request of accounting keys. */
+export const ACCOUNTING_TOKEN_PATH = '/miami/v1/token';
+
+/** A made-up organisation a call with accounting keys is bound to, as the Report API names an owner. */
+export const OWNER = { scheme: 'business:DK:CVR', id: '10000011' } as const;
+
 export type Reply = { status?: number; body?: unknown; raw?: string; headers?: Record<string, string> };
 export type Route = Reply | ((url: URL, init: RequestInit) => Reply | Promise<Reply>);
 
@@ -56,14 +68,25 @@ export function stubFetch(routes: Record<string, Route> = {}) {
     const url = new URL(String(input));
     const method = init.method ?? 'GET';
     const headers = Object.fromEntries(Object.entries((init.headers ?? {}) as Record<string, string>));
-    const body = typeof init.body === 'string' ? (JSON.parse(init.body) as unknown) : undefined;
+    // A JSON body as data; any other body (the form body of the accounting token request) as its text.
+    let body: unknown;
+    if (typeof init.body === 'string') {
+      try {
+        body = JSON.parse(init.body) as unknown;
+      } catch {
+        body = init.body;
+      }
+    }
     calls.push({ method, path: url.pathname, query: Object.fromEntries(url.searchParams), headers, body });
     const key = `${method} ${url.pathname}`;
     const route =
       routes[key] ??
       (key === 'POST /accesstoken/get'
         ? { body: { token_type: 'Bearer', expires_in: '3600', access_token: TOKEN } }
-        : undefined);
+        : key === `POST ${ACCOUNTING_TOKEN_PATH}`
+          ? // As seen in production: exactly these three fields, the lifetime a number.
+            { body: { access_token: TOKEN, expires_in: 900, token_type: 'Bearer' } }
+          : undefined);
     if (!route) {
       return new Response(JSON.stringify({ title: `no stub for ${url.pathname}` }), {
         status: 404,
@@ -85,7 +108,7 @@ export function stubFetch(routes: Record<string, Route> = {}) {
 
 /** API calls only (the token request left out). */
 export function apiCalls(calls: Call[]): Call[] {
-  return calls.filter(call => call.path !== '/accesstoken/get');
+  return calls.filter(call => call.path !== '/accesstoken/get' && call.path !== ACCOUNTING_TOKEN_PATH);
 }
 
 export function makeClient(fetchImpl: typeof fetch, options: Partial<VippsClientOptions> = {}) {
@@ -105,6 +128,22 @@ export function gateway(routes: Record<string, Route> = {}, options: Partial<Vip
   const gw = createVippsMobilePayGateway({
     ...KEYS,
     environment: 'test',
+    fetchImpl,
+    maxAttempts: 1,
+    sleep: async () => undefined,
+    policy: {},
+    ...options,
+  });
+  return { gw, fetchImpl, calls };
+}
+
+/** A gateway with accounting keys. Every call needs `{ owner }` in its context. */
+export function accountingGateway(routes: Record<string, Route> = {}, options: Partial<VippsAccountingGatewayOptions> = {}) {
+  const { fetchImpl, calls } = stubFetch(routes);
+  const gw = createVippsMobilePayGateway({
+    ...ACCOUNTING_KEYS,
+    keyType: 'accounting',
+    environment: 'production',
     fetchImpl,
     maxAttempts: 1,
     sleep: async () => undefined,
