@@ -173,7 +173,7 @@ The server uses the Access Token API (`POST /accesstoken/get`, standard authenti
 
 - `client_id`, `client_secret`, `Ocp-Apim-Subscription-Key`: from the business portal ([portal.vippsmobilepay.com](https://portal.vippsmobilepay.com/)), *Developer* section, for the sales unit.
 - `Merchant-Serial-Number`: the sales unit's MSN.
-- `Vipps-System-Name: mcp-server-vippsmobilepay`, `Vipps-System-Version: <package version>`, and, when an embedding host gives them, `Vipps-System-Plugin-Name` and `Vipps-System-Plugin-Version`.
+- `Vipps-System-Name`, `Vipps-System-Version`, `Vipps-System-Plugin-Name` and `Vipps-System-Plugin-Version`, all four on every request ([required of partners and plugins](https://developer.vippsmobilepay.com/docs/knowledge-base/http-headers/)). On its own the server sends `mcp-server-vippsmobilepay` and the package version as both the system and the plugin. An embedding host that gives `systemName` and `systemVersion` (its own solution) is sent as the system, and the server as the plugin. A host that gives `systemPluginName` instead (the older use) is sent as the plugin, with the server as the system; without `systemPluginVersion` the plugin version is `0` (`DEFAULT_PLUGIN_VERSION`). `systemName` is given with `systemVersion`, and a version never without its name. Each value is at most 30 letters, digits, dots, dashes or underscores, and none may share text with the keys: the headers are sent in clear on every request, so such a value is refused at construction, without quoting it.
 
 The token is kept until five minutes before it expires (Vipps MobilePay: one hour in test, 24 hours in production) and shared by concurrent calls. A call answered with 401 gets a new token and is sent once more (a write with the same `Idempotency-Key`); a second 401 is reported.
 
@@ -296,7 +296,8 @@ const gateway = createVippsMobilePayGateway({
   merchantSerialNumber: merchant.msn,
   environment: 'production',
   keyType: 'merchant',
-  systemPluginName: 'acme-host',
+  systemName: 'acme-host',
+  systemVersion: '2.1',
   policy: { enableWrites: true, allowedTools: ['get_payment', 'refund_payment'], audit: record => log(record) },
 });
 
