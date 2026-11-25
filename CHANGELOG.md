@@ -2,13 +2,28 @@
 
 ## Unreleased
 
+- All four `Vipps-System-*` headers are sent on every request, as Vipps
+  MobilePay requires of partners and plugins. An embedding host can give its
+  own solution as `systemName` and `systemVersion`; the host is then sent as
+  the system and the server as the plugin (`Vipps-System-Plugin-Name:
+  mcp-server-vippsmobilepay` with the package version). On its own the server
+  sends itself as both. A host that gives `systemPluginName` keeps the older
+  arrangement, with the server as the system.
+- `systemName` is given with `systemVersion`. `systemPluginName` without
+  `systemPluginVersion` still works, as before, and sends the plugin version
+  `0` (`DEFAULT_PLUGIN_VERSION`); `systemPluginVersion` without
+  `systemPluginName` is refused at construction.
+- A Vipps-System-* value that shares text with the instance's keys is refused
+  at construction, without quoting it: the headers are sent in clear.
 - Failure metadata for logging errors as Vipps MobilePay's checklist asks,
   without keeping answers: `failure` on an error result, and the audit's
   error record, now carry the request's `method`, its `pathTemplate` (the
   path from the server's fixed list with every reference, id, date and number
   as a `{name}`, never a query), Vipps MobilePay's `errorCode` (digits only,
-  such as ePayment's `6080`) and its `traceId` (a W3C trace context or a
-  UUID), next to `httpStatus` and `requestId`. The error code and trace id
+  such as ePayment's `6080`) and its `traceId` (ePayment's W3C trace context,
+  or Recurring's `contextId` as a UUID), next to `httpStatus` and `requestId`.
+  In the audit the vendor's request id is `vendorRequestId`; `requestId`
+  stays the server's own, shared by a call's start and error records. The error code and trace id
   are the only values read from an error body, only from JSON of at most
   16 KiB and only in their fixed forms; the vendor's message, title, field
   names and reasons are never read out.

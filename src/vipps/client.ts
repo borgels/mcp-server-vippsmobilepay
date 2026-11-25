@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor, vendorErrorFields } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
+import { ALLOWED_REQUESTS, TOKEN_PATH } from './requests.js';
 import type { KeyedHashPurpose } from './values.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
@@ -27,7 +28,10 @@ export const UPSTREAM_HOSTS: readonly string[] = ['api.vipps.no', 'apitest.vipps
 /** Header names that carry a credential; redaction follows them by name. */
 export const CREDENTIAL_HEADERS = ['client_id', 'client_secret', 'Ocp-Apim-Subscription-Key', 'Authorization'] as const;
 
-/** The value sent as Vipps-System-Name. */
+/**
+ * This server's name in the Vipps-System-* headers: the system when it runs on its own, and the plugin when a host
+ * gives its own system name (the host is the solution, this server the service it uses).
+ */
 export const SYSTEM_NAME = 'mcp-server-vippsmobilepay';
 
 const MSN_PATTERN = /^\d{4,10}$/;
@@ -35,6 +39,53 @@ const MSN_PATTERN = /^\d{4,10}$/;
 const SYSTEM_HEADER_PATTERN = /^[A-Za-z0-9._-]{1,30}$/;
 /** Idempotency-Key: the Recurring API allows 1-40 characters without '#', '?', '/' or '\'; we allow a strict subset. */
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9-]{8,40}$/;
+
+/** The plugin version sent when a host gives systemPluginName without systemPluginVersion (the older use). */
+export const DEFAULT_PLUGIN_VERSION = '0';
+
+/**
+ * The four Vipps-System-* headers, always all four: Vipps MobilePay requires them of partners and plugins. A host that
+ * gives its own system name and version is the system, and this server the plugin. On its own this server is both, as
+ * Vipps MobilePay suggests when there is no plugin. A host that gives a plugin name instead (the older use) is the
+ * plugin, and this server the system; without systemPluginVersion its version is DEFAULT_PLUGIN_VERSION. systemName is
+ * given with systemVersion, and a version is never given without its name.
+ *
+ * The values go to Vipps MobilePay in clear on every request, outside the credential headers, so none may hold a
+ * secret of the instance or a piece of one (`secrets`, the client's redactor). The refusal names the option, never
+ * the value.
+ */
+export function systemHeaders(
+  options: Pick<VippsClientOptions, 'systemName' | 'systemVersion' | 'systemPluginName' | 'systemPluginVersion'>,
+  secrets?: { matches(text: string): boolean },
+): Record<string, string> {
+  for (const [value, name] of [
+    [options.systemName, 'systemName'],
+    [options.systemVersion, 'systemVersion'],
+    [options.systemPluginName, 'systemPluginName'],
+    [options.systemPluginVersion, 'systemPluginVersion'],
+  ] as const) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
+      throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
+    }
+    if (secrets?.matches(value)) {
+      throw new ConfigError(`${name} shares text with the keys; it is sent in clear and must not hold a key.`);
+    }
+  }
+  if ((options.systemName === undefined) !== (options.systemVersion === undefined)) {
+    throw new ConfigError('systemName and systemVersion must be given together.');
+  }
+  if (options.systemPluginName === undefined && options.systemPluginVersion !== undefined) {
+    throw new ConfigError('systemPluginVersion is given only with systemPluginName.');
+  }
+  return {
+    'Vipps-System-Name': options.systemName ?? SYSTEM_NAME,
+    'Vipps-System-Version': options.systemVersion ?? PACKAGE_VERSION,
+    'Vipps-System-Plugin-Name': options.systemPluginName ?? SYSTEM_NAME,
+    'Vipps-System-Plugin-Version':
+      options.systemPluginName === undefined ? PACKAGE_VERSION : (options.systemPluginVersion ?? DEFAULT_PLUGIN_VERSION),
+  };
+}
 
 export interface VippsClientOptions {
   /** client_id. When omitted, read from VIPPS_CLIENT_ID in `credentialEnv`. */
@@ -57,7 +108,14 @@ export interface VippsClientOptions {
   baseUrl?: string;
   /** Allow a base URL outside UPSTREAM_HOSTS (env VIPPS_ALLOW_CUSTOM_BASE_URL=true). */
   allowCustomBaseUrl?: boolean;
-  /** Vipps-System-Plugin-Name, for a host that embeds this package (one word, at most 30 characters). */
+  /**
+   * Vipps-System-Name, for a host that embeds this package: its own solution (one word, at most 30 characters). Given
+   * with systemVersion; this server is then sent as the plugin (see systemHeaders).
+   */
+  systemName?: string;
+  /** Vipps-System-Version of the host's solution (at most 30 characters). */
+  systemVersion?: string;
+  /** Vipps-System-Plugin-Name, for a host that embeds this package as the system (one word, at most 30 characters). */
   systemPluginName?: string;
   /** Vipps-System-Plugin-Version (at most 30 characters). */
   systemPluginVersion?: string;
@@ -88,7 +146,8 @@ export interface VippsClientOptions {
 
 export type QueryValue = string | number | boolean | null | undefined;
 
-export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type { HttpMethod } from './requests.js';
+import type { HttpMethod } from './requests.js';
 
 /** A page of a response: the body and the response headers this server reads (lower-case names). */
 export interface ResponsePage<T> {
@@ -161,65 +220,6 @@ const TRANSIENT_NETWORK_CODES = new Set([
   'UND_ERR_BODY_TIMEOUT',
 ]);
 
-/**
- * Every API request this server can make, by method. A path is checked
- * against this list before anything is sent, whichever tool asks: nothing
- * outside it (agreement changes, merchant or sales unit settings, new
- * charges) can be sent, whatever the policy says. Path segments arrive
- * already encoded by encodePathParam.
- */
-const SEGMENT = '[^/?#]+';
-const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonly [RegExp, string]>>> = {
-  GET: [
-    [/^\/settlement\/v1\/ledgers$/, '/settlement/v1/ledgers'],
-    [/^\/report\/v2\/ledgers\/\d{1,20}\/funds\/dates\/\d{4}-\d{2}-\d{2}$/, '/report/v2/ledgers/{ledgerId}/funds/dates/{date}'],
-    [/^\/report\/v2\/ledgers\/\d{1,20}\/fees\/dates\/\d{4}-\d{2}-\d{2}$/, '/report/v2/ledgers/{ledgerId}/fees/dates/{date}'],
-    [new RegExp(`^/epayment/v1/payments/${SEGMENT}$`), '/epayment/v1/payments/{reference}'],
-    [new RegExp(`^/epayment/v1/payments/${SEGMENT}/events$`), '/epayment/v1/payments/{reference}/events'],
-    [/^\/recurring\/v3\/agreements$/, '/recurring/v3/agreements'],
-    [new RegExp(`^/recurring/v3/agreements/${SEGMENT}$`), '/recurring/v3/agreements/{agreementId}'],
-    [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges$`), '/recurring/v3/agreements/{agreementId}/charges'],
-    [
-      new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
-      '/recurring/v3/agreements/{agreementId}/charges/{chargeId}',
-    ],
-    // A charge by its own id, when the agreement is not known (find_charge).
-    [new RegExp(`^/recurring/v3/charges/${SEGMENT}$`), '/recurring/v3/charges/{chargeId}'],
-    // The order lines and category stored with a payment or a charge (get_receipt).
-    [new RegExp(`^/order-management/v2/ECOM/${SEGMENT}$`), '/order-management/v2/ECOM/{orderId}'],
-    [new RegExp(`^/order-management/v2/RECURRING/${SEGMENT}$`), '/order-management/v2/RECURRING/{orderId}'],
-    // The sales units the keys can read, and one of them (list_sales_units, get_sales_unit). Production only.
-    [/^\/management\/v1\/sales-units$/, '/management/v1/sales-units'],
-    [/^\/management\/v1\/sales-units\/\d{4,10}$/, '/management/v1/sales-units/{msn}'],
-    // The sales unit's fixed QR codes (list_qr_codes).
-    [/^\/qr\/v1\/merchant-redirect$/, '/qr/v1/merchant-redirect'],
-    [/^\/qr\/v1\/merchant-callback$/, '/qr/v1/merchant-callback'],
-  ],
-  POST: [
-    // A new payment request (create_payment). The customer approves it in the app before any money moves.
-    [/^\/epayment\/v1\/payments$/, '/epayment/v1/payments'],
-    [new RegExp(`^/epayment/v1/payments/${SEGMENT}/capture$`), '/epayment/v1/payments/{reference}/capture'],
-    [new RegExp(`^/epayment/v1/payments/${SEGMENT}/refund$`), '/epayment/v1/payments/{reference}/refund'],
-    [new RegExp(`^/epayment/v1/payments/${SEGMENT}/cancel$`), '/epayment/v1/payments/{reference}/cancel'],
-    [
-      new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
-      '/recurring/v3/agreements/{agreementId}/charges/{chargeId}/refund',
-    ],
-  ],
-  // Vipps MobilePay cancels a Recurring charge with DELETE on the charge. It is
-  // the only DELETE this server can send, and it deletes no record: the charge
-  // stays. A pending, due or reserved charge ends as CANCELLED; a partially
-  // captured one ends as CHARGED, with the rest released to the customer.
-  DELETE: [
-    [
-      new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
-      '/recurring/v3/agreements/{agreementId}/charges/{chargeId}',
-    ],
-  ],
-};
-
-/** The path of the access token request, which is not in ALLOWED_REQUESTS. */
-const TOKEN_PATH = '/accesstoken/get';
 
 /** A dot segment, or an encoded dot or separator, in a path: never sent. */
 const DOT_OR_ENCODED_SEPARATOR = /(^|\/)\.{1,2}(\/|$)|%2e|%2f|%5c/i;
@@ -361,20 +361,8 @@ export class VippsMobilePayClient implements UpstreamClient {
     this.baseUrl = trimTrailingSlash(override ?? ENVIRONMENT_BASE_URLS[this.environment]);
     assertSafeBaseUrl(this.baseUrl, options.allowCustomBaseUrl ?? readEnvBoolean('VIPPS_ALLOW_CUSTOM_BASE_URL', false, env));
 
-    this.systemHeaders = {
-      'Vipps-System-Name': SYSTEM_NAME,
-      'Vipps-System-Version': PACKAGE_VERSION,
-    };
-    for (const [header, value, name] of [
-      ['Vipps-System-Plugin-Name', options.systemPluginName, 'systemPluginName'],
-      ['Vipps-System-Plugin-Version', options.systemPluginVersion, 'systemPluginVersion'],
-    ] as const) {
-      if (value === undefined) continue;
-      if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
-        throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
-      }
-      this.systemHeaders[header] = value;
-    }
+    // After the keys are in the redactor: no header value may hold one of them.
+    this.systemHeaders = systemHeaders(options, this.redactor);
 
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'VIPPS_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);

@@ -149,8 +149,18 @@ export async function writeAuditEvent(
   }
 }
 
+/**
+ * The error's fields in the audit record. The vendor's request id goes in as vendorRequestId: the record's requestId
+ * is the server's own, shared by the call's start, finish and error records, and is never replaced.
+ */
 function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
-  return { httpStatus: summary.httpStatus, error: summary.message, ...(summary.failure ?? {}) };
+  const { requestId: vendorRequestId, ...failure } = summary.failure ?? {};
+  return {
+    httpStatus: summary.httpStatus,
+    error: summary.message,
+    ...failure,
+    ...(vendorRequestId === undefined ? {} : { vendorRequestId }),
+  };
 }
 
 /**

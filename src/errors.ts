@@ -15,6 +15,7 @@
  * short.
  */
 
+import { REQUEST_TEMPLATES } from './vipps/requests.js';
 import { isHttpsUrl } from './vipps/values.js';
 
 /** Configured secrets shorter than this are not redacted by value (too likely to hit normal text). */
@@ -301,19 +302,20 @@ export class VippsHttpError extends Error {
 }
 
 const METHODS: readonly string[] = ['GET', 'POST', 'DELETE'];
-/** A path template as this server writes them: lower-case words, digits, dashes, {name} placeholders. */
-const TEMPLATE_FORM = /^(?:\/(?:[a-z0-9-]+|ECOM|RECURRING|\{[a-zA-Z]+\}))+$/;
 /** Vipps MobilePay's error codes are numbers (ePayment: 3010 to 10070). */
 const ERROR_CODE_FORM = /^\d{2,6}$/;
 /** A W3C trace context, as ePayment gives its traceId: version, trace id, parent id and flags in lower-case hex. */
 const TRACE_CONTEXT_FORM = /^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
+/** A UUID, as the Recurring API gives its contextId: 8-4-4-4-12 hex digits. */
+const UUID_FORM = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 function vendorMethod(value: unknown): string | undefined {
   return typeof value === 'string' && METHODS.includes(value) ? value : undefined;
 }
 
+/** A path template only when it is one of the fixed list's (REQUEST_TEMPLATES); any other text is dropped. */
 function templateInForm(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length <= 120 && TEMPLATE_FORM.test(value) ? value : undefined;
+  return typeof value === 'string' && REQUEST_TEMPLATES.has(value) ? value : undefined;
 }
 
 /** An error code only as digits; anything else (a word, a sentence) is dropped. */
@@ -322,14 +324,19 @@ export function vendorErrorCode(value: unknown): string | undefined {
   return typeof text === 'string' && ERROR_CODE_FORM.test(text.trim()) ? text.trim() : undefined;
 }
 
-/**
- * A trace id only in a fixed form: a W3C trace context (random hex the vendor makes, never text), or a UUID or hex id
- * as vendorRequestId takes it. Anything else is dropped.
- */
+/** ePayment's traceId only as a W3C trace context; anything else (digits, a name, a resource id) is dropped. */
+export function vendorTraceContext(value: unknown): string | undefined {
+  return typeof value === 'string' && TRACE_CONTEXT_FORM.test(value.trim()) ? value.trim() : undefined;
+}
+
+/** Recurring's contextId only as a UUID; anything else is dropped. */
+export function vendorContextId(value: unknown): string | undefined {
+  return typeof value === 'string' && UUID_FORM.test(value.trim()) ? value.trim() : undefined;
+}
+
+/** A trace id as kept: a W3C trace context or a UUID, each in its exact form. Anything else is dropped. */
 export function vendorTraceId(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const id = value.trim();
-  return TRACE_CONTEXT_FORM.test(id) ? id : vendorRequestId(id);
+  return vendorTraceContext(value) ?? vendorContextId(value);
 }
 
 /**
@@ -349,7 +356,8 @@ export function vendorErrorFields(body: unknown): { errorCode?: string; traceId?
       }
     }
   }
-  const traceId = vendorTraceId(value.traceId) ?? vendorTraceId(value.contextId);
+  // Each field by its own exact form: traceId as a trace context, contextId as a UUID.
+  const traceId = vendorTraceContext(value.traceId) ?? vendorContextId(value.contextId);
   return { ...(errorCode === undefined ? {} : { errorCode }), ...(traceId === undefined ? {} : { traceId }) };
 }
 

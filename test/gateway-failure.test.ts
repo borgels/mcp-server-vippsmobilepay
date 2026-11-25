@@ -1,7 +1,7 @@
 // Failure metadata on gateway error results: method, path template, the upstream API's HTTP status, its request id, and
 // Vipps MobilePay's error code and trace id in their fixed forms only. Never the rest of the body or the vendor's message.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { failureMetadata, requestIdFrom, VippsHttpError, vendorErrorFields, vendorRequestId } from '../src/errors.js';
+import { failureInForm, failureMetadata, requestIdFrom, VippsHttpError, vendorErrorFields, vendorRequestId } from '../src/errors.js';
 import { requestTemplate } from '../src/vipps/client.js';
 import { BASE, gateway, payment } from './helpers.js';
 
@@ -258,6 +258,65 @@ describe("Vipps MobilePay's error code and trace id", () => {
     expect(vendorErrorFields({ errorCode: '6080 for Jane Doe' })).toEqual({});
     expect(vendorErrorFields(['6080'])).toEqual({});
     expect(vendorErrorFields('6080')).toEqual({});
+  });
+
+  it("keeps the server's own request id in the audit's error record, and the vendor's as vendorRequestId", async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const { gw } = gateway(
+      { [PAYMENT]: { status: 404, body: EPAYMENT_ERROR, headers: { 'x-request-id': UUID, 'content-type': 'application/problem+json' } } },
+      { policy: { audit: record => void records.push(record) } },
+    );
+    await gw.callTool('get_payment', { reference: REFERENCE });
+    const start = records.find(record => record.action === 'start');
+    const error = records.find(record => record.action === 'error');
+    expect(start?.requestId).toEqual(expect.any(String));
+    expect(error?.requestId).toBe(start?.requestId);
+    expect(error?.requestId).not.toBe(UUID);
+    expect(error?.vendorRequestId).toBe(UUID);
+    expect(error?.traceId).toBe(TRACE);
+  });
+
+  it('takes a trace id only in its exact form: traceId as a trace context, contextId as a UUID', () => {
+    for (const odd of ['4512345678', '12345678', '+4512345678', 'agr_5kSeqz', 'chr-123ab', 'deadbeef', 'deadbeef00112233', 'order-1001', UUID.toUpperCase().replace(/-/g, '')]) {
+      expect(vendorErrorFields({ traceId: odd }), odd).toEqual({});
+      expect(vendorErrorFields({ contextId: odd }), odd).toEqual({});
+    }
+    // Each field only in its own form.
+    expect(vendorErrorFields({ traceId: UUID })).toEqual({});
+    expect(vendorErrorFields({ contextId: TRACE })).toEqual({});
+    expect(failureInForm({ httpStatus: 400, traceId: '4512345678' })).toEqual({ httpStatus: 400 });
+  });
+
+  it('keeps a path template only when it is one of the fixed list', () => {
+    expect(failureInForm({ httpStatus: 400, pathTemplate: '/epayment/v1/payments/{reference}/capture' })).toEqual({
+      httpStatus: 400,
+      pathTemplate: '/epayment/v1/payments/{reference}/capture',
+    });
+    for (const odd of ['/epayment/v1/payments/order-1001', '/epayment/v1/{x}', '/accesstoken/get/x', '/recurring/v3/agreements?status=ACTIVE']) {
+      expect(failureInForm({ httpStatus: 400, pathTemplate: odd }), odd).toEqual({ httpStatus: 400 });
+    }
+  });
+
+  it('reads nothing from an error body that is not valid JSON or is over 16 KiB', async () => {
+    const answers: Array<[string, Record<string, unknown>]> = [
+      ['invalid JSON', { status: 400, raw: '{"traceId": "' + TRACE + '", "extraDetails": [{"name": "ErrorCode", "reason": "6080"}', headers: { 'content-type': 'application/problem+json' } }],
+      [
+        'over 16 KiB',
+        {
+          status: 400,
+          raw: JSON.stringify({ ...EPAYMENT_ERROR, padding: 'x'.repeat(17 * 1024) }),
+          headers: { 'content-type': 'application/problem+json' },
+        },
+      ],
+    ];
+    for (const [name, reply] of answers) {
+      const { gw } = gateway({ [PAYMENT]: reply });
+      expect((await gw.callTool('get_payment', { reference: REFERENCE })).failure, name).toEqual({
+        httpStatus: 400,
+        method: 'GET',
+        pathTemplate: '/epayment/v1/payments/{reference}',
+      });
+    }
   });
 
   it('gives every allowed request a template without ids, dates or query', () => {
