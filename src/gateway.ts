@@ -13,6 +13,15 @@ import {
   type InstancePolicy,
 } from './vipps/policy.js';
 import { ConfigError } from './config-env.js';
+import {
+  listWebhooks,
+  PAYMENT_EVENTS,
+  registerPaymentEvents,
+  removeWebhook,
+  type PaymentEvent,
+  type Webhook,
+  type WebhookRegistration,
+} from './vipps/webhooks.js';
 import { failureMetadata, formatUnknownError, redactDeep, SecretRedactor, vendorRequestId, type FailureMetadata } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
@@ -59,6 +68,9 @@ import {
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
 export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
 export type { VippsChangeAction, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
+export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
+/** The ePayment events a host can register its address for (registerPaymentEvents). */
+export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -402,6 +414,14 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
+  /** A host function's failure: our own text, redacted, without the cause. The webhook secret is never in it. */
+  const hostCall = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await underPolicy(work);
+    } catch (error) {
+      throw sealedError(new Error(formatUnknownError(error, redactor)));
+    }
+  };
 
   return {
     /** Tools offered on this instance: not disabled or outside allowedTools, and usable with its keys. */
@@ -411,6 +431,22 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     /** The environment and key type of this instance. */
     environment: client.environment,
     keyType: client.keyType,
+    /**
+     * Host only, never a tool: register `address` (https, the host's own) for this sales unit's ePayment `events`.
+     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here.
+     * Registering the same address and events again sends the same operation key.
+     */
+    registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
+      return hostCall(() => registerPaymentEvents(client, address, events));
+    },
+    /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
+    listWebhooks(): Promise<Webhook[]> {
+      return hostCall(() => listWebhooks(client));
+    },
+    /** Host only, never a tool: remove one registration by its id. */
+    removeWebhook(id: string): Promise<void> {
+      return hostCall(() => removeWebhook(client, id));
+    },
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Webhook registration for an embedding host: `registerPaymentEvents`,
+  `listWebhooks` and `removeWebhook` on a gateway instance, and
+  `VIPPS_PAYMENT_EVENTS`. The host registers its own https address for the
+  sales unit's ePayment events and gets the registration's id and signing
+  secret back, once. Host functions only, never tools. The fixed request list
+  gains `GET` and `POST /webhooks/v1/webhooks` and
+  `DELETE /webhooks/v1/webhooks/{id}`; an answer that cannot be used is never
+  quoted, since it may hold the secret.
 - All four `Vipps-System-*` headers are sent on every request, as Vipps
   MobilePay requires of partners and plugins. An embedding host can give its
   own solution as `systemName` and `systemVersion`; the host is then sent as
