@@ -29,6 +29,18 @@
   `systemPluginName` is refused at construction.
 - A Vipps-System-* value that shares text with the instance's keys is refused
   at construction, without quoting it: the headers are sent in clear.
+- Failure metadata for logging errors as Vipps MobilePay's checklist asks,
+  without keeping answers: `failure` on an error result, and the audit's
+  error record, now carry the request's `method`, its `pathTemplate` (the
+  path from the server's fixed list with every reference, id, date and number
+  as a `{name}`, never a query), Vipps MobilePay's `errorCode` (digits only,
+  such as ePayment's `6080`) and its `traceId` (ePayment's W3C trace context,
+  or Recurring's `contextId` as a UUID), next to `httpStatus` and `requestId`.
+  In the audit the vendor's request id is `vendorRequestId`; `requestId`
+  stays the server's own, shared by a call's start and error records. The error code and trace id
+  are the only values read from an error body, only from JSON of at most
+  16 KiB and only in their fixed forms; the vendor's message, title, field
+  names and reasons are never read out.
 
 ## 0.7.1
 

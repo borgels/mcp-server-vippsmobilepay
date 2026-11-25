@@ -22,7 +22,7 @@ import {
   type Webhook,
   type WebhookRegistration,
 } from './vipps/webhooks.js';
-import { failureMetadata, formatUnknownError, redactDeep, SecretRedactor, vendorRequestId, type FailureMetadata } from './errors.js';
+import { failureInForm, failureMetadata, formatUnknownError, redactDeep, SecretRedactor, type FailureMetadata } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
@@ -86,9 +86,11 @@ export interface GatewayToolDefinition {
 }
 
 /**
- * Metadata about a failed call, on an error result whose cause is known: the HTTP status the upstream API answered
- * with, and the vendor's own request id when a response header gives one as a UUID or hex id. For a host that counts
- * failures without reading their text. Never the response body, the vendor's error code or message, or the input.
+ * Metadata about a failed call, on an error result whose cause is known: the request's method and path template, the
+ * HTTP status the upstream API answered with, the vendor's own request id when a response header gives one as a UUID
+ * or hex id, and Vipps MobilePay's error code and trace id from the body in their fixed forms. For a host that logs
+ * and counts failures without reading their text. Never the response body, the vendor's message, an id or query value
+ * from the path, or the input.
  */
 export type GatewayFailure = FailureMetadata;
 
@@ -96,7 +98,7 @@ export interface GatewayToolResult {
   content: Array<{ type: 'text'; text: string }>;
   structuredContent?: GatewayJsonValue;
   isError?: boolean;
-  /** On an error result from the upstream API only: its HTTP status and request id (see GatewayFailure). */
+  /** On an error result from the upstream API only: method, path template, status, ids and error code (see GatewayFailure). */
   failure?: GatewayFailure;
 }
 
@@ -546,9 +548,7 @@ function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult 
  */
 function withFailureInForm(result: GatewayToolResult): GatewayToolResult {
   const { failure, ...rest } = result;
-  if (!result.isError || failure === undefined || failure === null || typeof failure !== 'object') return rest;
-  const status = failure.httpStatus;
-  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return rest;
-  const requestId = vendorRequestId(failure.requestId);
-  return { ...rest, failure: requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId } };
+  if (!result.isError) return rest;
+  const inForm = failureInForm(failure);
+  return inForm === undefined ? rest : { ...rest, failure: inForm };
 }

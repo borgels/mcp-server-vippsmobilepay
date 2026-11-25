@@ -1,7 +1,8 @@
 import { createHmac } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
+import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor, vendorErrorFields } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
+import { ALLOWED_REQUESTS, TOKEN_PATH } from './requests.js';
 import type { KeyedHashPurpose } from './values.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
@@ -145,7 +146,8 @@ export interface VippsClientOptions {
 
 export type QueryValue = string | number | boolean | null | undefined;
 
-export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type { HttpMethod } from './requests.js';
+import type { HttpMethod } from './requests.js';
 
 /** A page of a response: the body and the response headers this server reads (lower-case names). */
 export interface ResponsePage<T> {
@@ -218,60 +220,27 @@ const TRANSIENT_NETWORK_CODES = new Set([
   'UND_ERR_BODY_TIMEOUT',
 ]);
 
-/**
- * Every API request this server can make, by method. A path is checked
- * against this list before anything is sent, whichever tool asks: nothing
- * outside it (agreement changes, merchant or sales unit settings, new
- * charges) can be sent, whatever the policy says. Path segments arrive
- * already encoded by encodePathParam.
- */
-const SEGMENT = '[^/?#]+';
-const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
-  GET: [
-    /^\/settlement\/v1\/ledgers$/,
-    /^\/report\/v2\/ledgers\/\d{1,20}\/(funds|fees)\/dates\/\d{4}-\d{2}-\d{2}$/,
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}$`),
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}/events$`),
-    /^\/recurring\/v3\/agreements$/,
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
-    // A charge by its own id, when the agreement is not known (find_charge).
-    new RegExp(`^/recurring/v3/charges/${SEGMENT}$`),
-    // The order lines and category stored with a payment or a charge (get_receipt).
-    new RegExp(`^/order-management/v2/(ECOM|RECURRING)/${SEGMENT}$`),
-    // The sales units the keys can read, and one of them (list_sales_units, get_sales_unit). Production only.
-    /^\/management\/v1\/sales-units$/,
-    /^\/management\/v1\/sales-units\/\d{4,10}$/,
-    // The sales unit's fixed QR codes (list_qr_codes).
-    /^\/qr\/v1\/merchant-redirect$/,
-    /^\/qr\/v1\/merchant-callback$/,
-    // The host's registrations for events (listWebhooks, src/vipps/webhooks.ts). Never a tool.
-    /^\/webhooks\/v1\/webhooks$/,
-  ],
-  POST: [
-    // A new payment request (create_payment). The customer approves it in the app before any money moves.
-    /^\/epayment\/v1\/payments$/,
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}/(capture|refund|cancel)$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
-    // The host registers its own address for a sales unit's ePayment events (registerPaymentEvents). Never a tool.
-    /^\/webhooks\/v1\/webhooks$/,
-  ],
-  // Vipps MobilePay cancels a Recurring charge with DELETE on the charge. It is
-  // the only DELETE this server can send, and it deletes no record: the charge
-  // stays. A pending, due or reserved charge ends as CANCELLED; a partially
-  // captured one ends as CHARGED, with the rest released to the customer.
-  // The host also removes a registration of its own address for events (removeWebhook). Never a tool.
-  DELETE: [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`), /^\/webhooks\/v1\/webhooks\/[A-Za-z0-9-]{8,64}$/],
-};
 
 /** A dot segment, or an encoded dot or separator, in a path: never sent. */
 const DOT_OR_ENCODED_SEPARATOR = /(^|\/)\.{1,2}(\/|$)|%2e|%2f|%5c/i;
 
 /** Whether this server may send the request at all (see ALLOWED_REQUESTS). */
 export function isAllowedRequest(method: HttpMethod, path: string): boolean {
-  return (ALLOWED_REQUESTS[method] ?? []).some(pattern => pattern.test(path));
+  return (ALLOWED_REQUESTS[method] ?? []).some(([pattern]) => pattern.test(path));
 }
+
+/**
+ * The template of an allowed request's path, for logging a failure: the fixed text from ALLOWED_REQUESTS, with every
+ * id, reference, date and number as a {name}, and never a query. Undefined for a path outside the list.
+ */
+export function requestTemplate(method: HttpMethod, path: string): string | undefined {
+  const pathOnly = path.split('?')[0] ?? '';
+  if (method === 'POST' && pathOnly === TOKEN_PATH) return TOKEN_PATH;
+  return (ALLOWED_REQUESTS[method] ?? []).find(([pattern]) => pattern.test(pathOnly))?.[1];
+}
+
+/** The largest error body read for its code and trace id; a larger one is not read. */
+const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /**
  * The client as handed to tool handlers. Read-only tools get a view whose
@@ -572,14 +541,24 @@ export class VippsMobilePayClient implements UpstreamClient {
       );
     }
     if (!response.ok) {
-      // The body is the vendor's text: it is never read into an error, a result or an audit record.
-      await discardBody(response);
+      // The body is the vendor's text: only its error code and trace id are read out, in their fixed forms
+      // (vendorErrorFields). Nothing else of it reaches an error, a result or an audit record.
+      const fields = vendorErrorFields(await readErrorBody(response));
+      let path = '';
+      try {
+        path = new URL(url).pathname;
+      } catch {
+        // No template for an address that cannot be read.
+      }
       throw new VippsHttpError({
         status: response.status,
         url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
         requestId: requestIdFrom(response.headers),
         tokenRequest,
+        method,
+        pathTemplate: requestTemplate(method, path),
+        ...fields,
       });
     }
   }
@@ -793,6 +772,26 @@ async function discardBody(response: Response): Promise<void> {
     await response.body?.cancel();
   } catch {
     // ignore
+  }
+}
+
+/**
+ * An error body as JSON, for vendorErrorFields only: read when it says it is JSON and is at most
+ * MAX_ERROR_BODY_BYTES, otherwise discarded. Any failure to read or parse it gives undefined.
+ */
+async function readErrorBody(response: Response): Promise<unknown> {
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  if (!contentType.includes('json')) {
+    await discardBody(response);
+    return undefined;
+  }
+  try {
+    const read = await readUpTo(response, MAX_ERROR_BODY_BYTES);
+    if (read.exceeded) return undefined;
+    return JSON.parse(new TextDecoder().decode(read.bytes)) as unknown;
+  } catch {
+    await discardBody(response);
+    return undefined;
   }
 }
 
