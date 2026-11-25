@@ -46,7 +46,9 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 | Agreements | 10 pages of 500 |
 | Charges of one agreement | 20 pages (`Continuation-Token`) |
 
-A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`; every page it has so far is still read. So is a date that has not come yet: it is not requested, since Vipps MobilePay refuses a ledger date more than 24 hours ahead.
+A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`; every page it has so far is still read. A date that has not come yet is not requested, since Vipps MobilePay refuses a ledger date more than 24 hours ahead, and is listed in `futureDates`, apart from the open dates. `readFrom` and `readTo` are the first and last date actually read, `complete` is `false` when any date is open or was not read, and `note` says in words what the answer lacks; the gateway's result text carries the same sentence. A period that lies entirely in the future makes no request and says that the period has not begun: `get_funds_summary` then returns `period: null`, not sums of zero.
+
+Vipps MobilePay documents that a ledger date runs from midnight to midnight in the sales unit's time zone, and that a ledger date more than 24 hours in the future is refused; it does not document which clock the 24 hours follow. The server therefore asks for every date up to tomorrow in UTC, which covers the sales unit's own day in its markets all year round, and treats a refusal of tomorrow's date as "not come yet".
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 

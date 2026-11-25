@@ -1,4 +1,5 @@
 import { encodePathParam } from '../path-params.js';
+import { VippsHttpError } from '../errors.js';
 import type { UpstreamClient } from './client.js';
 import { datesBetween } from './values.js';
 
@@ -10,9 +11,10 @@ import { datesBetween } from './values.js';
  * looks complete but is not. A ledger date that Vipps MobilePay has not closed
  * yet (`tryLater`) is named in the result, which then says it is incomplete;
  * every page it has so far is still read. A date that has not come yet is
- * named in the same way and is not requested, because Vipps MobilePay answers
- * HTTP 400 for a ledger date more than 24 hours ahead and the whole period
- * would fail with it.
+ * not requested, because Vipps MobilePay answers HTTP 400 for a ledger date
+ * more than 24 hours ahead and the whole period would fail with it. It is named
+ * apart from the open dates (`futureDates`), the dates actually read are given
+ * (`readFrom`, `readTo`), and `note` says in words what the answer lacks.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -120,13 +122,22 @@ async function readLedgerDate(
 }
 
 /**
- * The last ledger date worth asking for: tomorrow in UTC. Ledger dates follow the sales unit's time zone, which is
- * ahead of UTC in Vipps MobilePay's markets, so late in the evening UTC the sales unit's own day is already
- * tomorrow's date and has entries. A date after that starts more than 24 hours from now, and Vipps MobilePay
- * refuses it.
+ * The last ledger date worth asking for: tomorrow in UTC.
+ *
+ * What Vipps MobilePay documents: "a ledger date lasts from midnight to midnight in the timezone of the merchant"
+ * (it can be configured to another cutoff), and a `ledgerDate` "more than 24 hours in the future" is answered with
+ * HTTP 400. It does not document from which moment or in which time zone the 24 hours are counted. Its markets are
+ * ahead of UTC, so late in the evening UTC the sales unit's own day is already tomorrow's date in UTC and has
+ * entries: tomorrow in UTC must be asked for. A date after that starts 24 hours or more from now by every clock,
+ * and is not asked for. Because the limit's clock is not documented, a refusal (HTTP 400) of a date after today in
+ * UTC is taken as "not come yet" as well, see readPeriod.
  */
 export function lastAskableLedgerDate(now: number): string {
   return new Date(now + 86_400_000).toISOString().slice(0, 10);
+}
+
+function utcDate(now: number): string {
+  return new Date(now).toISOString().slice(0, 10);
 }
 
 export interface PeriodInput {
@@ -135,40 +146,129 @@ export interface PeriodInput {
   toDate: string;
 }
 
+/** What was read of a period, and what was not and why. */
+interface PeriodReading {
+  /** One report per date that was read, in order. */
+  reports: DateReport[];
+  /** Dates read that Vipps MobilePay has not closed yet: entries can still be added. */
+  openDates: string[];
+  /** Dates not read because they have not come yet. They are never among the dates read. */
+  futureDates: string[];
+}
+
+/**
+ * Every date of the period that has come, in order. A date that has not come yet is not asked for, and neither are
+ * the dates after it. `onDate` runs after each date read, so a caller can refuse a period that is too large early.
+ */
+async function readPeriod(
+  client: UpstreamClient,
+  input: PeriodInput,
+  topic: ReportTopic,
+  onDate?: (report: DateReport) => void,
+): Promise<PeriodReading> {
+  const budget = { pages: 0 };
+  const now = client.currentTime();
+  const today = utcDate(now);
+  const lastAskable = lastAskableLedgerDate(now);
+  const reading: PeriodReading = { reports: [], openDates: [], futureDates: [] };
+  let ahead = false;
+  for (const date of datesBetween(input.fromDate, input.toDate)) {
+    if (ahead || date > lastAskable) {
+      ahead = true;
+      reading.futureDates.push(date);
+      continue;
+    }
+    let report: DateReport;
+    const pagesBefore = budget.pages;
+    try {
+      report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
+    } catch (error) {
+      // Tomorrow's date in UTC, its first page refused as a bad request: Vipps MobilePay counts it as too far ahead.
+      // Of what it documents as answered with HTTP 400, only the date is left: the ledger id is digits by the input
+      // check, the topic is one of two fixed words, the date is a real date, and no cursor was sent.
+      if (error instanceof VippsHttpError && error.status === 400 && date > today && budget.pages === pagesBefore + 1) {
+        ahead = true;
+        reading.futureDates.push(date);
+        continue;
+      }
+      throw error;
+    }
+    reading.reports.push(report);
+    if (report.open) reading.openDates.push(date);
+    onDate?.(report);
+  }
+  return reading;
+}
+
+function span(dates: readonly string[]): string {
+  const first = dates[0] ?? '';
+  const last = dates[dates.length - 1] ?? '';
+  return first === last ? first : `${first} to ${last}`;
+}
+
+/**
+ * In words, what of the period the answer does not hold and why; undefined when it holds all of it. An answer that
+ * is cut, empty or still open must say so itself: sums of a part must never read as sums of the whole.
+ */
+function periodNote(reading: PeriodReading): string | undefined {
+  const read = reading.reports.map(report => report.ledgerDate);
+  const parts: string[] = [];
+  if (read.length === 0) {
+    parts.push(
+      `Nothing was read and nothing is summed: the period has not begun. ${span(reading.futureDates)} is in the future.`,
+    );
+  } else if (reading.futureDates.length > 0) {
+    parts.push(
+      `Only ${span(read)} was read. ${span(reading.futureDates)} is in the future and was not asked for, so the answer does not cover the whole period.`,
+    );
+  }
+  if (reading.openDates.length > 0) {
+    parts.push(
+      `Vipps MobilePay has not closed ${reading.openDates.join(', ')} yet: more entries can come for ${reading.openDates.length === 1 ? 'that date' : 'those dates'}.`,
+    );
+  }
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+/** The fields every period answer has: the period asked for, the dates read, and what is missing and why. */
+function periodFields(input: PeriodInput, reading: PeriodReading) {
+  const read = reading.reports.map(report => report.ledgerDate);
+  const note = periodNote(reading);
+  return {
+    ledgerId: input.ledgerId,
+    fromDate: input.fromDate,
+    toDate: input.toDate,
+    readFrom: read[0] ?? null,
+    readTo: read[read.length - 1] ?? null,
+    complete: reading.openDates.length === 0 && reading.futureDates.length === 0,
+    openDates: reading.openDates,
+    futureDates: reading.futureDates,
+    ...(note ? { note } : {}),
+    amountsInMinorUnits: true,
+  };
+}
+
+/** The note of a period answer, for the text of a result; undefined for any other value. */
+export function periodNoteOf(result: unknown): string | undefined {
+  const note = asRecord(result).note;
+  return typeof note === 'string' ? note : undefined;
+}
+
 export async function listTransactions(
   client: UpstreamClient,
   input: PeriodInput & { topic?: ReportTopic },
 ): Promise<unknown> {
   const topic = input.topic ?? 'funds';
-  const budget = { pages: 0 };
   const items: Array<Record<string, unknown>> = [];
-  const openDates: string[] = [];
-  const lastAskable = lastAskableLedgerDate(client.currentTime());
-  for (const date of datesBetween(input.fromDate, input.toDate)) {
-    if (date > lastAskable) {
-      openDates.push(date);
-      continue;
-    }
-    const report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
-    if (report.open) openDates.push(date);
+  const reading = await readPeriod(client, input, topic, report => {
     items.push(...report.items);
     if (items.length > MAX_TRANSACTIONS) {
       throw new TooMuchDataError(
         `The period holds more than ${MAX_TRANSACTIONS} entries; choose a shorter period. Refused rather than returned incomplete.`,
       );
     }
-  }
-  return {
-    ledgerId: input.ledgerId,
-    topic,
-    fromDate: input.fromDate,
-    toDate: input.toDate,
-    complete: openDates.length === 0,
-    openDates,
-    amountsInMinorUnits: true,
-    count: items.length,
-    items,
-  };
+  });
+  return { ...periodFields(input, reading), topic, count: items.length, items };
 }
 
 interface Totals {
@@ -205,32 +305,13 @@ function totalsOf(items: ReadonlyArray<Record<string, unknown>>): Totals {
 /**
  * Totals of the funds ledger per ledger date and for the period: sales
  * (capture), refunds, retained fees, payouts and the balance before and after.
- * Reads every entry of the period and returns only the sums.
+ * Reads every entry of the dates that have come and returns only the sums.
+ * `period` is null when no date was read: an empty sum would read as "nothing
+ * happened", which is not known.
  */
 export async function fundsSummary(client: UpstreamClient, input: PeriodInput): Promise<unknown> {
-  const budget = { pages: 0 };
-  const days: Array<Totals & { ledgerDate: string; open: boolean }> = [];
-  const all: Array<Record<string, unknown>> = [];
-  const lastAskable = lastAskableLedgerDate(client.currentTime());
-  for (const date of datesBetween(input.fromDate, input.toDate)) {
-    if (date > lastAskable) {
-      days.push({ ledgerDate: date, open: true, ...totalsOf([]) });
-      continue;
-    }
-    const report = await readLedgerDate(client, input.ledgerId, 'funds', date, budget);
-    days.push({ ledgerDate: date, open: report.open, ...totalsOf(report.items) });
-    all.push(...report.items);
-  }
-  const period = totalsOf(all);
-  const openDates = days.filter(day => day.open).map(day => day.ledgerDate);
-  return {
-    ledgerId: input.ledgerId,
-    fromDate: input.fromDate,
-    toDate: input.toDate,
-    complete: openDates.length === 0,
-    openDates,
-    amountsInMinorUnits: true,
-    period,
-    days,
-  };
+  const reading = await readPeriod(client, input, 'funds');
+  const days = reading.reports.map(report => ({ ledgerDate: report.ledgerDate, open: report.open, ...totalsOf(report.items) }));
+  const period = reading.reports.length === 0 ? null : totalsOf(reading.reports.flatMap(report => report.items));
+  return { ...periodFields(input, reading), period, days };
 }
