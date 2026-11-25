@@ -148,6 +148,19 @@ export class SecretRedactor {
     return this.secrets.has(value);
   }
 
+  /**
+   * Whether the text shares anything with a secret of this instance: it holds one (in any form) or a piece of one, or it
+   * is itself a piece of one, also of an exact-only secret such as an access token.
+   */
+  sharesWith(text: string): boolean {
+    if (this.matches(text)) return true;
+    if (text.length < MIN_SECRET_LENGTH) return false;
+    for (const secret of this.secrets) {
+      if (secret.includes(text)) return true;
+    }
+    return false;
+  }
+
   /** Whether the text contains one of the secrets in any form, or any FRAGMENT_LENGTH-character piece of one. */
   matches(text: string): boolean {
     for (const secret of this.secrets) {

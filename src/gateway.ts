@@ -416,9 +416,6 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
-  /** The instance's own keys only: a registration secret must share no piece with them. */
-  const keysOnly = new SecretRedactor();
-  for (const name of SECRET_OPTIONS) keysOnly.addSecret(secrets[name]);
   /** The registration secrets this instance has given on: the same one again is a repeat, not a leak. */
   const givenSigningValues = new Set<string>();
   /**
@@ -456,8 +453,9 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     keyType: client.keyType,
     /**
      * Host only, never a tool: register `address` (https, the host's own) for this sales unit's ePayment `events`.
-     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here, and
-     * the instance masks it from then on. Registering the same address and set of events again sends the same operation
+     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here, only
+     * when it shares nothing with a secret the instance already knows (or is exactly an earlier registration's), and
+     * the instance masks it from the moment the answer arrives, also when the answer is then refused. Registering the same address and set of events again sends the same operation
      * key (Vipps MobilePay does not document it for this API).
      */
     registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
@@ -467,13 +465,23 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       // the rest of the answer is checked, so an id that holds it is withheld too; and from then on everywhere: every
       // later error, failure metadata, result, host value and audit record.
       return hostCall(async () => {
-        const registration = await underPolicy(() => registerPaymentEvents(client, address, events));
-        const repeat = givenSigningValues.has(registration.secret);
-        if (!repeat && leaksSecret(registration.secret, keysOnly)) throw new Error(HOST_ANSWER_WITHHELD);
-        redactor.addSecret(registration.secret);
+        // Whether the value may be given on is decided against every secret the instance knows (its keys, the access
+        // tokens it has had, the registration secrets before this one), before the value itself is added; then every
+        // text in the field is masked from here on, whatever becomes of the answer. The one exception is the exact value
+        // of an earlier registration of this instance: a repeat.
+        let mayGiveOn = false;
+        const registration = await underPolicy(() =>
+          registerPaymentEvents(client, address, events, signing => {
+            const value = signing.value;
+            mayGiveOn = value !== undefined && (givenSigningValues.has(value) || !redactor.sharesWith(value));
+            for (const text of signing.texts) redactor.addSecret(text);
+          }),
+        );
+        if (!mayGiveOn) throw new Error(HOST_ANSWER_WITHHELD);
         givenSigningValues.add(registration.secret);
+        // The rest of the answer, the id, as any other value: one that holds or shares a piece of a secret is withheld.
         const { id } = guarded({ id: registration.id });
-        if (id !== registration.id) throw new Error(HOST_ANSWER_WITHHELD);
+        if (id !== registration.id || redactor.sharesWith(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
         return { id, secret: registration.secret };
       }, undefined, false);
     },

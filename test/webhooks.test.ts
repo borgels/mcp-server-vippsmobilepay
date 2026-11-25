@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { VIPPS_PAYMENT_EVENTS, vippsGatewayTools, type GatewayJsonObject } from '../src/gateway.js';
 import { isAllowedRequest } from '../src/vipps/client.js';
-import { apiCalls, fakeToken, gateway, KEYS, payment } from './helpers.js';
+import { apiCalls, fakeToken, gateway, KEYS, payment, TOKEN } from './helpers.js';
 
 const originalEnv = { ...process.env };
 beforeEach(() => {
@@ -290,5 +290,100 @@ describe('what a registration answer gives on', () => {
       expect(text.split(value).length - 1).toBe(1);
       expect(await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).toEqual({ id: REGISTRATION_ID, secret: value });
     }
+  });
+});
+
+describe('a registration answer, refused or not, never lets its secret out later', () => {
+  const S = 'Lm4_Nq7-Rt2_Vx9-Kp3_Hz6';
+  /** An instance whose registration answers `answer`, and whose every later answer carries S where a text can stand. */
+  const instance = (answer: unknown) => {
+    const records: unknown[] = [];
+    const later = { status: 200, headers: { 'x-request-id': S }, body: payment({ reference: S, pspReference: S, note: S }) };
+    const { gw } = gateway(
+      {
+        'POST /webhooks/v1/webhooks': { body: answer },
+        'GET /webhooks/v1/webhooks': { body: { webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${S}`, events: [S] }] } },
+        'GET /epayment/v1/payments/fjord-order-10042': later,
+        'GET /epayment/v1/payments/fjord-order-10042/events': { body: [] },
+        'DELETE /webhooks/v1/webhooks/reg-fjord-one': { status: 500, headers: { 'x-request-id': S } },
+      },
+      { policy: { audit: record => void records.push(record) } },
+    );
+    return { gw, records };
+  };
+  const afterwards = async (gw: ReturnType<typeof gateway>['gw'], records: unknown[]) =>
+    JSON.stringify([
+      await gw.listWebhooks().catch((e: unknown) => String(e)),
+      await gw.callTool('get_payment', { reference: 'fjord-order-10042' }),
+      await gw.removeWebhook(REGISTRATION_ID).catch((e: unknown) => String(e)),
+      records,
+    ]);
+
+  it.each([
+    ['an id that is not an id', { id: '../x', secret: S }],
+    ['no id', { secret: S }],
+    ['an id that is the secret', { id: S.replace(/_/g, '-'), secret: S }],
+    ['a secret too short to be one', { id: REGISTRATION_ID, secret: S.slice(0, 12) }],
+    ['the secret inside a list', { id: REGISTRATION_ID, secret: [S] }],
+    ['the secret inside an object', { id: REGISTRATION_ID, secret: { value: S } }],
+  ])('masks it when the answer is refused: %s', async (_name, answer) => {
+    const { gw, records } = instance(answer);
+    await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow();
+    const text = await afterwards(gw, records);
+    for (const piece of [S, S.slice(0, 12), S.slice(6, 18)]) expect(text).not.toContain(piece);
+  });
+
+  it('masks it when the answer is refused because the secret shares a piece with a key', async () => {
+    const value = `${KEYS.clientSecret.slice(0, 10)}${S}`;
+    const { gw, records } = instance({ id: REGISTRATION_ID, secret: value });
+    await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow(/withheld/);
+    expect(await afterwards(gw, records)).not.toContain(S);
+  });
+});
+
+describe('a registration secret that is or holds another secret of the instance', () => {
+  // An access token of a form that shares nothing with the made-up keys, so only the token itself can match.
+  const ISSUED_VALUE = 'Jw8Mn3Bq7Vc2Xz5Lp9Rk4Td6';
+  const register = (answers: unknown[]) => {
+    let n = 0;
+    const { gw } = gateway({
+      'POST /accesstoken/get': { body: { token_type: 'Bearer', expires_in: '3600', access_token: ISSUED_VALUE } },
+      'POST /webhooks/v1/webhooks': () => ({ body: answers[Math.min(n++, answers.length - 1)] }),
+    });
+    return gw;
+  };
+
+  it.each([
+    ['is', () => ISSUED_VALUE],
+    ['starts with', () => `${ISSUED_VALUE}-more`],
+    ['holds', () => `pre-${ISSUED_VALUE}-post`],
+    ['is a piece of', () => ISSUED_VALUE.slice(2, 18)],
+  ])('withholds a secret that %s the access token', async (_how, secret) => {
+    const gw = register([{ id: REGISTRATION_ID, secret: secret() }]);
+    const error = await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1']).catch((e: unknown) => e as Error);
+    expect(error).toBeInstanceOf(Error);
+    expect(String((error as Error).message)).not.toContain(ISSUED_VALUE.slice(2, 18));
+  });
+
+  it('withholds the access token of the helpers too (a token the keys also resemble)', async () => {
+    const { gw } = gateway({ 'POST /webhooks/v1/webhooks': { body: { id: REGISTRATION_ID, secret: TOKEN } } });
+    await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow(/withheld/);
+  });
+
+  const FIRST = 'Qa1_Wb2-Ec3_Rd4-Tf5_Yg6';
+  it.each([
+    ['starts with', `${FIRST}-and-more`],
+    ['holds', `zz-${FIRST}-zz`],
+    ['is a piece of', FIRST.slice(2, 18)],
+  ])('withholds a new secret that %s an earlier registration secret', async (_how, secret) => {
+    const gw = register([{ id: REGISTRATION_ID, secret: FIRST }, { id: 'reg-fjord-two', secret }]);
+    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);
+    await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.authorized.v1'])).rejects.toThrow(/withheld/);
+  });
+
+  it('gives on exactly the same earlier registration secret again: a repeat', async () => {
+    const gw = register([{ id: REGISTRATION_ID, secret: FIRST }, { id: REGISTRATION_ID, secret: FIRST }]);
+    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);
+    expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);
   });
 });

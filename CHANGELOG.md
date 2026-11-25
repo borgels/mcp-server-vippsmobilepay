@@ -9,9 +9,12 @@
   secret back, once. Host functions only, never tools. The fixed request list
   gains `GET` and `POST /webhooks/v1/webhooks` and
   `DELETE /webhooks/v1/webhooks/{id}`; an answer that cannot be used is never
-  quoted, since it may hold the secret. A secret that shares a piece with the
-  instance's keys, and an id that holds the secret, are withheld. The secret is
-  masked by the instance from then on, like its keys. The address must be https on a public host
+  quoted, since it may hold the secret. Every text in the answer's `secret`
+  field is masked by the instance the moment the answer arrives, also when the
+  answer is then refused. The secret is given on only when it shares nothing
+  with a secret the instance already knows (its keys, access tokens and earlier
+  registration secrets), or is exactly an earlier registration's; an id that
+  holds a secret is withheld. The address must be https on a public host
   name: IP literals, single labels, non-default ports, fragments and local or
   internal names are refused before anything is sent (by the name's form,
   without a DNS lookup). Every value a host function returns goes through the

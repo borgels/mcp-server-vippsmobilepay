@@ -109,16 +109,44 @@ function operationKey(...parts: string[]): string {
   return `wh-${createHash('sha256').update(parts.join('\n')).digest('base64url').replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`;
 }
 
+/** Every text in a value, to a fixed depth and count: what an answer holds wherever it holds it. */
+function textsIn(value: unknown, out: string[] = [], depth = 0): string[] {
+  if (out.length >= 64) return out;
+  if (typeof value === 'string') out.push(value);
+  else if (depth < 8 && value !== null && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (!Array.isArray(value)) textsIn(key, out, depth + 1);
+      textsIn(item, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+/** What a registration answer holds in its `secret` field, given to the host's instance before anything else is done. */
+export interface SigningValueSeen {
+  /** The field itself, when it is a text: the value the host may get. */
+  readonly value: string | undefined;
+  /** Every text in the field, whatever its form, the value included. */
+  readonly texts: readonly string[];
+}
+
+/**
+ * Register the address. `seen` is called with what the answer's `secret` field holds as the very first thing done with
+ * the answer, whether the answer is then accepted or refused, so the instance can mask it before any later value could
+ * carry it.
+ */
 export async function registerPaymentEvents(
   client: UpstreamClient,
   address: string,
   events: readonly PaymentEvent[],
+  seen: (signing: SigningValueSeen) => void = () => undefined,
 ): Promise<WebhookRegistration> {
   const url = checkedAddress(address);
   const chosen = checkedEvents(events);
   const answer = await client.post<unknown>(WEBHOOKS_PATH, { url, events: chosen }, { idempotencyKey: operationKey('register', url, ...chosen) });
   const record = answer !== null && typeof answer === 'object' ? (answer as Record<string, unknown>) : {};
   const { id, secret } = record;
+  seen({ value: typeof secret === 'string' ? secret : undefined, texts: textsIn(secret) });
   if (typeof id !== 'string' || !WEBHOOK_ID.test(id) || typeof secret !== 'string' || !SECRET.test(secret)) {
     // Never quoted: the answer may hold the secret.
     throw new Error('Vipps MobilePay answered the registration in an unexpected form.');
