@@ -46,9 +46,40 @@ The result has one form however the request came to exist: `created`, `alreadyEx
 
 **Before a write.** Capture and refund read the payment (or charge) first and refuse, without sending anything, when the currency differs from the payment's or the amount is more than can be captured or refunded. Capture needs an `AUTHORIZED` payment; cancelling a charge needs a cancellable status. The payment's or charge's amounts must be whole, non-negative minor units that add up (nothing captured beyond what was authorized, nothing refunded beyond what was captured), and its currency one of NOK, DKK and EUR; otherwise the change is refused with a fixed text.
 
-**A payment request gets its key from its content.** `create_payment` takes no `idempotencyKey`. The server makes a fingerprint of the request: 32 hex characters of the SHA-256 of the sales unit's number and everything the request says (reference, amount, currency, text, delivery, phone number, return address, deadline, order lines) in a fixed field order; a deadline is the same whichever offset it is written with. The fingerprint is used twice. The `Idempotency-Key` is `create-` and the fingerprint, so the same input is always the same key and any other input another, and a caller that repeats a request after a timeout, an error or a lost answer cannot repeat it under a new key. And the request carries it as `metadata.requestFingerprint`, which Vipps MobilePay stores and returns when the payment is read. The server itself never sends the request twice (one more time only after HTTP 401, with a new access token and the same key). Nothing is kept between calls, and the fingerprint is neither returned nor logged, since it is made from content that can hold a phone number.
+**A payment request gets its key from its content.** `create_payment` takes no `idempotencyKey`. The server makes two values from the sales unit's number and everything the request says (reference, amount, currency, text, delivery, phone number, return address, deadline, order lines) in a fixed field order; a deadline is the same whichever offset it is written with. Each is 32 hex characters of a keyed hash (HMAC-SHA-256), and each has its own key, derived from the client secret inside the client:
 
-**A payment that is read back is this request only when that is proven.** Vipps MobilePay returns a payment's reference, amount, currency, payment method, state and metadata, and not its phone number, text or order lines. A payment is taken for this request only when all of the first four are the request's own and the metadata holds this request's fingerprint, which stands for everything that is not returned. A payment that has the reference and cannot be proven to be this request is a conflict: the call is refused, and nothing of that payment is passed on, neither its state nor its link.
+- the `Idempotency-Key`, `create-` and the first value. The same input is always the same key and any other input another, so a caller that repeats a request after a timeout, an error or a lost answer cannot repeat it under a new key;
+- the fingerprint, which the request carries as `metadata.requestFingerprint`. Vipps MobilePay stores it and returns it when the payment is read.
+
+Without the client secret neither value can be made, and neither can be tested against a guess of the content: someone who knows everything of a request but the phone number cannot find the number by trying every one. The key does not give the fingerprint. The server itself never sends the request twice (one more time only after HTTP 401, with a new access token and the same key), and nothing is kept between calls.
+
+Where the two values go, and where they do not (`test/create-payment.test.ts`, "the fingerprint and the key leave the server only in the create request"):
+
+| Place | The key and the fingerprint |
+|---|---|
+| The create request to Vipps MobilePay | The key as `Idempotency-Key`, the fingerprint as `metadata.requestFingerprint`. The only place. |
+| Every other request to Vipps MobilePay (the read after the create, `get_payment`, capture, refund, cancel) | Neither. |
+| The answer of `create_payment`, also when the request exists already or is refused | Neither. |
+| The answer of `get_payment` | Neither. A payment passes an allow-list without `metadata`. An event passes on its `idempotencyKey` only when it is a capture, a refund or a cancellation (`CAPTURED`, `REFUNDED`, `CANCELLED`, `TERMINATED`), whose key the caller chose; a key in the form this server derives is passed on under no event. |
+| The answers of `capture_payment`, `refund_payment` and `cancel_payment` | Neither. What Vipps MobilePay answers a change with passes the same allow-list as a payment. |
+| Errors | Neither. The texts are this server's own, and the vendor's body is never read. |
+| The audit, `resolveVippsChange` and the console | Neither. The audit holds the named input fields; neither value is an input. |
+
+**After the client secret is replaced** the same input gives another key and another fingerprint. A request made before is then no longer recognised: the same call is refused as a conflict, and nothing of the payment is returned. It is not created a second time, since the reference is used; `get_payment` shows it. A request made after the replacement is recognised as before.
+
+**A payment that is read back is this request only when that is proven.** Vipps MobilePay returns a payment's reference, amount, currency, payment method, state and metadata, and not its phone number, text or order lines. A payment is taken for this request only when all of the first four are the request's own and the metadata holds this request's fingerprint, which stands for everything that is not returned. Every way `create_payment` can answer holds to it:
+
+| What Vipps MobilePay answered the create request with | The payment that has the reference | Answer |
+|---|---|---|
+| Accepted | Read, and proven to be this request | Its state, and the address while the customer can use it. `created: true` when it waits, otherwise `alreadyExists: true`. |
+| Accepted | Read, and not proven (no metadata, another fingerprint, another amount, currency or payment method, an empty answer) | An error, and nothing of the payment or of the acceptance: no state and no link. A request may exist; `get_payment` shows it and `cancel_payment` cancels it. |
+| Accepted | Not read at all (no answer, or an HTTP error) | `created: true`, `state: null` and the address from the acceptance, which answers this request's own key. Nothing of a payment is returned, since none was read. |
+| Refused (HTTP 400 or 409) | Read, and proven to be this request | `alreadyExists: true`, its state, and the link while the customer can use it. |
+| Refused (HTTP 400 or 409) | Read, and not proven | Refused as a conflict. Nothing of the payment is returned. |
+| Refused (HTTP 400 or 409) | Not read at all | The refusal as it is. Nothing is said of a payment, except that it could not be read when that is so. |
+| Refused otherwise, or no answer | Not read | The error, with what is known: nothing was created (429, 423, the access token), or it is not known (a timeout, a lost connection, 5xx). |
+
+A payment proven to be this request in a state this server does not know is answered with `state: null`, and with a link only when Vipps MobilePay accepted the request in this call.
 
 What a second call is answered with (`test/create-payment.test.ts` has a test per row, for a vendor that answers a repeated key with the first answer and for one that refuses it):
 
@@ -59,6 +90,9 @@ What a second call is answered with (`test/create-payment.test.ts` has a test pe
 | The same input when the deadline is now near or has passed | Sent as it is: no refusal by our clock. Found as above, or as `EXPIRED`. |
 | The same input after the customer has paid | `alreadyExists: true`, `state: AUTHORIZED`, no link; `capture_payment` draws the amount. |
 | The same input after the request was cancelled, declined or expired | `alreadyExists: true`, the state (`TERMINATED`, `ABORTED`, `EXPIRED`), no link; a new request needs another reference. |
+| The same input, when the payment cannot be read at all | Accepted again (a repeated key answered with the first answer): `created: true`, `state: null`, the link of the acceptance. Refused (a repeated key refused): the refusal, with a note that the payment could not be read. One request either way. |
+| The same input, when the payment is read back without the fingerprint | An error or a conflict, and nothing of the payment, whatever the create request was answered with. |
+| The same input after the client secret was replaced | Refused as a conflict: the request is no longer recognised. Not created twice, and nothing of the payment is returned. |
 | The same reference with anything else changed (amount, phone number, text, delivery, return address, deadline, order lines) | Refused as a conflict. Nothing is created and nothing of the existing payment is returned. |
 | The same content with another reference | A second request: a new reference is what makes a request new. |
 | The same input after a refusal that created nothing (HTTP 429) | Created, under the same key. |
@@ -84,7 +118,7 @@ Vipps MobilePay documents that a ledger date runs from midnight to midnight in t
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 
-**Personal data in results.** The known personal fields of the payer and the subscriber are left out: `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub`, `userinfoUrl`, phone numbers and the card number prefix. Payments, events and agreements pass through a typed allow-list (`src/vipps/views.ts`), so a field Vipps MobilePay adds later is left out until it is listed. This does not make the results free of personal data: a payment reference, a product name or a description is text the merchant or an integration chose, and it can hold a name or another personal detail. Treat results as data that may contain personal data.
+**Personal data in results.** The known personal fields of the payer and the subscriber are left out: `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub`, `userinfoUrl`, phone numbers and the card number prefix. Payments, events, agreements and the answers to a capture, a refund and a cancellation pass through a typed allow-list (`src/vipps/views.ts`), so a field Vipps MobilePay adds later is left out until it is listed. This does not make the results free of personal data: a payment reference, a product name or a description is text the merchant or an integration chose, and it can hold a name or another personal detail. Treat results as data that may contain personal data.
 
 ## Keys and authentication
 
@@ -284,7 +318,8 @@ The client follows the published OpenAPI specifications (Access Token 2.0.0, Rep
 - the paging of `GET /recurring/v3/agreements` with `pageNumber` and `pageSize`, and `Continuation-Token` on the charge list;
 - an `Idempotency-Key` on `POST .../cancel` (the ePayment specification does not list it for cancel);
 - what a repeated `Idempotency-Key` on `POST /epayment/v1/payments` is answered with (the first answer again, or a refusal), for how long a key is remembered, and whether a reference already used is refused with HTTP 400 or 409; `create_payment` handles each of these, and reads the payment after either status;
-- that `metadata` given when a payment is created comes back when it is read (the specification says it "is passed through in the `GetPaymentResponse` object"); if it did not, a repeated request would be refused as a conflict instead of found, never the other way round;
+- that `metadata` given when a payment is created comes back when it is read (the specification says it "is passed through in the `GetPaymentResponse` object"); if it did not, every `create_payment` whose payment is read back would end as an error after the request was accepted, and a repeated request as a conflict: never as another request's payment taken for this one;
+- whether the events of a payment hold the `Idempotency-Key` of the request that created it; the key is not passed on either way;
 - the form of the customer's link (`redirectUrl`), `PUSH_MESSAGE` on an approved sales unit, and a request with `expiresAt` on a sales unit that has it enabled;
 - partner keys (production only, so they cannot be tried in the test environment);
 - the Report API with the merchant's own keys for every kind of sales unit.

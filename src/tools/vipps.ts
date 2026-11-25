@@ -292,7 +292,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     name: 'vipps_get_payment',
     title: 'Get ePayment payment (Vipps MobilePay)',
     description:
-      'One ePayment payment by its reference: state, amounts authorized, captured, cancelled and refunded (minor units), and its events. A failed event read is reported in the result.',
+      'One ePayment payment by its reference: state, amounts authorized, captured, cancelled and refunded (minor units), and its events. An event of a capture, a refund or a cancellation has the operation key it was made with. A failed event read is reported in the result.',
     inputShape: {
       reference: referenceSchema,
       includeEvents: z.boolean().optional().describe('Also read the events (default true).'),

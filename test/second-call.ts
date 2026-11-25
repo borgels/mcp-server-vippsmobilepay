@@ -1,5 +1,5 @@
 import { describe, it } from 'vitest';
-import type { GatewayJsonObject, GatewayToolResult } from '../src/gateway.js';
+import type { GatewayJsonObject, GatewayToolResult, VippsGatewayOptions } from '../src/gateway.js';
 import { apiCalls, gateway, payment, type Call, type Reply, type Route } from './helpers.js';
 
 /**
@@ -68,6 +68,11 @@ export interface SecondCall<V extends StandIn> {
   lostAnswer?: boolean;
   /** What happens between the two calls, at the stand-in or to the clock. */
   between?: (world: { vendor: V; clock: Clock }) => void;
+  /**
+   * The second call is made by an installation set up otherwise (for example after the client secret was replaced),
+   * against the same stand-in.
+   */
+  secondAs?: Partial<VippsGatewayOptions>;
   /** What must hold after the second call. */
   then: (seen: { first: GatewayToolResult; second: GatewayToolResult; vendor: V; calls: Call[]; repeat: Repeat }) => void;
   /** Only for one of the two ways a repeated key is answered (default: both). */
@@ -83,12 +88,14 @@ export function secondCalls<V extends StandIn>(tool: string, standIn: (repeat: R
           const vendor = standIn(repeat);
           let time = start;
           const clock: Clock = { now: () => time, advance: ms => void (time += ms) };
-          const { gw, calls } = gateway(vendor.routes, { policy: { enableWrites: true }, maxAttempts: 5, retryBaseDelayMs: 1, now: clock.now });
+          const options = { policy: { enableWrites: true }, maxAttempts: 5, retryBaseDelayMs: 1, now: clock.now };
+          const { gw, calls } = gateway(vendor.routes, options);
           if (row.lostAnswer) vendor.loseNextAnswer();
           const first = await gw.callTool(tool, row.first);
           row.between?.({ vendor, clock });
-          const second = await gw.callTool(tool, row.second);
-          row.then({ first, second, vendor, calls: apiCalls(calls), repeat });
+          const other = row.secondAs ? gateway(vendor.routes, { ...options, ...row.secondAs }) : undefined;
+          const second = await (other?.gw ?? gw).callTool(tool, row.second);
+          row.then({ first, second, vendor, calls: apiCalls([...calls, ...(other?.calls ?? [])]), repeat });
         });
       }
     });
@@ -108,13 +115,19 @@ export interface PaymentStandIn extends StandIn {
   readonly payments: Map<string, KeptPayment>;
   /** The customer approved, the business cancelled, or the deadline passed. */
   setState(reference: string, state: 'AUTHORIZED' | 'ABORTED' | 'EXPIRED' | 'TERMINATED'): void;
+  /** From now on a payment cannot be read: every read is answered with an error. */
+  failReads(): void;
+  /** From now on a payment is read back without the metadata its request gave. */
+  dropMetadata(): void;
 }
 
 /**
  * A stand-in for the ePayment API's create and read of a payment, for the given references. It creates one payment
  * per reference and refuses a reference that is used (HTTP 409, or `usedReferenceStatus`). A payment is read back as
  * the specification says: amount, state, payment method, reference, the landing page address and the metadata the
- * request gave; not the phone number, the text or the order lines. `problem` is the body of every refusal.
+ * request gave; not the phone number, the text or the order lines. Its events are read back the way that says most:
+ * the key of the create request stands on the event of the creation and on the event of what happened next.
+ * `problem` is the body of every refusal.
  */
 export function paymentStandIn(
   repeat: Repeat,
@@ -124,6 +137,8 @@ export function paymentStandIn(
   const keys = new KeyMemory(repeat, refusal);
   const payments = new Map<string, KeptPayment>();
   let lose = false;
+  let readsFail = false;
+  let metadataDropped = false;
   const routes: Record<string, Route> = {
     'POST /epayment/v1/payments': (_url, init): Reply => {
       const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -146,6 +161,7 @@ export function paymentStandIn(
   for (const reference of options.references) {
     routes[`GET /epayment/v1/payments/${reference}`] = (): Reply => {
       const kept = payments.get(reference);
+      if (readsFail) return { status: 500, body: options.problem };
       if (!kept) return { status: 404, body: options.problem };
       return {
         body: payment({
@@ -153,13 +169,31 @@ export function paymentStandIn(
           state: kept.state,
           amount: kept.body.amount,
           paymentMethod: kept.body.paymentMethod,
-          metadata: kept.body.metadata,
+          metadata: metadataDropped ? undefined : kept.body.metadata,
           redirectUrl: options.landingPage(reference),
           // What a real answer also holds, and what must never be passed on.
           profile: { sub: '00000000-0000-4000-8000-000000000001' },
           userDetails: { firstName: 'Solveig', lastName: 'Fjordheim', mobileNumber: '4512345678' },
         }),
       };
+    };
+  }
+  for (const reference of options.references) {
+    routes[`GET /epayment/v1/payments/${reference}/events`] = (): Reply => {
+      const kept = payments.get(reference);
+      if (!kept) return { status: 404, body: options.problem };
+      const event = (name: string) => ({
+        reference,
+        pspReference: '1234567890',
+        name,
+        amount: kept.body.amount,
+        timestamp: '2026-11-25T12:00:00Z',
+        idempotencyKey: kept.key,
+        success: true,
+        // What must never be passed on, should an event hold it.
+        metadata: kept.body.metadata,
+      });
+      return { body: [event('CREATED'), ...(kept.state === 'CREATED' ? [] : [event(kept.state)])] };
     };
   }
   return {
@@ -171,5 +205,7 @@ export function paymentStandIn(
       const kept = payments.get(reference);
       if (kept) kept.state = state;
     },
+    failReads: () => void (readsFail = true),
+    dropMetadata: () => void (metadataDropped = true),
   };
 }

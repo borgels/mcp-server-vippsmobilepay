@@ -1,6 +1,8 @@
+import { createHmac } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
 import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
+import type { KeyedHashPurpose } from './values.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
 export type VippsEnvironment = 'test' | 'production';
@@ -214,6 +216,12 @@ export interface UpstreamClient {
   readonly merchantSerialNumber?: string;
   /** The client's clock, in milliseconds since the epoch. */
   currentTime(): number;
+  /**
+   * A keyed hash (HMAC-SHA-256, hex) of a text, with a key derived from the client secret for this one purpose. The
+   * secret and the derived key stay in the client. The same keys give the same hash on every instance; after the
+   * client secret is replaced, the same text gives another hash.
+   */
+  keyedHash(purpose: KeyedHashPurpose, text: string): string;
 }
 
 /** A view of the client that only allows GET. */
@@ -229,6 +237,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     verifyCredentials: () => client.verifyCredentials(),
     merchantSerialNumber: client.merchantSerialNumber,
     currentTime: () => client.currentTime(),
+    keyedHash: (purpose, text) => client.keyedHash(purpose, text),
   };
 }
 
@@ -354,6 +363,13 @@ export class VippsMobilePayClient implements UpstreamClient {
 
   currentTime(): number {
     return this.now();
+  }
+
+  keyedHash(purpose: KeyedHashPurpose, text: string): string {
+    const { clientSecret } = this.credentials();
+    // One key for each purpose, so a value made for one says nothing of a value made for another.
+    const key = createHmac('sha256', clientSecret).update(`mcp-server-vippsmobilepay ${purpose} v1`).digest();
+    return createHmac('sha256', key).update(text).digest('hex');
   }
 
   async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {

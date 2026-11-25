@@ -132,24 +132,42 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
+/** What a keyed hash is used for. Each use has its own key, so one value says nothing of another. */
+export type KeyedHashPurpose = 'request-fingerprint' | 'idempotency-key';
+
+/** Characters of a keyed hash that are used: 128 bits, as hex. */
+const MARK_LENGTH = 32;
+
 /**
  * The fingerprint of a request this server builds itself: 32 hex characters
- * of the SHA-256 of its content. The same content always gives the same
- * fingerprint and any other content another. It is no pseudonym: content
- * with few possible values (a phone number) can be found from it by trying
- * them, so it goes to Vipps MobilePay only, which has the content already,
- * and is never logged and never returned.
+ * of a keyed hash (HMAC-SHA-256) of its content. The same content always
+ * gives the same fingerprint and any other content another. The key is
+ * derived from the client secret and never leaves the client, so content
+ * with few possible values (a phone number) cannot be found from the
+ * fingerprint by trying them: not by Vipps MobilePay's logs, and not by
+ * anyone who reads what Vipps MobilePay returns.
  */
-export function contentFingerprint(content: unknown): string {
-  return createHash('sha256').update(canonicalJson(content)).digest('hex').slice(0, 32);
+export function requestFingerprint(keyedHash: (purpose: KeyedHashPurpose, text: string) => string, content: unknown): string {
+  return keyedHash('request-fingerprint', canonicalJson(content)).slice(0, MARK_LENGTH);
 }
 
 /**
  * The Idempotency-Key of a request this server builds itself: `kind`, a dash
- * and the request's fingerprint. A request repeated after a failure or a
- * lost answer is then the same request to Vipps MobilePay, and a caller
- * cannot repeat it under a new key.
+ * and a second keyed hash of the same content, made with another key than
+ * the fingerprint. A request repeated after a failure or a lost answer is
+ * then the same request to Vipps MobilePay, and a caller cannot repeat it
+ * under a new key. Whoever sees the key (it can stand in the payment's
+ * events) learns neither the content nor the fingerprint.
  */
-export function derivedIdempotencyKey(kind: 'create', fingerprint: string): string {
-  return `${kind}-${fingerprint}`;
+export function derivedIdempotencyKey(
+  kind: 'create',
+  keyedHash: (purpose: KeyedHashPurpose, text: string) => string,
+  content: unknown,
+): string {
+  return `${kind}-${keyedHash('idempotency-key', canonicalJson(content)).slice(0, MARK_LENGTH)}`;
+}
+
+/** Whether a text has the form of a key this server derives. Such a key is never passed on in an answer. */
+export function isDerivedIdempotencyKey(value: unknown): boolean {
+  return typeof value === 'string' && /^create-[0-9a-f]{32}$/.test(value);
 }

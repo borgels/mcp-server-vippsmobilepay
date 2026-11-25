@@ -2,7 +2,7 @@ import { CustomerLink, VippsHttpError, withNote } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { ChangeRefusedError } from './payments.js';
-import { contentFingerprint, derivedIdempotencyKey, timestampMs, type MerchantCurrency } from './values.js';
+import { derivedIdempotencyKey, requestFingerprint, timestampMs, type KeyedHashPurpose, type MerchantCurrency } from './values.js';
 
 /**
  * ePayment API: a new payment request (create_payment).
@@ -10,24 +10,43 @@ import { contentFingerprint, derivedIdempotencyKey, timestampMs, type MerchantCu
  * The request moves no money: the customer approves it in the Vipps or
  * MobilePay app, the amount is then reserved, and a capture draws it.
  *
- * The same request twice. A request has a fingerprint: a hash of the sales
- * unit and everything the request says (reference, amount, currency, text,
- * delivery, phone number, return address, deadline, order lines). Two things
- * are made from it, and nothing is kept between calls:
+ * The same request twice. Two values are made from the sales unit and
+ * everything the request says (reference, amount, currency, text, delivery,
+ * phone number, return address, deadline, order lines), each a keyed hash
+ * with its own key, derived in the client from the client secret. Nothing is
+ * kept between calls:
  *
  *   - the Idempotency-Key, so the same request is the same key however often
  *     it is repeated, and the caller cannot repeat it under a new one;
- *   - the request's `metadata.requestFingerprint`, which Vipps MobilePay
- *     stores with the payment and returns when the payment is read (the
- *     specification: metadata "is passed through in the GetPaymentResponse").
+ *   - the fingerprint, sent as the request's `metadata.requestFingerprint`,
+ *     which Vipps MobilePay stores with the payment and returns when the
+ *     payment is read (the specification: metadata "is passed through in the
+ *     GetPaymentResponse").
  *
- * A payment that is read back is taken for this request only when everything
- * Vipps MobilePay returns of it matches: reference, amount, currency, payment
- * method and that fingerprint (isThisRequest). The fingerprint is what proves
- * the rest: the phone number, the text and the order lines are not returned.
- * A payment that has the reference and cannot be proven to be this request
- * is a conflict, and nothing of it is passed on: not its state and not its
- * link, which would be another customer's.
+ * Both go to Vipps MobilePay in the create request and nowhere else: not
+ * into an answer, an error or the audit. Without the client secret neither
+ * can be made or tested against a guess of the content, and the key, which
+ * Vipps MobilePay may show in the payment's events, does not give the
+ * fingerprint. After the client secret is replaced the same input gives new
+ * values: a request made before is then no longer recognised and is answered
+ * as a conflict (the reference still keeps it from being created twice).
+ *
+ * The rule for what is passed on. A payment that is read is taken for this
+ * request only when everything Vipps MobilePay returns of it matches:
+ * reference, amount, currency, payment method and the fingerprint
+ * (readBack). The fingerprint proves the rest: the phone number, the text
+ * and the order lines are not returned. Every branch of createPayment that
+ * answers holds to it:
+ *
+ *   - read and proven: its state, and its link when the customer can use it;
+ *   - read and not proven (another request, or no fingerprint): a refusal,
+ *     and nothing of the payment, whatever Vipps MobilePay answered the
+ *     create request with;
+ *   - not read at all, after Vipps MobilePay accepted the create request:
+ *     no state, and the address from that acceptance, which answers this
+ *     request's own key;
+ *   - not read at all, after Vipps MobilePay refused the create request: the
+ *     refusal, and nothing else.
  *
  * No refusal here depends on the clock. The deadline (expiresAt) is part of
  * the fingerprint, so an identical call made later must still reach Vipps
@@ -201,19 +220,35 @@ type PaymentState = (typeof PAYMENT_STATES)[number];
 interface Outcome {
   /** Vipps MobilePay answered the create request of this call with success. */
   accepted: boolean;
-  /** The state of the payment, when it was read back and proven to be this request. */
+  /** The state of the payment, when it was read back, proven to be this request and in a state this server knows. */
   state?: PaymentState;
   /** The address for the customer: the link, or the address of the QR code. */
   address?: CustomerLink;
 }
 
+/** A payment read after the create request. */
+type ReadBack =
+  /** No answer to the read, or an HTTP error. `absent`: Vipps MobilePay answered that no payment has the reference. */
+  | { kind: 'unread'; absent: boolean }
+  /** An answer that is not proven to be this request: another request, or a payment without this fingerprint. */
+  | { kind: 'other' }
+  /** This request. The state when it is one this server knows; the landing page address when there is a usable one. */
+  | { kind: 'ours'; state?: PaymentState; landingPage?: CustomerLink };
+
 /**
- * Whether a payment read from Vipps MobilePay is this request: every field
- * that is returned and that the request sets must be the request's own, the
- * fingerprint among them. Returns its state, or undefined when it cannot be
- * proven (another request, or an answer that does not hold the fingerprint).
+ * Reads the payment that has the reference and says whether it is this
+ * request. Every answer to the read must prove it: each field that is
+ * returned and that the request sets must be the request's own, the
+ * fingerprint among them. An answer that proves nothing (an empty one, one
+ * without metadata) is another payment, never an unread one.
  */
-function stateOfThisRequest(payment: Record<string, unknown>, input: CreatePaymentInput, fingerprint: string): PaymentState | undefined {
+async function readBack(client: UpstreamClient, input: CreatePaymentInput, fingerprint: string): Promise<ReadBack> {
+  let payment: Record<string, unknown>;
+  try {
+    payment = asRecord(await client.get(`/epayment/v1/payments/${encodePathParam(input.reference, 'reference')}`));
+  } catch (error) {
+    return { kind: 'unread', absent: error instanceof VippsHttpError && !error.tokenRequest && error.status === 404 };
+  }
   const amount = asRecord(payment.amount);
   const proven =
     payment.reference === input.reference &&
@@ -221,12 +256,14 @@ function stateOfThisRequest(payment: Record<string, unknown>, input: CreatePayme
     amount.currency === input.currency &&
     asRecord(payment.paymentMethod).type === 'WALLET' &&
     asRecord(payment.metadata)[FINGERPRINT_FIELD] === fingerprint;
-  return proven ? PAYMENT_STATES.find(state => state === payment.state) : undefined;
+  if (!proven) return { kind: 'other' };
+  return { kind: 'ours', state: PAYMENT_STATES.find(state => state === payment.state), landingPage: CustomerLink.from(payment.redirectUrl) };
 }
 
 const WAITING = 'The request waits for the customer to approve it. get_payment shows the state.';
 const STATE_NOT_READ = 'Vipps MobilePay accepted the request. Its state could not be read back; get_payment shows it.';
 const EXISTS = 'This request already exists, so nothing new was created.';
+const STATE_UNKNOWN = 'Its state is not one this server knows; get_payment shows it.';
 const NO_ADDRESS = 'Vipps MobilePay answered without a usable address for the customer.';
 const QR_ONLY_ONCE =
   'Vipps MobilePay gives the address of a QR code only when the request is created. For a new code, cancel this request with cancel_payment and create one with another reference.';
@@ -238,9 +275,10 @@ const QR_ONLY_ONCE =
  */
 function answer(input: CreatePaymentInput, outcome: Outcome): Record<string, unknown> {
   const { state } = outcome;
-  // A request that is no longer CREATED was not created by this call, whatever the answer to it was: Vipps MobilePay
-  // answered a repeat of an earlier one.
-  const live = state === undefined || state === 'CREATED';
+  // The customer can use the request while it is CREATED. A request Vipps MobilePay accepted in this call and whose
+  // state is not known counts as such; one that is no longer CREATED was not created by this call, whatever the
+  // answer to it was: Vipps MobilePay answered a repeat of an earlier one.
+  const live = state === 'CREATED' || (outcome.accepted && state === undefined);
   const created = outcome.accepted && live;
   const expiresAt = deadline(input.expiresAt);
   // The address only while the customer can use it.
@@ -249,6 +287,7 @@ function answer(input: CreatePaymentInput, outcome: Outcome): Record<string, unk
   if (created) notes.push(state === undefined ? STATE_NOT_READ : WAITING);
   else if (state === 'CREATED') notes.push(`${EXISTS} The customer has not approved it yet.`);
   else if (state === 'AUTHORIZED') notes.push(`${EXISTS} The customer has approved it: the amount is reserved, and capture_payment draws it.`);
+  else if (state === undefined) notes.push(`${EXISTS} ${STATE_UNKNOWN}`);
   else notes.push(`${EXISTS} It can no longer be paid: a new request needs another reference.`);
   if (live && address === null && input.delivery === 'link') notes.push(NO_ADDRESS);
   if (live && address === null && input.delivery === 'qr') notes.push(outcome.accepted ? NO_ADDRESS : QR_ONLY_ONCE);
@@ -270,13 +309,30 @@ function answer(input: CreatePaymentInput, outcome: Outcome): Record<string, unk
 
 const CONFLICT =
   'Refused: the reference is already used by a payment that is not this request, or that cannot be shown to be it. Nothing was created, and nothing of that payment is returned. A reference is used once per sales unit: use the number the business itself has for this request, and get_payment to see the payment that has the reference.';
+const ACCEPTED_NOT_PROVEN =
+  'Vipps MobilePay answered that the request was accepted, but the payment that has the reference cannot be shown to be this request, so nothing of it is returned: no state and no link. Do not call again with another reference. get_payment shows the payment that has the reference, and cancel_payment cancels it when it should not stand.';
+const REFERENCE_NOT_READ = 'Whether a payment already has the reference could not be read; get_payment shows it.';
+
+/**
+ * Vipps MobilePay accepted the create request, and the payment read back is
+ * not proven to be it. A request may exist; nothing of what was read is
+ * passed on. The text is ours.
+ */
+export class RequestNotProvenError extends Error {
+  constructor() {
+    super(ACCEPTED_NOT_PROVEN);
+    this.name = 'RequestNotProvenError';
+  }
+}
 
 export async function createPayment(client: UpstreamClient, input: CreatePaymentInput): Promise<unknown> {
   const content = requestContent(input);
-  const fingerprint = contentFingerprint({ merchantSerialNumber: client.merchantSerialNumber ?? null, request: content });
-  const idempotencyKey = derivedIdempotencyKey('create', fingerprint);
+  // The sales unit and everything the request says. The two values made from it are keyed: see the top of the file.
+  const identity = { merchantSerialNumber: client.merchantSerialNumber ?? null, request: content };
+  const keyedHash = (purpose: KeyedHashPurpose, text: string) => client.keyedHash(purpose, text);
+  const fingerprint = requestFingerprint(keyedHash, identity);
+  const idempotencyKey = derivedIdempotencyKey('create', keyedHash, identity);
   const body = { ...content, metadata: { [FINGERPRINT_FIELD]: fingerprint } };
-  const read = () => client.get(`/epayment/v1/payments/${encodePathParam(input.reference, 'reference')}`).then(asRecord);
 
   // The access token first (the cached one when there is one): a failure to get it is then known to be before
   // anything was sent.
@@ -295,30 +351,28 @@ export async function createPayment(client: UpstreamClient, input: CreatePayment
     }
     // The Access Token API refused or failed: the create request was never sent.
     if (error.tokenRequest) throw withNote(error, NOTHING_CREATED);
-    if (error.status === 400 || error.status === 409) {
-      // Refused, perhaps because the reference is used: by this request (a repeat of one whose answer was lost, or
-      // that Vipps MobilePay no longer remembers the key of), or by another.
-      const payment = await read().catch(() => undefined);
-      if (payment?.reference === input.reference) {
-        const state = stateOfThisRequest(payment, input, fingerprint);
-        if (state === undefined) throw new ChangeRefusedError(CONFLICT, { cause: error });
-        // The link of a payment page can be read again (the specification: redirectUrl "is the URL to the Vipps
-        // MobilePay landing page"); the address of a QR code cannot.
-        const address = input.delivery === 'link' ? CustomerLink.from(payment.redirectUrl) : undefined;
-        return answer(input, { accepted: false, state, address });
-      }
-    }
-    throw withNote(error, createNote(error.status, input, client.currentTime()));
+    const note = createNote(error.status, input, client.currentTime());
+    if (error.status !== 400 && error.status !== 409) throw withNote(error, note);
+    // Refused, perhaps because the reference is used: by this request (a repeat of one whose answer was lost, or
+    // that Vipps MobilePay no longer remembers the key of), or by another.
+    const found = await readBack(client, input, fingerprint);
+    if (found.kind === 'other') throw new ChangeRefusedError(CONFLICT, { cause: error });
+    // Nothing read: the refusal stands as it is. When no payment has the reference, the refusal is about the request.
+    if (found.kind === 'unread') throw withNote(error, found.absent ? note : `${note} ${REFERENCE_NOT_READ}`);
+    // The link of a payment page can be read again (the specification: redirectUrl "is the URL to the Vipps
+    // MobilePay landing page"); the address of a QR code cannot.
+    return answer(input, { accepted: false, state: found.state, address: input.delivery === 'link' ? found.landingPage : undefined });
   }
 
-  // Accepted. The payment is read back for its state: Vipps MobilePay may have answered a repeat of an earlier request
-  // with the first answer, and the request may since have been approved, cancelled or expired. A read that fails or
-  // proves nothing leaves the state unknown; it is never an error, since the request exists.
-  const payment = await read().catch(() => ({}) as Record<string, unknown>);
-  const state = stateOfThisRequest(payment, input, fingerprint);
-  const address =
-    input.delivery === 'phone'
-      ? undefined
-      : (CustomerLink.from(asRecord(accepted).redirectUrl) ?? (input.delivery === 'link' && state !== undefined ? CustomerLink.from(payment.redirectUrl) : undefined));
-  return answer(input, { accepted: true, state, address });
+  // Accepted. The payment is read back: Vipps MobilePay may have answered a repeat of an earlier request with the
+  // first answer, and the request may since have been approved, cancelled or expired.
+  const found = await readBack(client, input, fingerprint);
+  // Read, and not proven to be this request: nothing of it is passed on, and neither is the address of the
+  // acceptance, which is then not known to be this request's either.
+  if (found.kind === 'other') throw new RequestNotProvenError();
+  // The address in the acceptance answers this request's own key. It is all there is when the read failed, and for a
+  // QR code, whose address is given only here.
+  const own = input.delivery === 'phone' ? undefined : CustomerLink.from(asRecord(accepted).redirectUrl);
+  if (found.kind === 'unread') return answer(input, { accepted: true, address: own });
+  return answer(input, { accepted: true, state: found.state, address: own ?? (input.delivery === 'link' ? found.landingPage : undefined) });
 }

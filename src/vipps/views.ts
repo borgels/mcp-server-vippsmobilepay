@@ -1,3 +1,5 @@
+import { isDerivedIdempotencyKey } from './values.js';
+
 /**
  * What the read tools pass on of a payment, its events and an agreement: a
  * deep allow-list with a type for every field, on every level. A field is
@@ -90,6 +92,26 @@ export function paymentView(payment: unknown): Record<string, unknown> {
   return out;
 }
 
+/**
+ * The answer to a capture, a refund or a cancellation through the same
+ * allow-list as a payment (the specification's ModificationResponse holds
+ * amount, state, aggregate, pspReference and reference). The change has been
+ * made when this is read, so an answer in another form is not refused: what
+ * is not on the list is left out, and an answer that is no object is empty.
+ */
+export function modificationView(answer: unknown): Record<string, unknown> {
+  return (typed(answer, PAYMENT) as Record<string, unknown> | undefined) ?? {};
+}
+
+/**
+ * The events whose Idempotency-Key the caller chose: a capture, a refund and
+ * a cancellation (CANCELLED after the customer approved, TERMINATED before).
+ * The key of any other event is not passed on: the key of the request that
+ * created the payment is made by this server from the request's content
+ * (create_payment), and is not the caller's to see.
+ */
+const EVENTS_WITH_CALLER_KEY: ReadonlySet<unknown> = new Set(['CAPTURED', 'REFUNDED', 'CANCELLED', 'TERMINATED']);
+
 /** A list of events through the allow-list, or undefined when the answer is not a list of objects. */
 export function paymentEventsView(events: unknown): Array<Record<string, unknown>> | undefined {
   if (!Array.isArray(events)) return undefined;
@@ -97,6 +119,8 @@ export function paymentEventsView(events: unknown): Array<Record<string, unknown
   for (const event of events) {
     const kept = typed(event, PAYMENT_EVENT) as Record<string, unknown> | undefined;
     if (!kept) return undefined;
+    // By the event's name, and once more by the key's own form: a derived key is passed on under no name.
+    if (!EVENTS_WITH_CALLER_KEY.has(kept.name) || isDerivedIdempotencyKey(kept.idempotencyKey)) delete kept.idempotencyKey;
     out.push(kept);
   }
   return out;

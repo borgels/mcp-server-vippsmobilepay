@@ -48,6 +48,8 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
 };
 
+/** The payment request answerEverything last accepted: it is read back as that request, as Vipps MobilePay would. */
+let lastCreated: Record<string, unknown> | undefined;
 const answerEverything: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   const method = init?.method ?? 'GET';
@@ -57,11 +59,17 @@ const answerEverything: typeof fetch = async (input, init) => {
   if (path === '/accesstoken/get') return json({ access_token: fakeToken('catalog'), expires_in: '3600' });
   if (method === 'DELETE') return json(null, 204);
   if (path.endsWith('/charges/chr-5kSeqz/refund')) return json(null, 204);
-  if (method === 'POST' && path === '/epayment/v1/payments') return json({ redirectUrl: 'https://landing.example/?token=abc', reference: 'fjord-order-10077' }, 201);
+  if (method === 'POST' && path === '/epayment/v1/payments') {
+    lastCreated = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return json({ redirectUrl: 'https://landing.example/?token=abc', reference: lastCreated.reference }, 201);
+  }
   if (method === 'POST') return json({ state: 'AUTHORIZED' });
   if (path === '/settlement/v1/ledgers') return json({ cursor: '', items: [] });
   if (path.startsWith('/report/')) return json({ items: [], hasMore: false, tryLater: false });
   if (path.endsWith('/events')) return json([]);
+  if (lastCreated && path === `/epayment/v1/payments/${String(lastCreated.reference)}`) {
+    return json(payment({ reference: lastCreated.reference, state: 'CREATED', amount: lastCreated.amount, metadata: lastCreated.metadata }));
+  }
   if (path.startsWith('/epayment/')) {
     return json(
       payment({

@@ -11,15 +11,31 @@
   `requiresConfirmation` like them. `POST /epayment/v1/payments` is added to
   the fixed list of requests; nothing else is.
 - The request's `Idempotency-Key` is not chosen by the caller: the server
-  derives it from a fingerprint of the sales unit and the request's own
-  content, so a request repeated after a failure or a lost answer is created
-  once and cannot be repeated under a new key. The fingerprint is also sent
-  as `metadata.requestFingerprint`. A request refused because the reference
-  is used is answered with the existing payment (`alreadyExists`, its state
-  and its link) only when the payment read back is proven to be the same
-  request: reference, amount, currency, payment method and fingerprint. Any
-  other payment with the reference is a conflict, and nothing of it is
-  returned. The README has the table of what a second call is answered with.
+  derives it from the sales unit and the request's own content, so a request
+  repeated after a failure or a lost answer is created once and cannot be
+  repeated under a new key. A second value from the same content, the
+  fingerprint, is sent as `metadata.requestFingerprint`. Both are keyed
+  hashes (HMAC-SHA-256) with keys derived from the client secret, so neither
+  can be made or tested against a guess of the content without it; after the
+  client secret is replaced, a request made before is no longer recognised
+  and is answered as a conflict. Neither value is in an answer, an error or
+  the audit.
+- A payment read back is taken for the request, and its state or link passed
+  on, only when it is proven to be the same request: reference, amount,
+  currency, payment method and fingerprint. A payment that is read and not
+  proven is a refusal with nothing of it, whether Vipps MobilePay accepted or
+  refused the create request. When the payment cannot be read at all after an
+  accepted request, the answer has no state and the address of the
+  acceptance. The README has the tables of every branch and of what a second
+  call is answered with.
+- `get_payment`: an event passes on its `idempotencyKey` only when it is a
+  capture, a refund or a cancellation, whose key the caller chose. The key of
+  the request that created the payment is not passed on.
+- `capture_payment`, `refund_payment` and `cancel_payment`: what Vipps
+  MobilePay answers the change with passes the same allow-list as a payment
+  that is read (reference, pspReference, state, amount, aggregate, payment
+  method). The specification's answer holds nothing else; a field outside the
+  list was passed on before and is now left out.
 - No refusal depends on the clock: whether a deadline is too near or too far
   is for Vipps MobilePay to refuse, so an identical call made later is still
   sent. In NOK a request with a deadline needs `productUrl` on every order
