@@ -9,7 +9,12 @@ import { datesBetween } from './values.js';
  * call fails with our own text and returns nothing, rather than a list that
  * looks complete but is not. A ledger date that Vipps MobilePay has not closed
  * yet (`tryLater`) is named in the result, which then says it is incomplete;
- * every page it has so far is still read.
+ * every page it has so far is still read. A date that has not begun is not
+ * requested (lastBegunLedgerDate), because Vipps MobilePay answers HTTP 400
+ * for a ledger date more than 24 hours ahead and the whole period would fail
+ * with it. It is named apart from the open dates (`futureDates`), the dates
+ * actually read are given (`readFrom`, `readTo`), and `note` says in words
+ * what the answer lacks.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -116,10 +121,128 @@ async function readLedgerDate(
   }
 }
 
+/** The time zone furthest ahead among Vipps MobilePay's markets (Denmark, Finland, Norway and Sweden): Finland's. */
+const EARLIEST_MARKET_TIME_ZONE = 'Europe/Helsinki';
+
+const marketDate = new Intl.DateTimeFormat('en-GB', {
+  timeZone: EARLIEST_MARKET_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/**
+ * The last ledger date that is asked for: the newest calendar date that has begun in any of Vipps MobilePay's
+ * markets.
+ *
+ * What Vipps MobilePay documents: "a ledger date lasts from midnight to midnight in the timezone of the merchant"
+ * (it can be configured to another cutoff), and a `ledgerDate` "more than 24 hours in the future" is answered with
+ * HTTP 400. It does not say which clock the 24 hours follow, so nothing here depends on that: the server does not
+ * know the sales unit's time zone, but a date that has begun in Finland has begun, or begins within two hours, for
+ * every sales unit, which is far inside the 24 hours by any clock. No sales unit's own day is left out, also not
+ * just after its midnight, in summer or winter time. A later date is not asked for. Every refusal of a date that is
+ * asked for is an error; none is taken to mean "not come yet".
+ */
+export function lastBegunLedgerDate(now: number): string {
+  const parts = Object.fromEntries(marketDate.formatToParts(new Date(now)).map(part => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
 export interface PeriodInput {
   ledgerId: string;
   fromDate: string;
   toDate: string;
+}
+
+/** What was read of a period, and what was not and why. */
+interface PeriodReading {
+  /** One report per date that was read, in order. */
+  reports: DateReport[];
+  /** Dates read that Vipps MobilePay has not closed yet: entries can still be added. */
+  openDates: string[];
+  /** Dates not asked for because they have not begun. They are never among the dates read. */
+  futureDates: string[];
+}
+
+/**
+ * Every date of the period that has begun, in order. A date that has not begun is not asked for. `onDate` runs after
+ * each date read, so a caller can refuse a period that is too large early. An error from any request, the access
+ * request included, ends the reading: nothing read so far is returned.
+ */
+async function readPeriod(
+  client: UpstreamClient,
+  input: PeriodInput,
+  topic: ReportTopic,
+  onDate?: (report: DateReport) => void,
+): Promise<PeriodReading> {
+  const budget = { pages: 0 };
+  const lastBegun = lastBegunLedgerDate(client.currentTime());
+  const reading: PeriodReading = { reports: [], openDates: [], futureDates: [] };
+  for (const date of datesBetween(input.fromDate, input.toDate)) {
+    if (date > lastBegun) {
+      reading.futureDates.push(date);
+      continue;
+    }
+    const report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
+    reading.reports.push(report);
+    if (report.open) reading.openDates.push(date);
+    onDate?.(report);
+  }
+  return reading;
+}
+
+function span(dates: readonly string[]): string {
+  const first = dates[0] ?? '';
+  const last = dates[dates.length - 1] ?? '';
+  return first === last ? first : `${first} to ${last}`;
+}
+
+/**
+ * In words, what of the period the answer does not hold and why; undefined when it holds all of it. An answer that
+ * is cut, empty or still open must say so itself: sums of a part must never read as sums of the whole.
+ */
+function periodNote(reading: PeriodReading): string | undefined {
+  const read = reading.reports.map(report => report.ledgerDate);
+  const parts: string[] = [];
+  if (read.length === 0) {
+    parts.push(
+      `Nothing was read and nothing is summed: the period has not begun. ${span(reading.futureDates)} is in the future.`,
+    );
+  } else if (reading.futureDates.length > 0) {
+    parts.push(
+      `Only ${span(read)} was read. ${span(reading.futureDates)} is in the future and was not asked for, so the answer does not cover the whole period.`,
+    );
+  }
+  if (reading.openDates.length > 0) {
+    parts.push(
+      `Vipps MobilePay has not closed ${reading.openDates.join(', ')} yet: more entries can come for ${reading.openDates.length === 1 ? 'that date' : 'those dates'}.`,
+    );
+  }
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+/** The fields every period answer has: the period asked for, the dates read, and what is missing and why. */
+function periodFields(input: PeriodInput, reading: PeriodReading) {
+  const read = reading.reports.map(report => report.ledgerDate);
+  const note = periodNote(reading);
+  return {
+    ledgerId: input.ledgerId,
+    fromDate: input.fromDate,
+    toDate: input.toDate,
+    readFrom: read[0] ?? null,
+    readTo: read[read.length - 1] ?? null,
+    complete: reading.openDates.length === 0 && reading.futureDates.length === 0,
+    openDates: reading.openDates,
+    futureDates: reading.futureDates,
+    ...(note ? { note } : {}),
+    amountsInMinorUnits: true,
+  };
+}
+
+/** The note of a period answer, for the text of a result; undefined for any other value. */
+export function periodNoteOf(result: unknown): string | undefined {
+  const note = asRecord(result).note;
+  return typeof note === 'string' ? note : undefined;
 }
 
 export async function listTransactions(
@@ -127,30 +250,16 @@ export async function listTransactions(
   input: PeriodInput & { topic?: ReportTopic },
 ): Promise<unknown> {
   const topic = input.topic ?? 'funds';
-  const budget = { pages: 0 };
   const items: Array<Record<string, unknown>> = [];
-  const openDates: string[] = [];
-  for (const date of datesBetween(input.fromDate, input.toDate)) {
-    const report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
-    if (report.open) openDates.push(date);
+  const reading = await readPeriod(client, input, topic, report => {
     items.push(...report.items);
     if (items.length > MAX_TRANSACTIONS) {
       throw new TooMuchDataError(
         `The period holds more than ${MAX_TRANSACTIONS} entries; choose a shorter period. Refused rather than returned incomplete.`,
       );
     }
-  }
-  return {
-    ledgerId: input.ledgerId,
-    topic,
-    fromDate: input.fromDate,
-    toDate: input.toDate,
-    complete: openDates.length === 0,
-    openDates,
-    amountsInMinorUnits: true,
-    count: items.length,
-    items,
-  };
+  });
+  return { ...periodFields(input, reading), topic, count: items.length, items };
 }
 
 interface Totals {
@@ -187,27 +296,13 @@ function totalsOf(items: ReadonlyArray<Record<string, unknown>>): Totals {
 /**
  * Totals of the funds ledger per ledger date and for the period: sales
  * (capture), refunds, retained fees, payouts and the balance before and after.
- * Reads every entry of the period and returns only the sums.
+ * Reads every entry of the dates that have come and returns only the sums.
+ * `period` is null when no date was read: an empty sum would read as "nothing
+ * happened", which is not known.
  */
 export async function fundsSummary(client: UpstreamClient, input: PeriodInput): Promise<unknown> {
-  const budget = { pages: 0 };
-  const days: Array<Totals & { ledgerDate: string; open: boolean }> = [];
-  const all: Array<Record<string, unknown>> = [];
-  for (const date of datesBetween(input.fromDate, input.toDate)) {
-    const report = await readLedgerDate(client, input.ledgerId, 'funds', date, budget);
-    days.push({ ledgerDate: date, open: report.open, ...totalsOf(report.items) });
-    all.push(...report.items);
-  }
-  const period = totalsOf(all);
-  const openDates = days.filter(day => day.open).map(day => day.ledgerDate);
-  return {
-    ledgerId: input.ledgerId,
-    fromDate: input.fromDate,
-    toDate: input.toDate,
-    complete: openDates.length === 0,
-    openDates,
-    amountsInMinorUnits: true,
-    period,
-    days,
-  };
+  const reading = await readPeriod(client, input, 'funds');
+  const days = reading.reports.map(report => ({ ledgerDate: report.ledgerDate, open: report.open, ...totalsOf(report.items) }));
+  const period = reading.reports.length === 0 ? null : totalsOf(reading.reports.flatMap(report => report.items));
+  return { ...periodFields(input, reading), period, days };
 }

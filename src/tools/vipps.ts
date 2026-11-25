@@ -22,7 +22,7 @@ import {
   listCharges,
   refundCharge,
 } from '../vipps/recurring.js';
-import { fundsSummary, listLedgers, listTransactions, MAX_REPORT_DAYS, MAX_TRANSACTIONS } from '../vipps/reports.js';
+import { fundsSummary, listLedgers, listTransactions, MAX_REPORT_DAYS, MAX_TRANSACTIONS, periodNoteOf } from '../vipps/reports.js';
 import {
   checkInputPolicy,
   checkToolPolicy,
@@ -119,6 +119,8 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   returnsUpstreamContent: boolean;
   /** Short human-readable summary used by the gateway result text. */
   summary: string;
+  /** What a result lacks and why, in this server's own words, added to the gateway result text; undefined when nothing. */
+  resultNote?: (result: unknown) => string | undefined;
   /** Every upstream request the handler may make (the access token request is not listed). */
   upstream: readonly UpstreamOperation[];
   /** True when the tool can read more than its name says. None of these tools does. */
@@ -226,11 +228,12 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     name: 'vipps_get_funds_summary',
     title: 'Settlement and funds summary (Vipps MobilePay)',
     description:
-      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet are listed in openDates. Merchant keys only.',
+      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, note says in words what is missing, and period is null when no date was read. Merchant keys only.',
     inputShape: periodShape,
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
     summary: 'Summarised the funds ledger.',
+    resultNote: periodNoteOf,
     upstream: [{ access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/funds/dates/{ledgerDate}' }],
     keyTypes: MERCHANT_KEYS,
     check: checkPeriod,
@@ -239,7 +242,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'vipps_list_transactions',
     title: 'Ledger entries for a period (Vipps MobilePay)',
-    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet are listed in openDates, and complete is false. Customer names and messages are not requested. Merchant keys only.`,
+    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, and note says in words what is missing. Customer names and messages are not requested. Merchant keys only.`,
     inputShape: {
       ...periodShape,
       topic: z.enum(['funds', 'fees']).optional().describe('funds (default) or fees.'),
@@ -247,6 +250,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
     summary: 'Listed ledger entries.',
+    resultNote: periodNoteOf,
     upstream: [
       { access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/funds/dates/{ledgerDate}' },
       { access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/fees/dates/{ledgerDate}' },

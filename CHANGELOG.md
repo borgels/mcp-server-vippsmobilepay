@@ -7,6 +7,28 @@
   end the date, also when it said `hasMore`, so an open date with more than
   one page of entries came back with only the first page. The date is still
   named in `openDates`, and `complete` is still `false`.
+- `list_transactions` and `get_funds_summary` no longer fail for a period that
+  reaches past today, such as the current month. Vipps MobilePay answers HTTP
+  400 for a ledger date more than 24 hours ahead, which made the whole call
+  fail. A date is requested only when it has begun in the market furthest
+  ahead (Finland's time zone), so no request is ever more than two hours
+  early for any sales unit, and a sales unit's own day is read from its own
+  midnight. A refusal of a date that was requested is an error, as is every
+  failure to get access. The days that have been are returned, and the answer
+  says that it is cut:
+  - `futureDates` lists the dates that were not requested because they have
+    not begun. They are no longer mixed into `openDates`, which holds only
+    dates that were read and are not closed.
+  - `readFrom` and `readTo` are the first and last date actually read (`null`
+    when none was); `fromDate` and `toDate` are still the period asked for.
+  - `complete` is `false` when any date is open or was not read.
+  - `note` says in words what the answer lacks and why, and the gateway's
+    result text carries the same sentence, so a reader of the text alone
+    cannot take a part of the period for the whole.
+  - A period that lies entirely in the future makes no request and says that
+    the period has not begun. `get_funds_summary` then returns `period: null`
+    and no days instead of sums of zero, and its `days` never holds a date
+    that was not read.
 
 ## 0.4.0
 
