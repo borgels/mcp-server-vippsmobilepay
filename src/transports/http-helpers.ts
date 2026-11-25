@@ -194,7 +194,7 @@ export function assertAllowedHost(req: IncomingMessage, config: HttpConfig): voi
   }
 }
 
-const HOSTNAME = String.raw`(\[[0-9a-f:.]+\]|[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?)`;
+const HOSTNAME = String.raw`(\[[\da-f:.]+\]|[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?)`;
 const HOST_HEADER_PATTERN = new RegExp(String.raw`^${HOSTNAME}(?::\d{1,5})?$`);
 const HOSTNAME_PATTERN = new RegExp(`^${HOSTNAME}$`);
 

@@ -191,7 +191,7 @@ const PRODUCTION_ONLY = ['production'] as const;
 
 const referenceSchema = z.string().trim().regex(REFERENCE_PATTERN).describe('The ePayment reference (8-64 letters, digits or dashes).');
 const agreementIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring agreement id, e.g. agr_5kSeqz.');
-const chargeIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring charge id, e.g. chr-123ab.');
+const chargeIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring charge id, e.g. chr-Kq7wZp.');
 const ledgerIdSchema = z.string().trim().regex(LEDGER_ID_PATTERN).describe('The ledger id, from list_ledgers.');
 const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
 const amountSchema = z
@@ -475,15 +475,15 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
         .string()
         .regex(PHONE_NUMBER_PATTERN)
         .optional()
-        .describe('Only with delivery phone: the number of the customer as digits with country code and no plus sign, e.g. 4512345678.'),
+        .describe('Only with delivery phone: the number of the customer as digits with country code and no plus sign or spaces: 45 followed by the 8-digit number for Denmark.'),
       returnUrl: httpsUrlSchema
         .optional()
         .describe('Required with delivery link: the https address the customer is sent to after the payment page, e.g. the website of the business.'),
       expiresAt: z
         .string()
-        .refine(value => timestampMs(value) !== undefined, 'must be a time with a time zone, e.g. 2026-12-15T23:59:59+01:00')
+        .refine(value => timestampMs(value) !== undefined, 'must be a time with a time zone in the form YYYY-MM-DDThh:mm:ss+01:00 (or ending in Z)')
         .optional()
-        .describe('Only for a request the customer can pay later: the deadline, more than 10 minutes and less than 60 days ahead, e.g. 2026-12-15T23:59:59+01:00.'),
+        .describe('Only for a request the customer can pay later: the deadline, more than 10 minutes and less than 60 days ahead, in the form YYYY-MM-DDThh:mm:ss+01:00 (or ending in Z).'),
       orderLines: z
         .array(orderLineSchema)
         .min(1)

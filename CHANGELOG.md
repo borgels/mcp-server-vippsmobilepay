@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.1
+
+- Fix: 0.7.0 refused valid keys. A key is refused when it shares six
+  characters with one of the server's own texts, and 0.7.0's texts held the
+  example phone number `4512345678`, so a client id, subscription key or
+  client secret holding `123456`, `234567`, `345678` and so on was refused
+  before any request (for example the client id
+  `e89f2345-c841-4bc7-a695-234567ab89cd`, which 0.5.0 accepts). The same
+  class of run was in other texts too: the example dates
+  `2026-12-15T23:59:59+01:00`, the charge id example `chr-123ab`, the word
+  "Embedded", the range `0-9a-f` in the host name pattern, and the numbers
+  `65000000` (the amount limit) and `9007199254740991` (the integer limit
+  zod adds) in the gateway's tool list.
+- The texts now hold no run of six or more characters from `[0-9A-Fa-f-]`:
+  the phone number and the dates are described in words and by their form,
+  the examples are changed, and a numeric bound of six digits or more is left
+  out of the gateway's JSON schemas (zod still checks it when the call runs;
+  the limits themselves are unchanged).
+- A test checks every text a key is compared against (the fixed texts, the
+  refusal, the fallbacks and the gateway's tool list) for such runs, and
+  realistic made-up GUID, hex and base64 keys are admitted.
+
 ## 0.7.0
 
 - Five new read tools. `find_charge`: one Recurring charge by its own id,
