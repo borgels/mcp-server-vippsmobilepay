@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased: reads
+
+- Five new read tools. `find_charge`: one Recurring charge by its own id,
+  when the agreement is not known. `get_receipt`: the order lines with VAT,
+  the bottom line and the category stored with a payment or a Recurring
+  charge (Order Management API). `list_sales_units` and `get_sales_unit`: the
+  sales units the keys can read, and what Vipps MobilePay has enabled for the
+  one the keys are used for (Management API). `list_qr_codes`: the sales
+  unit's fixed QR codes, of both kinds (QR API).
+- Seven GET requests are added to the fixed list of requests, and nothing
+  else: no request that creates or changes a QR code, a receipt, a category,
+  an image, a product order or a sales unit can be sent.
+- Gateway catalog: every entry has `environments`. The two sales unit tools
+  have `['production']`: Vipps MobilePay has no Management API in the test
+  environment, where they are left out of the offered tools and refused
+  before anything is sent. `list_sales_units` is for the merchant's own keys
+  only; with partner keys it would list the sales units of every merchant of
+  the partner.
+- Every answer of the new tools passes a typed allow-list that is read
+  strictly, on every level and for every item of a list: a field that is not
+  known is left out, and a known field in another type, or an object without
+  a field it needs, refuses the whole answer. No item of a list is ever an
+  empty object, and no list is cut short. The README lists what each object
+  needs. The older reads are unchanged here.
+- The address of a QR code's image is passed on whole, as the link of a
+  payment request is: it carries a token in the form of a JSON Web Token,
+  which the redaction would otherwise mask. A host should treat it as answer
+  data and not log it.
+- `find_charge` leaves an operation key out of a charge's history when it has
+  the form this server makes from a request's content. `get_charge` and
+  `list_charges` are unchanged and pass the charge on as it comes.
+- Not added: each sale with its lines and VAT. The Sales API takes accounting
+  keys only, which this server does not hold (see the README).
+
 ## 0.6.0
 
 A new write tool, `create_payment`, and three changes a host must look at

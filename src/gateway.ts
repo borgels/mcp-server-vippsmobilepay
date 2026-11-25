@@ -7,7 +7,6 @@ import {
   type VippsKeyType,
 } from './vipps/client.js';
 import {
-  isToolDisabled,
   resolveInstancePolicy,
   runInCallScope,
   TOOL_PREFIX,
@@ -19,10 +18,10 @@ import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
   auditRejectedCall,
+  enabledTools,
   executeTool,
   findTool,
   logFieldValue,
-  toolSupportsKeyType,
   validateStartupConfig,
   VIPPS_TOOLS,
   type CallContext,
@@ -114,8 +113,14 @@ export interface GatewayToolCatalogEntry {
   readonly upstream: readonly GatewayUpstreamOperation[];
   /** True when the tool can read more than its name says. False for every tool here. */
   readonly broad: boolean;
-  /** The key types the tool works with. Report tools need the merchant's own keys. */
+  /** The key types the tool works with. Report tools and the list of sales units need the merchant's own keys. */
   readonly keyTypes: readonly VippsKeyType[];
+  /**
+   * The environments the tool works in. The two sales unit tools work in
+   * production only: Vipps MobilePay has no Management API in the test
+   * environment.
+   */
+  readonly environments: readonly VippsEnvironment[];
   /**
    * Vipps MobilePay addition: true for every write tool. A capture, refund
    * or cancellation moves or releases money, and a payment request reaches
@@ -240,6 +245,7 @@ export const vippsToolCatalog: readonly GatewayToolCatalogEntry[] = deepFreeze(
     upstream: tool.upstream.map(operation => ({ ...operation })),
     broad: tool.broad === true,
     keyTypes: [...tool.keyTypes],
+    environments: [...(tool.environments ?? (['test', 'production'] as const))],
     requiresConfirmation: tool.change !== undefined,
     ...(tool.change
       ? { change: { ...tool.change, logFields: tool.change.logFields.map(field => ({ ...field })) } }
@@ -392,7 +398,7 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   return {
     /** Tools offered on this instance: not disabled or outside allowedTools, and usable with its keys. */
     tools: underPolicy(() =>
-      VIPPS_TOOLS.filter(tool => !isToolDisabled(tool.name) && toolSupportsKeyType(tool, client.keyType)).map(toGatewayDefinition),
+      enabledTools(client.keyType, client.environment).map(toGatewayDefinition),
     ),
     /** The environment and key type of this instance. */
     environment: client.environment,
