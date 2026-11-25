@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { lastAskableLedgerDate, MAX_LEDGER_PAGES, MAX_TRANSACTIONS } from '../src/vipps/reports.js';
+import { lastBegunLedgerDate, MAX_LEDGER_PAGES, MAX_TRANSACTIONS } from '../src/vipps/reports.js';
 import { AGREEMENT_PAGE_SIZE, MAX_AGREEMENT_PAGES, MAX_CHARGE_PAGES } from '../src/vipps/recurring.js';
 import { UNTRUSTED_CONTENT_NOTE } from '../src/vipps/annotations.js';
-import { apiCalls, charge, gateway, payment, texts, type Reply } from './helpers.js';
+import { apiCalls, charge, gateway, payment, texts, TOKEN, type Reply } from './helpers.js';
 
 const LEDGER = '302321';
 
@@ -162,35 +162,36 @@ describe('transactions and funds summary', () => {
     /** Vipps MobilePay's answer for a ledger date more than 24 hours ahead. */
     const refused = () => ({ status: 400, body: { title: 'Bad Request', detail: 'ledgerDate is in the future' } });
     const routes = {
-      [day('2026-11-24')]: closed('2026-11-24', 30_000),
+      [day('2026-11-23')]: closed('2026-11-23', 30_000),
+      [day('2026-11-24')]: closed('2026-11-24', 7_500),
       [day('2026-11-25')]: open('2026-11-25', [12_500]),
-      [day('2026-11-26')]: open('2026-11-26'),
+      [day('2026-11-26')]: refused,
       [day('2026-11-27')]: refused,
-      [day('2026-11-28')]: refused,
     };
-    const period = { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-28' };
+    const period = { ledgerId: LEDGER, fromDate: '2026-11-23', toDate: '2026-11-27' };
+    // 12.00 in Denmark, 13.00 in Finland, on 25 November.
     const midday = () => Date.parse('2026-11-25T11:00:00Z');
     const asked = (calls: Parameters<typeof apiCalls>[0]) => apiCalls(calls).map(call => call.path.split('/').pop());
     const CUT =
-      'Only 2026-11-24 to 2026-11-26 was read. 2026-11-27 to 2026-11-28 is in the future and was not asked for, so the answer does not cover the whole period.';
-    const OPEN = 'Vipps MobilePay has not closed 2026-11-25, 2026-11-26 yet: more entries can come for those dates.';
+      'Only 2026-11-23 to 2026-11-25 was read. 2026-11-26 to 2026-11-27 is in the future and was not asked for, so the answer does not cover the whole period.';
+    const OPEN = 'Vipps MobilePay has not closed 2026-11-25 yet: more entries can come for that date.';
 
-    it('asks only for dates that have come, and keeps the dates not asked for apart from the open ones', async () => {
+    it('asks only for dates that have begun, and keeps the dates not asked for apart from the open ones', async () => {
       const { gw, calls } = gateway(routes, { now: midday });
       const result = await gw.callTool('list_transactions', period);
       expect(result.isError).toBeUndefined();
       expect(result.structuredContent).toMatchObject({
-        fromDate: '2026-11-24',
-        toDate: '2026-11-28',
-        readFrom: '2026-11-24',
-        readTo: '2026-11-26',
+        fromDate: '2026-11-23',
+        toDate: '2026-11-27',
+        readFrom: '2026-11-23',
+        readTo: '2026-11-25',
         complete: false,
-        openDates: ['2026-11-25', '2026-11-26'],
-        futureDates: ['2026-11-27', '2026-11-28'],
+        openDates: ['2026-11-25'],
+        futureDates: ['2026-11-26', '2026-11-27'],
         note: `${CUT} ${OPEN}`,
-        count: 2,
+        count: 3,
       });
-      expect(asked(calls)).toEqual(['2026-11-24', '2026-11-25', '2026-11-26']);
+      expect(asked(calls)).toEqual(['2026-11-23', '2026-11-24', '2026-11-25']);
       // The text says it too: a reader of the text alone must not take the part for the whole.
       expect(texts(result)[0]).toBe(`Listed ledger entries. ${CUT} ${OPEN} ${UNTRUSTED_CONTENT_NOTE}`);
     });
@@ -200,27 +201,27 @@ describe('transactions and funds summary', () => {
       const result = await gw.callTool('get_funds_summary', period);
       expect(result.isError).toBeUndefined();
       expect(result.structuredContent).toMatchObject({
-        readFrom: '2026-11-24',
-        readTo: '2026-11-26',
+        readFrom: '2026-11-23',
+        readTo: '2026-11-25',
         complete: false,
-        openDates: ['2026-11-25', '2026-11-26'],
-        futureDates: ['2026-11-27', '2026-11-28'],
+        openDates: ['2026-11-25'],
+        futureDates: ['2026-11-26', '2026-11-27'],
         note: `${CUT} ${OPEN}`,
-        period: { entries: 2, totalsByEntryType: { capture: 42_500 } },
+        period: { entries: 3, totalsByEntryType: { capture: 50_000 } },
       });
       // A day that was not read is not a day with nothing in it: it is not among the days at all.
       expect((result.structuredContent as { days: Array<{ ledgerDate: string }> }).days.map(d => d.ledgerDate)).toEqual([
+        '2026-11-23',
         '2026-11-24',
         '2026-11-25',
-        '2026-11-26',
       ]);
       expect(texts(result)[0]).toBe(`Summarised the funds ledger. ${CUT} ${OPEN} ${UNTRUSTED_CONTENT_NOTE}`);
       expect(asked(calls)).toHaveLength(3);
     });
 
     it('says that a period has not begun, instead of an empty sum or an empty list', async () => {
-      const future = { ledgerId: LEDGER, fromDate: '2026-11-27', toDate: '2026-11-28' };
-      const NOT_BEGUN = 'Nothing was read and nothing is summed: the period has not begun. 2026-11-27 to 2026-11-28 is in the future.';
+      const future = { ledgerId: LEDGER, fromDate: '2026-11-26', toDate: '2026-11-27' };
+      const NOT_BEGUN = 'Nothing was read and nothing is summed: the period has not begun. 2026-11-26 to 2026-11-27 is in the future.';
       const { gw, calls } = gateway(routes, { now: midday });
 
       const summed = await gw.callTool('get_funds_summary', future);
@@ -230,7 +231,7 @@ describe('transactions and funds summary', () => {
         readTo: null,
         complete: false,
         openDates: [],
-        futureDates: ['2026-11-27', '2026-11-28'],
+        futureDates: ['2026-11-26', '2026-11-27'],
         note: NOT_BEGUN,
         period: null,
         days: [],
@@ -239,101 +240,122 @@ describe('transactions and funds summary', () => {
 
       const listed = await gw.callTool('list_transactions', future);
       expect(listed.isError).toBeUndefined();
-      expect(listed.structuredContent).toMatchObject({ readFrom: null, readTo: null, complete: false, futureDates: ['2026-11-27', '2026-11-28'], note: NOT_BEGUN, count: 0, items: [] });
+      expect(listed.structuredContent).toMatchObject({ readFrom: null, readTo: null, complete: false, futureDates: ['2026-11-26', '2026-11-27'], note: NOT_BEGUN, count: 0, items: [] });
       expect(texts(listed)[0]).toBe(`Listed ledger entries. ${NOT_BEGUN} ${UNTRUSTED_CONTENT_NOTE}`);
-      expect(apiCalls(calls)).toHaveLength(0);
+      // Nothing at all was sent: not a report request, and not a request for access either.
+      expect(calls).toHaveLength(0);
     });
 
     it('names one future date as one date', async () => {
       const { gw } = gateway(routes, { now: midday });
-      const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-27', toDate: '2026-11-27' });
-      expect(result.structuredContent).toMatchObject({ note: 'Nothing was read and nothing is summed: the period has not begun. 2026-11-27 is in the future.' });
+      const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-26', toDate: '2026-11-26' });
+      expect(result.structuredContent).toMatchObject({ note: 'Nothing was read and nothing is summed: the period has not begun. 2026-11-26 is in the future.' });
     });
 
     it('says which dates are still open when the whole period was read, and nothing when it is whole and closed', async () => {
       const { gw } = gateway(routes, { now: midday });
       const openOnly = await gw.callTool('get_funds_summary', { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-25' });
-      const ONE_OPEN = 'Vipps MobilePay has not closed 2026-11-25 yet: more entries can come for that date.';
-      expect(openOnly.structuredContent).toMatchObject({ readFrom: '2026-11-24', readTo: '2026-11-25', complete: false, openDates: ['2026-11-25'], futureDates: [], note: ONE_OPEN });
-      expect(texts(openOnly)[0]).toBe(`Summarised the funds ledger. ${ONE_OPEN} ${UNTRUSTED_CONTENT_NOTE}`);
+      expect(openOnly.structuredContent).toMatchObject({ readFrom: '2026-11-24', readTo: '2026-11-25', complete: false, openDates: ['2026-11-25'], futureDates: [], note: OPEN });
+      expect(texts(openOnly)[0]).toBe(`Summarised the funds ledger. ${OPEN} ${UNTRUSTED_CONTENT_NOTE}`);
 
-      const whole = await gw.callTool('get_funds_summary', { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-24' });
-      expect(whole.structuredContent).toMatchObject({ readFrom: '2026-11-24', readTo: '2026-11-24', complete: true, openDates: [], futureDates: [] });
+      const whole = await gw.callTool('get_funds_summary', { ledgerId: LEDGER, fromDate: '2026-11-23', toDate: '2026-11-24' });
+      expect(whole.structuredContent).toMatchObject({ readFrom: '2026-11-23', readTo: '2026-11-24', complete: true, openDates: [], futureDates: [] });
       expect(whole.structuredContent).not.toHaveProperty('note');
       expect(texts(whole)[0]).toBe(`Summarised the funds ledger. ${UNTRUSTED_CONTENT_NOTE}`);
     });
 
-    // Vipps MobilePay: a ledger date runs from midnight to midnight in the sales unit's time zone. Denmark is one hour
-    // ahead of UTC in winter and two in summer, so for the last hours of the UTC day the sales unit's own day is
-    // already the next date, and it has entries.
-    for (const [season, now, today, after] of [
-      ['winter, 00.30 Danish time', '2026-11-25T23:30:00Z', '2026-11-26', '2026-11-27'],
-      ['summer, 00.30 Danish time', '2026-06-30T22:30:00Z', '2026-07-01', '2026-07-02'],
-      ['summer, 01.59 Danish time', '2026-06-30T23:59:59Z', '2026-07-01', '2026-07-02'],
+    // Vipps MobilePay: a ledger date runs from midnight to midnight in the sales unit's time zone. The server does not
+    // know that zone, so it asks for a date from the moment it has begun in the market furthest ahead (Finland): a Danish
+    // sales unit's new day is then read from its own midnight, and no date is asked for more than two hours early.
+    for (const [moment, now, lastBegun] of [
+      ['winter, 22.30 in Denmark: the day has not begun anywhere', '2026-11-25T21:30:00Z', '2026-11-25'],
+      ['winter, 23.30 in Denmark: the day has begun in Finland', '2026-11-25T22:30:00Z', '2026-11-26'],
+      ['winter, 00.30 in Denmark: the Danish day has begun, UTC is on the day before', '2026-11-25T23:30:00Z', '2026-11-26'],
+      ['summer, 22.30 in Denmark: the day has not begun anywhere', '2026-06-30T20:30:00Z', '2026-06-30'],
+      ['summer, 23.30 in Denmark: the day has begun in Finland', '2026-06-30T21:30:00Z', '2026-07-01'],
+      ['summer, 00.30 in Denmark: the Danish day has begun, UTC is on the day before', '2026-06-30T22:30:00Z', '2026-07-01'],
+      ['summer, 01.59 in Denmark', '2026-06-30T23:59:59Z', '2026-07-01'],
     ] as const) {
-      it(`reads the day that has just begun in Denmark, although UTC is still on the day before (${season})`, async () => {
-        const before = new Date(Date.parse(`${today}T00:00:00Z`) - 86_400_000).toISOString().slice(0, 10);
+      it(`reads up to the date that has begun, and not the one after (${moment})`, async () => {
+        const shift = (date: string, days: number) => new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+        const before = shift(lastBegun, -1);
+        const after = shift(lastBegun, 1);
+        expect(lastBegunLedgerDate(Date.parse(now))).toBe(lastBegun);
         const { gw, calls } = gateway(
-          { [day(before)]: closed(before, 10_000), [day(today)]: open(today, [2_500]), [day(after)]: refused },
+          { [day(before)]: closed(before, 10_000), [day(lastBegun)]: open(lastBegun, [2_500]), [day(after)]: refused },
           { now: () => Date.parse(now) },
         );
         const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: before, toDate: after });
         expect(result.isError).toBeUndefined();
-        expect(result.structuredContent).toMatchObject({ readFrom: before, readTo: today, openDates: [today], futureDates: [after], count: 2 });
-        expect(asked(calls)).toEqual([before, today]);
+        expect(result.structuredContent).toMatchObject({ readFrom: before, readTo: lastBegun, openDates: [lastBegun], futureDates: [after], count: 2 });
+        expect(asked(calls)).toEqual([before, lastBegun]);
       });
     }
 
-    it('asks for tomorrow just before Danish midnight too, and takes a refusal of it as "not come yet", not as a failure', async () => {
-      // 23.59 Danish time on 25 November: tomorrow's date starts within 24 hours. Whether Vipps MobilePay answers for it
-      // or refuses it is not documented (the 24 hours' clock is not stated), so both must give a true answer.
-      const now = () => Date.parse('2026-11-25T22:59:00Z');
-      const range = { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-26' };
-
-      const answered = gateway({ [day('2026-11-24')]: closed('2026-11-24', 30_000), [day('2026-11-25')]: open('2026-11-25', [12_500]), [day('2026-11-26')]: open('2026-11-26') }, { now });
-      const first = await answered.gw.callTool('get_funds_summary', range);
-      expect(first.structuredContent).toMatchObject({ readTo: '2026-11-26', openDates: ['2026-11-25', '2026-11-26'], futureDates: [], period: { entries: 2 } });
-
-      const refusing = gateway({ [day('2026-11-24')]: closed('2026-11-24', 30_000), [day('2026-11-25')]: open('2026-11-25', [12_500]), [day('2026-11-26')]: refused }, { now });
-      const second = await refusing.gw.callTool('get_funds_summary', range);
-      expect(second.isError).toBeUndefined();
-      expect(second.structuredContent).toMatchObject({
-        readFrom: '2026-11-24',
-        readTo: '2026-11-25',
-        complete: false,
-        openDates: ['2026-11-25'],
-        futureDates: ['2026-11-26'],
-        period: { entries: 2, totalsByEntryType: { capture: 42_500 } },
-      });
-      expect(asked(refusing.calls)).toEqual(['2026-11-24', '2026-11-25', '2026-11-26']);
+    it('follows the calendar over a year end and a change to and from summer time', () => {
+      expect(lastBegunLedgerDate(Date.parse('2026-12-31T21:59:59Z'))).toBe('2026-12-31');
+      expect(lastBegunLedgerDate(Date.parse('2026-12-31T22:00:00Z'))).toBe('2027-01-01');
+      // Summer time begins 29 March 2026 and ends 25 October 2026.
+      expect(lastBegunLedgerDate(Date.parse('2026-03-29T20:59:59Z'))).toBe('2026-03-29');
+      expect(lastBegunLedgerDate(Date.parse('2026-03-29T21:00:00Z'))).toBe('2026-03-30');
+      expect(lastBegunLedgerDate(Date.parse('2026-10-25T21:59:59Z'))).toBe('2026-10-25');
+      expect(lastBegunLedgerDate(Date.parse('2026-10-25T22:00:00Z'))).toBe('2026-10-26');
     });
 
-    it('still fails when Vipps MobilePay refuses a date that has come: that is not a future date', async () => {
-      const { gw } = gateway({ [day('2026-11-24')]: refused }, { now: midday });
+    it('fails when Vipps MobilePay refuses a date that was asked for: no refusal is taken to mean "not come yet"', async () => {
       for (const tool of ['list_transactions', 'get_funds_summary']) {
-        const result = await gw.callTool(tool, { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-25' });
+        // The newest date asked for is refused, after a date that was read.
+        const { gw, calls } = gateway({ [day('2026-11-24')]: closed('2026-11-24', 1), [day('2026-11-25')]: refused }, { now: midday });
+        const result = await gw.callTool(tool, { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-26' });
+        expect(result.isError, tool).toBe(true);
+        // No sum or list of the part that was read, and no "the period has not begun".
+        expect(result.structuredContent, tool).toBeUndefined();
+        expect(texts(result).join(' '), tool).not.toContain('future');
+        expect(texts(result).join(' '), tool).not.toContain('not begun');
+        expect(asked(calls), tool).toEqual(['2026-11-24', '2026-11-25']);
+      }
+    });
+
+    it('fails when the request for access is refused, also with HTTP 400: that is never a date that has not come', async () => {
+      const noAccess = { status: 400, body: { error: 'invalid_client' } };
+      for (const tool of ['list_transactions', 'get_funds_summary']) {
+        for (const range of [
+          { fromDate: '2026-11-25', toDate: '2026-11-25' },
+          { fromDate: '2026-11-24', toDate: '2026-11-27' },
+        ]) {
+          const { gw, calls } = gateway({ ...routes, 'POST /accesstoken/get': noAccess }, { now: midday });
+          const result = await gw.callTool(tool, { ledgerId: LEDGER, ...range });
+          expect(result.isError, tool).toBe(true);
+          expect(result.structuredContent, tool).toBeUndefined();
+          expect(texts(result).join(' '), tool).not.toContain('future');
+          expect(texts(result).join(' '), tool).not.toContain('not begun');
+          // No report request was sent without access.
+          expect(apiCalls(calls), tool).toHaveLength(0);
+        }
+      }
+    });
+
+    it('fails when access cannot be renewed in the middle of a period, instead of summing the days read so far', async () => {
+      for (const tool of ['list_transactions', 'get_funds_summary']) {
+        let tokenRequests = 0;
+        const { gw, calls } = gateway(
+          {
+            ...routes,
+            // The first request for access is answered; the renewal is refused with HTTP 400.
+            'POST /accesstoken/get': () =>
+              ++tokenRequests === 1 ? { body: { token_type: 'Bearer', expires_in: '3600', access_token: TOKEN } } : { status: 400, body: { error: 'invalid_client' } },
+            // The access stops working after the first two days: Vipps MobilePay answers 401, and the client asks for a new one.
+            [day('2026-11-25')]: () => ({ status: 401, body: { title: 'Unauthorized' } }),
+          },
+          { now: midday },
+        );
+        const result = await gw.callTool(tool, period);
         expect(result.isError, tool).toBe(true);
         expect(result.structuredContent, tool).toBeUndefined();
+        expect(texts(result).join(' '), tool).not.toContain('future');
+        expect(tokenRequests, tool).toBe(2);
+        expect(asked(calls), tool).toEqual(['2026-11-23', '2026-11-24', '2026-11-25']);
       }
-      // A later page of tomorrow's date refused is a failure as well: the first page was answered, so the date has come.
-      const laterPage = gateway(
-        {
-          [day('2026-11-25')]: closed('2026-11-25', 1),
-          [day('2026-11-26')]: (url: URL): Reply =>
-            url.searchParams.get('cursor') ? refused() : { body: { items: [entry({ ledgerDate: '2026-11-26' })], hasMore: true, tryLater: true, cursor: '1' } },
-        },
-        { now: midday },
-      );
-      expect((await laterPage.gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-25', toDate: '2026-11-26' })).isError).toBe(true);
-      // Today's date in UTC refused is a failure too: only a date after today can be "not come yet".
-      const today = gateway({ [day('2026-11-24')]: closed('2026-11-24', 1), [day('2026-11-25')]: refused }, { now: midday });
-      expect((await today.gw.callTool('get_funds_summary', { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-25' })).isError).toBe(true);
-    });
-
-    it("asks for tomorrow's date in UTC and no later", () => {
-      expect(lastAskableLedgerDate(Date.parse('2026-11-25T00:00:00Z'))).toBe('2026-11-26');
-      expect(lastAskableLedgerDate(Date.parse('2026-11-25T23:59:59Z'))).toBe('2026-11-26');
-      expect(lastAskableLedgerDate(Date.parse('2026-12-31T23:30:00Z'))).toBe('2027-01-01');
     });
   });
 

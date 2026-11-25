@@ -10,11 +10,14 @@
 - `list_transactions` and `get_funds_summary` no longer fail for a period that
   reaches past today, such as the current month. Vipps MobilePay answers HTTP
   400 for a ledger date more than 24 hours ahead, which made the whole call
-  fail. Dates after tomorrow (UTC) are not requested, and tomorrow's date is
-  taken as not come yet when Vipps MobilePay refuses it. The days that have
-  been are returned, and the answer says that it is cut:
-  - `futureDates` lists the dates that were not read because they have not
-    come yet. They are no longer mixed into `openDates`, which holds only
+  fail. A date is requested only when it has begun in the market furthest
+  ahead (Finland's time zone), so no request is ever more than two hours
+  early for any sales unit, and a sales unit's own day is read from its own
+  midnight. A refusal of a date that was requested is an error, as is every
+  failure to get access. The days that have been are returned, and the answer
+  says that it is cut:
+  - `futureDates` lists the dates that were not requested because they have
+    not begun. They are no longer mixed into `openDates`, which holds only
     dates that were read and are not closed.
   - `readFrom` and `readTo` are the first and last date actually read (`null`
     when none was); `fromDate` and `toDate` are still the period asked for.

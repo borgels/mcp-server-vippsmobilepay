@@ -1,5 +1,4 @@
 import { encodePathParam } from '../path-params.js';
-import { VippsHttpError } from '../errors.js';
 import type { UpstreamClient } from './client.js';
 import { datesBetween } from './values.js';
 
@@ -10,11 +9,12 @@ import { datesBetween } from './values.js';
  * call fails with our own text and returns nothing, rather than a list that
  * looks complete but is not. A ledger date that Vipps MobilePay has not closed
  * yet (`tryLater`) is named in the result, which then says it is incomplete;
- * every page it has so far is still read. A date that has not come yet is
- * not requested, because Vipps MobilePay answers HTTP 400 for a ledger date
- * more than 24 hours ahead and the whole period would fail with it. It is named
- * apart from the open dates (`futureDates`), the dates actually read are given
- * (`readFrom`, `readTo`), and `note` says in words what the answer lacks.
+ * every page it has so far is still read. A date that has not begun is not
+ * requested (lastBegunLedgerDate), because Vipps MobilePay answers HTTP 400
+ * for a ledger date more than 24 hours ahead and the whole period would fail
+ * with it. It is named apart from the open dates (`futureDates`), the dates
+ * actually read are given (`readFrom`, `readTo`), and `note` says in words
+ * what the answer lacks.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -121,23 +121,31 @@ async function readLedgerDate(
   }
 }
 
+/** The time zone furthest ahead among Vipps MobilePay's markets (Denmark, Finland, Norway and Sweden): Finland's. */
+const EARLIEST_MARKET_TIME_ZONE = 'Europe/Helsinki';
+
+const marketDate = new Intl.DateTimeFormat('en-GB', {
+  timeZone: EARLIEST_MARKET_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
 /**
- * The last ledger date worth asking for: tomorrow in UTC.
+ * The last ledger date that is asked for: the newest calendar date that has begun in any of Vipps MobilePay's
+ * markets.
  *
  * What Vipps MobilePay documents: "a ledger date lasts from midnight to midnight in the timezone of the merchant"
  * (it can be configured to another cutoff), and a `ledgerDate` "more than 24 hours in the future" is answered with
- * HTTP 400. It does not document from which moment or in which time zone the 24 hours are counted. Its markets are
- * ahead of UTC, so late in the evening UTC the sales unit's own day is already tomorrow's date in UTC and has
- * entries: tomorrow in UTC must be asked for. A date after that starts 24 hours or more from now by every clock,
- * and is not asked for. Because the limit's clock is not documented, a refusal (HTTP 400) of a date after today in
- * UTC is taken as "not come yet" as well, see readPeriod.
+ * HTTP 400. It does not say which clock the 24 hours follow, so nothing here depends on that: the server does not
+ * know the sales unit's time zone, but a date that has begun in Finland has begun, or begins within two hours, for
+ * every sales unit, which is far inside the 24 hours by any clock. No sales unit's own day is left out, also not
+ * just after its midnight, in summer or winter time. A later date is not asked for. Every refusal of a date that is
+ * asked for is an error; none is taken to mean "not come yet".
  */
-export function lastAskableLedgerDate(now: number): string {
-  return new Date(now + 86_400_000).toISOString().slice(0, 10);
-}
-
-function utcDate(now: number): string {
-  return new Date(now).toISOString().slice(0, 10);
+export function lastBegunLedgerDate(now: number): string {
+  const parts = Object.fromEntries(marketDate.formatToParts(new Date(now)).map(part => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 export interface PeriodInput {
@@ -152,13 +160,14 @@ interface PeriodReading {
   reports: DateReport[];
   /** Dates read that Vipps MobilePay has not closed yet: entries can still be added. */
   openDates: string[];
-  /** Dates not read because they have not come yet. They are never among the dates read. */
+  /** Dates not asked for because they have not begun. They are never among the dates read. */
   futureDates: string[];
 }
 
 /**
- * Every date of the period that has come, in order. A date that has not come yet is not asked for, and neither are
- * the dates after it. `onDate` runs after each date read, so a caller can refuse a period that is too large early.
+ * Every date of the period that has begun, in order. A date that has not begun is not asked for. `onDate` runs after
+ * each date read, so a caller can refuse a period that is too large early. An error from any request, the access
+ * request included, ends the reading: nothing read so far is returned.
  */
 async function readPeriod(
   client: UpstreamClient,
@@ -167,32 +176,14 @@ async function readPeriod(
   onDate?: (report: DateReport) => void,
 ): Promise<PeriodReading> {
   const budget = { pages: 0 };
-  const now = client.currentTime();
-  const today = utcDate(now);
-  const lastAskable = lastAskableLedgerDate(now);
+  const lastBegun = lastBegunLedgerDate(client.currentTime());
   const reading: PeriodReading = { reports: [], openDates: [], futureDates: [] };
-  let ahead = false;
   for (const date of datesBetween(input.fromDate, input.toDate)) {
-    if (ahead || date > lastAskable) {
-      ahead = true;
+    if (date > lastBegun) {
       reading.futureDates.push(date);
       continue;
     }
-    let report: DateReport;
-    const pagesBefore = budget.pages;
-    try {
-      report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
-    } catch (error) {
-      // Tomorrow's date in UTC, its first page refused as a bad request: Vipps MobilePay counts it as too far ahead.
-      // Of what it documents as answered with HTTP 400, only the date is left: the ledger id is digits by the input
-      // check, the topic is one of two fixed words, the date is a real date, and no cursor was sent.
-      if (error instanceof VippsHttpError && error.status === 400 && date > today && budget.pages === pagesBefore + 1) {
-        ahead = true;
-        reading.futureDates.push(date);
-        continue;
-      }
-      throw error;
-    }
+    const report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
     reading.reports.push(report);
     if (report.open) reading.openDates.push(date);
     onDate?.(report);
