@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { VippsHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
+import { VippsHttpError, failureMetadata, formatUnknownError, redactDeep, redactSecrets, type FailureMetadata, type SecretRedactor } from '../errors.js';
 import { STDERR_WITHHELD, withheldAuditRecord } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import { ConfigError, readEnvString } from '../config-env.js';
@@ -26,18 +26,21 @@ export interface AuditEvent {
 const MAX_AUDIT_MESSAGE_LENGTH = 200;
 
 /**
- * Error summary for the audit log: the HTTP status, or this server's own
- * message, redacted before it is shortened. Nothing the upstream controls
- * (body, error code, message) is logged: it can quote input or part of the key.
+ * Error summary for the audit log: for an HTTP error the failure metadata (method, path template, status, request
+ * id, Vipps MobilePay's error code and trace id, each in its fixed form), or this server's own message, redacted
+ * before it is shortened. Nothing else the upstream controls (body, message) is logged: it can quote input or part of
+ * the key.
  */
 export function auditErrorSummary(
   error: unknown,
   redactor?: SecretRedactor,
-): { httpStatus?: number; message: string } {
+): { httpStatus?: number; message: string; failure?: Omit<FailureMetadata, 'httpStatus'> } {
   if (error instanceof VippsHttpError) {
+    const { httpStatus: _status, ...failure } = failureMetadata(error) ?? { httpStatus: error.status };
     return {
       httpStatus: error.status,
       message: `Vipps MobilePay API request failed with HTTP ${error.status}`,
+      ...(Object.keys(failure).length > 0 ? { failure } : {}),
     };
   }
   const message = formatUnknownError(error, redactor);
@@ -147,7 +150,7 @@ export async function writeAuditEvent(
 }
 
 function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
-  return { httpStatus: summary.httpStatus, error: summary.message };
+  return { httpStatus: summary.httpStatus, error: summary.message, ...(summary.failure ?? {}) };
 }
 
 /**

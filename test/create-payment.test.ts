@@ -850,7 +850,7 @@ describe('the second call of create_payment', () => {
     expect(seen.first.isError).toBeUndefined();
     expect(seen.second.isError).toBe(true);
     expect(texts(seen.second)[0]).toMatch(CONFLICT);
-    expect(seen.second.failure).toEqual({ httpStatus: 409 });
+    expect(seen.second.failure).toEqual({ httpStatus: 409, method: 'POST', pathTemplate: '/epayment/v1/payments' });
     expect(seen.second.structuredContent).toBeUndefined();
     // Another key was sent, and the payment is the first call's, untouched.
     expect(new Set(keysOf(seen.calls)).size).toBe(2);
@@ -1103,7 +1103,7 @@ describe('the second call of create_payment', () => {
     expect(data(await gw.callTool('create_payment', byPhone))).toMatchObject({ created: false, alreadyExists: true, state: 'CREATED' });
     const other = await gw.callTool('create_payment', { ...byPhone, phoneNumber: OTHER_PHONE });
     expect(texts(other)[0]).toMatch(CONFLICT);
-    expect(other.failure).toEqual({ httpStatus: 400 });
+    expect(other.failure).toEqual({ httpStatus: 400, method: 'POST', pathTemplate: '/epayment/v1/payments' });
     expect(vendor.payments.size).toBe(1);
   });
 
