@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Webhook registration for an embedding host: `registerPaymentEvents`,
+  `listWebhooks` and `removeWebhook` on a gateway instance, and
+  `VIPPS_PAYMENT_EVENTS`. The host registers its own https address for the
+  sales unit's ePayment events and gets the registration's id and signing
+  secret back, once. Host functions only, never tools. The fixed request list
+  gains `GET` and `POST /webhooks/v1/webhooks` and
+  `DELETE /webhooks/v1/webhooks/{id}`; an answer that cannot be used is never
+  quoted, since it may hold the secret. The answer's `secret` is masked by the
+  instance the moment the answer arrives, also when the answer is then
+  refused; when `secret` is not one text, every text anywhere in the answer is
+  masked, without a cap on count or depth, and the answer is refused. If
+  that masking cannot finish, the instance withholds every later host value
+  and tool result. The secret is given on only when it shares nothing
+  with a secret the instance already knows (its keys, access tokens and earlier
+  registration secrets, compared piece by piece for every one of them), or is
+  exactly an earlier registration's; an id that
+  holds a secret is withheld. The address must be https on a public host
+  name: IP literals, single labels, non-default ports, fragments and local or
+  internal names are refused before anything is sent (by the name's form,
+  without a DNS lookup). Every value a host function returns goes through the
+  same redaction and leak check as a tool result. The events are sent sorted,
+  so the same set always gives the same request and operation key.
+
 ## 0.8.0
 
 - All four `Vipps-System-*` headers are sent on every request, as Vipps

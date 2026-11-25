@@ -13,6 +13,15 @@ import {
   type InstancePolicy,
 } from './vipps/policy.js';
 import { ConfigError } from './config-env.js';
+import {
+  listWebhooks,
+  PAYMENT_EVENTS,
+  registerPaymentEvents,
+  removeWebhook,
+  type PaymentEvent,
+  type Webhook,
+  type WebhookRegistration,
+} from './vipps/webhooks.js';
 import { failureInForm, failureMetadata, formatUnknownError, redactDeep, SecretRedactor, type FailureMetadata } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
@@ -59,6 +68,9 @@ import {
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
 export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
 export type { VippsChangeAction, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
+export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
+/** The ePayment events a host can register its address for (registerPaymentEvents). */
+export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -404,6 +416,40 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
+  /**
+   * Set when a registration answer could not be masked in full (seen() was told it is incomplete, or masking itself
+   * threw): from then on this instance gives nothing more on, neither a host value nor a tool result, since what it
+   * would give could carry a secret it does not know. A new instance (new keys from the host) starts clean.
+   */
+  let withholdAll = false;
+  /** The registration secrets this instance has given on: the same one again is a repeat, not a leak. */
+  const givenSigningValues = new Set<string>();
+  /**
+   * What a host function returns, as a tool result is returned: with this instance's secrets redacted everywhere, then
+   * the sink check. A value that still holds a piece of a secret is withheld whole, as a failure in our own words.
+   */
+  const guarded = <T>(value: T): T => {
+    if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+    if (value === undefined) return value;
+    const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(value, redactor), redactor))) as T;
+    if (leaksSecret(final, redactor)) throw new Error(HOST_ANSWER_WITHHELD);
+    return final;
+  };
+  /**
+   * Every host function goes through here: its value through `guarded`, its failure as our own text, redacted, without
+   * the cause. Nothing a host function returns or throws skips either.
+   */
+  const hostCall = async <T>(work: () => Promise<T>, after?: (value: T) => void, guard = true): Promise<T> => {
+    try {
+      const raw = await underPolicy(work);
+      const value = guard ? guarded(raw) : raw;
+      after?.(value);
+      return value;
+    } catch (error) {
+      // Once the instance withholds everything, its failures say nothing but that.
+      throw sealedError(new Error(withholdAll ? HOST_ANSWER_WITHHELD : formatUnknownError(error, redactor)));
+    }
+  };
 
   return {
     /** Tools offered on this instance: not disabled or outside allowedTools, and usable with its keys. */
@@ -413,11 +459,68 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     /** The environment and key type of this instance. */
     environment: client.environment,
     keyType: client.keyType,
+    /**
+     * Host only, never a tool: register `address` (https, the host's own) for this sales unit's ePayment `events`.
+     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here, only
+     * when it shares nothing with a secret the instance already knows (or is exactly an earlier registration's), and
+     * the instance masks it from the moment the answer arrives, also when the answer is then refused. Registering the same address and set of events again sends the same operation
+     * key (Vipps MobilePay does not document it for this API).
+     */
+    registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
+      // The secret is the one value given on unmasked, because it is what the host asked for, and only when it is new to
+      // this instance's keys: one that shares a piece with a key is withheld (it may be an echo of the key). The same
+      // secret as an earlier registration of this instance is a repeat and goes on. It is masked from here on, before
+      // the rest of the answer is checked, so an id that holds it is withheld too; and from then on everywhere: every
+      // later error, failure metadata, result, host value and audit record.
+      return hostCall(async () => {
+        // Whether the value may be given on is decided against every secret the instance knows (its keys, the access
+        // tokens it has had, the registration secrets before this one), before the value itself is added; then every
+        // text in the field is masked from here on, whatever becomes of the answer. The one exception is the exact value
+        // of an earlier registration of this instance: a repeat.
+        let mayGiveOn = false;
+        const registration = await underPolicy(() =>
+          registerPaymentEvents(client, address, events, signing => {
+            try {
+              if (signing.incomplete) withholdAll = true;
+              const value = signing.value;
+              mayGiveOn = value !== undefined && (givenSigningValues.has(value) || !redactor.sharesWith(value));
+              for (const text of signing.texts) redactor.addSecret(text);
+            } catch (error) {
+              // Masking that did not finish: nothing more leaves this instance.
+              withholdAll = true;
+              mayGiveOn = false;
+              throw error;
+            }
+          }),
+        );
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+        if (!mayGiveOn) throw new Error(HOST_ANSWER_WITHHELD);
+        givenSigningValues.add(registration.secret);
+        // The rest of the answer, the id, as any other value the instance returns: one that holds a secret or a piece of
+        // one (by the redactor, as for a tool result) is withheld. The stricter sharesWith is for the value given on
+        // unmasked only; an id is not given on unmasked.
+        const { id } = guarded({ id: registration.id });
+        if (id !== registration.id || redactor.matches(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
+        return { id, secret: registration.secret };
+      }, undefined, false);
+    },
+    /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
+    listWebhooks(): Promise<Webhook[]> {
+      return hostCall(() => listWebhooks(client));
+    },
+    /** Host only, never a tool: remove one registration by its id. */
+    removeWebhook(id: string): Promise<void> {
+      return hostCall(async () => {
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+        await removeWebhook(client, id);
+      });
+    },
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.
       return underPolicy(() =>
         runCall(toolName, input, context).then(result => {
+          if (withholdAll) return withheldResult();
           const final = withFailureInForm(
             JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult,
           );
@@ -458,6 +561,9 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     }
   }
 }
+
+/** A host function's value that held a piece of a secret after redaction: withheld whole. */
+const HOST_ANSWER_WITHHELD = 'The answer from Vipps MobilePay was withheld: it held a piece of a key of this instance.';
 
 /** One gateway instance, as returned by createVippsMobilePayGateway. */
 export type VippsMobilePayGateway = ReturnType<typeof createVippsMobilePayGateway>;

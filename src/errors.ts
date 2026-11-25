@@ -148,6 +148,23 @@ export class SecretRedactor {
     return this.secrets.has(value);
   }
 
+  /**
+   * Whether the text shares anything with any secret of this instance, for deciding whether a new value may be given on:
+   * any piece of FRAGMENT_LENGTH characters of the text that is also in a secret, in any form, whether the secret was
+   * added whole and in pieces (a key) or whole only (an access token). Stricter than `matches`, which leaves the pieces
+   * of an exact-only secret alone because they are common in other text; here a false positive only withholds a value.
+   */
+  sharesWith(text: string): boolean {
+    if (this.matches(text)) return true;
+    for (const secret of this.secrets) {
+      if (secret.includes(text) || text.includes(secret)) return true;
+      for (let i = 0; i + FRAGMENT_LENGTH <= text.length; i += 1) {
+        if (secret.includes(text.slice(i, i + FRAGMENT_LENGTH))) return true;
+      }
+    }
+    return false;
+  }
+
   /** Whether the text contains one of the secrets in any form, or any FRAGMENT_LENGTH-character piece of one. */
   matches(text: string): boolean {
     for (const secret of this.secrets) {
