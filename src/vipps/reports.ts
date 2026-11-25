@@ -8,7 +8,8 @@ import { datesBetween } from './values.js';
  * Every list is read to its end or refused: when a cap below is reached, the
  * call fails with our own text and returns nothing, rather than a list that
  * looks complete but is not. A ledger date that Vipps MobilePay has not closed
- * yet (`tryLater`) is named in the result, which then says it is incomplete.
+ * yet (`tryLater`) is named in the result, which then says it is incomplete;
+ * every page it has so far is still read.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -79,7 +80,11 @@ interface DateReport {
   items: Array<Record<string, unknown>>;
 }
 
-/** Every entry of one ledger date, following the cursor while hasMore is true. */
+/**
+ * Every entry of one ledger date, following the cursor while hasMore is true. tryLater says only that the date is
+ * still open; it does not end the pages that exist now. Vipps MobilePay: "If hasMore and tryLater are both true,
+ * do not wait: keep paging with the returned cursor."
+ */
 async function readLedgerDate(
   client: UpstreamClient,
   ledgerId: string,
@@ -90,6 +95,7 @@ async function readLedgerDate(
   const path = `/report/v2/ledgers/${encodePathParam(ledgerId, 'ledgerId')}/${topic}/dates/${encodePathParam(ledgerDate, 'ledgerDate')}`;
   const items: Array<Record<string, unknown>> = [];
   let cursor: string | undefined;
+  let open = false;
   for (;;) {
     budget.pages += 1;
     if (budget.pages > MAX_REPORT_PAGES) {
@@ -100,11 +106,9 @@ async function readLedgerDate(
     const body = asRecord(await client.get(path, cursor ? { cursor } : undefined));
     if (!Array.isArray(body.items)) throw unexpected('a report');
     items.push(...body.items.map(asRecord));
-    if (body.tryLater === true) {
-      return { ledgerDate, open: true, items };
-    }
+    if (body.tryLater === true) open = true;
     if (body.hasMore !== true) {
-      return { ledgerDate, open: false, items };
+      return { ledgerDate, open, items };
     }
     const next = typeof body.cursor === 'string' ? body.cursor : '';
     if (!next || next === cursor) throw unexpected('a report (more pages without a new cursor)');
