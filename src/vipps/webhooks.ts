@@ -120,7 +120,8 @@ function allTexts(value: unknown): string[] {
   while (stack.length > 0) {
     const item = stack.pop();
     if (typeof item === 'string') out.push(item);
-    else if (Array.isArray(item)) stack.push(...item);
+    // One by one: spreading a wide array into push() would exceed the engine's argument limit.
+    else if (Array.isArray(item)) for (const entry of item) stack.push(entry);
     else if (item !== null && typeof item === 'object') {
       for (const [key, entry] of Object.entries(item as Record<string, unknown>)) {
         out.push(key);
@@ -140,6 +141,11 @@ export interface SigningValueSeen {
    * answer, since where the secret stands is then not known. Such an answer is refused.
    */
   readonly texts: readonly string[];
+  /**
+   * True when the texts could not all be collected (the walk itself failed): what the answer holds is then not known to
+   * be masked, and the instance must give nothing more on.
+   */
+  readonly incomplete?: true;
 }
 
 /**
@@ -158,7 +164,19 @@ export async function registerPaymentEvents(
   const answer = await client.post<unknown>(WEBHOOKS_PATH, { url, events: chosen }, { idempotencyKey: operationKey('register', url, ...chosen) });
   const record = answer !== null && typeof answer === 'object' ? (answer as Record<string, unknown>) : {};
   const { id, secret } = record;
-  seen(typeof secret === 'string' ? { value: secret, texts: [secret] } : { value: undefined, texts: allTexts(answer) });
+  if (typeof secret === 'string') {
+    seen({ value: secret, texts: [secret] });
+  } else {
+    let texts: string[];
+    try {
+      texts = allTexts(answer);
+    } catch {
+      // Fail closed: the instance is told, and withholds everything from here on.
+      seen({ value: undefined, texts: [], incomplete: true });
+      throw new Error('Vipps MobilePay answered the registration in an unexpected form.');
+    }
+    seen({ value: undefined, texts });
+  }
   if (typeof id !== 'string' || !WEBHOOK_ID.test(id) || typeof secret !== 'string' || !SECRET.test(secret)) {
     // Never quoted: the answer may hold the secret.
     throw new Error('Vipps MobilePay answered the registration in an unexpected form.');

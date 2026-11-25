@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { VIPPS_PAYMENT_EVENTS, vippsGatewayTools, type GatewayJsonObject } from '../src/gateway.js';
 import { isAllowedRequest } from '../src/vipps/client.js';
 import { apiCalls, fakeToken, gateway, KEYS, payment, TOKEN } from './helpers.js';
@@ -392,5 +392,61 @@ describe('a registration secret that is or holds another secret of the instance'
     const gw = register([{ id: REGISTRATION_ID, secret: FIRST }, { id: REGISTRATION_ID, secret: FIRST }]);
     expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);
     expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);
+  });
+});
+
+describe('a wide or odd registration answer never stops the masking', () => {
+  const S = 'Pw3_Xs8-Ld5_Gk1-Mv7_Bn2';
+  const later = (gw: ReturnType<typeof gateway>['gw']) =>
+    Promise.all([
+      gw.listWebhooks().catch((e: unknown) => String(e)),
+      gw.callTool('get_payment', { reference: 'fjord-order-10042' }),
+      gw.removeWebhook(REGISTRATION_ID).catch((e: unknown) => String(e)),
+    ]).then(values => JSON.stringify(values));
+  const routes = (answer: unknown) => ({
+    'POST /webhooks/v1/webhooks': { body: answer },
+    'GET /webhooks/v1/webhooks': { body: { webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${S}`, events: [S] }] } },
+    'GET /epayment/v1/payments/fjord-order-10042': { headers: { 'x-request-id': S }, body: payment({ reference: S, pspReference: S }) },
+    'GET /epayment/v1/payments/fjord-order-10042/events': { body: [] },
+    'DELETE /webhooks/v1/webhooks/reg-fjord-one': { status: 500, headers: { 'x-request-id': S } },
+  });
+
+  it.each([
+    ['200 000 empty places before it', () => ({ id: REGISTRATION_ID, secret: [...Array.from({ length: 200_000 }, () => null), S] })],
+    ['a wide array of texts around it', () => ({ id: REGISTRATION_ID, secret: [...Array.from({ length: 150_000 }, (_, i) => `n${i}`), S] })],
+    ['a wide array outside the secret field', () => ({ id: REGISTRATION_ID, list: [...Array.from({ length: 200_000 }, () => 0), { s: S }] })],
+  ])('masks the secret after %s', async (_name, answer) => {
+    const { gw } = gateway(routes(answer()));
+    await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow();
+    const text = await later(gw);
+    expect(text).not.toContain(S);
+    expect(text).not.toContain(S.slice(4, 16));
+  }, 30_000);
+});
+
+describe('when the masking itself fails', () => {
+  it('withholds every later result and value of the instance', async () => {
+    const S = 'Yt4_Ku9-Fr6_Je3-Wd8_Qc5';
+    const { gw } = gateway({
+      'POST /webhooks/v1/webhooks': { body: { id: REGISTRATION_ID } },
+      'GET /webhooks/v1/webhooks': { body: { webhooks: [{ id: REGISTRATION_ID, url: `${ADDRESS}?${S}`, events: [] }] } },
+      'GET /epayment/v1/payments/fjord-order-10042': { body: payment({ reference: S }) },
+      'GET /epayment/v1/payments/fjord-order-10042/events': { body: [] },
+    });
+    // A walk over an answer that fails cannot come from JSON the stub can send, so the module reports it as it would.
+    const webhooks = await import('../src/vipps/webhooks.js');
+    const spy = vi.spyOn(webhooks, 'registerPaymentEvents').mockImplementation(async (_c, _a, _e, seen) => {
+      seen?.({ value: undefined, texts: [], incomplete: true });
+      throw new Error('Vipps MobilePay answered the registration in an unexpected form.');
+    });
+    try {
+      await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow(/withheld/);
+      expect(await gw.callTool('get_payment', { reference: 'fjord-order-10042' })).toMatchObject({ isError: true });
+      await expect(gw.listWebhooks()).rejects.toThrow(/withheld/);
+      await expect(gw.removeWebhook(REGISTRATION_ID)).rejects.toThrow(/withheld/);
+      expect(JSON.stringify(await gw.callTool('get_payment', { reference: 'fjord-order-10042' }))).not.toContain(S);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

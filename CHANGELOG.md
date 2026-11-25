@@ -12,7 +12,9 @@
   quoted, since it may hold the secret. The answer's `secret` is masked by the
   instance the moment the answer arrives, also when the answer is then
   refused; when `secret` is not one text, every text anywhere in the answer is
-  masked, without a cap on count or depth, and the answer is refused. The secret is given on only when it shares nothing
+  masked, without a cap on count or depth, and the answer is refused. If
+  that masking cannot finish, the instance withholds every later host value
+  and tool result. The secret is given on only when it shares nothing
   with a secret the instance already knows (its keys, access tokens and earlier
   registration secrets, compared piece by piece for every one of them), or is
   exactly an earlier registration's; an id that

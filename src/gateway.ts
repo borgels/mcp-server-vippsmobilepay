@@ -416,6 +416,12 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
+  /**
+   * Set when a registration answer could not be masked in full (seen() was told it is incomplete, or masking itself
+   * threw): from then on this instance gives nothing more on, neither a host value nor a tool result, since what it
+   * would give could carry a secret it does not know. A new instance (new keys from the host) starts clean.
+   */
+  let withholdAll = false;
   /** The registration secrets this instance has given on: the same one again is a repeat, not a leak. */
   const givenSigningValues = new Set<string>();
   /**
@@ -423,6 +429,7 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
    * the sink check. A value that still holds a piece of a secret is withheld whole, as a failure in our own words.
    */
   const guarded = <T>(value: T): T => {
+    if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
     if (value === undefined) return value;
     const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(value, redactor), redactor))) as T;
     if (leaksSecret(final, redactor)) throw new Error(HOST_ANSWER_WITHHELD);
@@ -439,7 +446,8 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       after?.(value);
       return value;
     } catch (error) {
-      throw sealedError(new Error(formatUnknownError(error, redactor)));
+      // Once the instance withholds everything, its failures say nothing but that.
+      throw sealedError(new Error(withholdAll ? HOST_ANSWER_WITHHELD : formatUnknownError(error, redactor)));
     }
   };
 
@@ -472,11 +480,20 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
         let mayGiveOn = false;
         const registration = await underPolicy(() =>
           registerPaymentEvents(client, address, events, signing => {
-            const value = signing.value;
-            mayGiveOn = value !== undefined && (givenSigningValues.has(value) || !redactor.sharesWith(value));
-            for (const text of signing.texts) redactor.addSecret(text);
+            try {
+              if (signing.incomplete) withholdAll = true;
+              const value = signing.value;
+              mayGiveOn = value !== undefined && (givenSigningValues.has(value) || !redactor.sharesWith(value));
+              for (const text of signing.texts) redactor.addSecret(text);
+            } catch (error) {
+              // Masking that did not finish: nothing more leaves this instance.
+              withholdAll = true;
+              mayGiveOn = false;
+              throw error;
+            }
           }),
         );
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
         if (!mayGiveOn) throw new Error(HOST_ANSWER_WITHHELD);
         givenSigningValues.add(registration.secret);
         // The rest of the answer, the id, as any other value the instance returns: one that holds a secret or a piece of
@@ -493,13 +510,17 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     },
     /** Host only, never a tool: remove one registration by its id. */
     removeWebhook(id: string): Promise<void> {
-      return hostCall(() => removeWebhook(client, id));
+      return hostCall(async () => {
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+        await removeWebhook(client, id);
+      });
     },
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.
       return underPolicy(() =>
         runCall(toolName, input, context).then(result => {
+          if (withholdAll) return withheldResult();
           const final = withFailureInForm(
             JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult,
           );

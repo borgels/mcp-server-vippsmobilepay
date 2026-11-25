@@ -733,9 +733,9 @@ function causeCodes(cause: unknown, depth = 0): string[] {
   const { code, errors, cause: inner } = cause as { code?: unknown; errors?: unknown; cause?: unknown };
   if (typeof code === 'string') codes.push(code);
   if (Array.isArray(errors)) {
-    for (const entry of errors) codes.push(...causeCodes(entry, depth + 1));
+    for (const entry of errors) for (const code of causeCodes(entry, depth + 1)) codes.push(code);
   }
-  codes.push(...causeCodes(inner, depth + 1));
+  for (const code of causeCodes(inner, depth + 1)) codes.push(code);
   return codes;
 }
 
