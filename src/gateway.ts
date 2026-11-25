@@ -479,9 +479,11 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
         );
         if (!mayGiveOn) throw new Error(HOST_ANSWER_WITHHELD);
         givenSigningValues.add(registration.secret);
-        // The rest of the answer, the id, as any other value: one that holds or shares a piece of a secret is withheld.
+        // The rest of the answer, the id, as any other value the instance returns: one that holds a secret or a piece of
+        // one (by the redactor, as for a tool result) is withheld. The stricter sharesWith is for the value given on
+        // unmasked only; an id is not given on unmasked.
         const { id } = guarded({ id: registration.id });
-        if (id !== registration.id || redactor.sharesWith(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
+        if (id !== registration.id || redactor.matches(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
         return { id, secret: registration.secret };
       }, undefined, false);
     },

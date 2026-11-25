@@ -326,6 +326,10 @@ describe('a registration answer, refused or not, never lets its secret out later
     ['a secret too short to be one', { id: REGISTRATION_ID, secret: S.slice(0, 12) }],
     ['the secret inside a list', { id: REGISTRATION_ID, secret: [S] }],
     ['the secret inside an object', { id: REGISTRATION_ID, secret: { value: S } }],
+    ['the secret after 64 other texts', { id: REGISTRATION_ID, secret: [...Array.from({ length: 64 }, () => 'x'.repeat(9)), S] }],
+    ['the secret 40 levels deep', { id: REGISTRATION_ID, secret: Array.from({ length: 40 }).reduce<unknown>(inner => ({ in: inner }), S) }],
+    ['the secret in another field, with no secret field', { id: REGISTRATION_ID, other: [{ deep: [S] }] }],
+    ['the secret as a key', { id: REGISTRATION_ID, secret: { [S]: true } }],
   ])('masks it when the answer is refused: %s', async (_name, answer) => {
     const { gw, records } = instance(answer);
     await expect(gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).rejects.toThrow();
@@ -358,6 +362,8 @@ describe('a registration secret that is or holds another secret of the instance'
     ['starts with', () => `${ISSUED_VALUE}-more`],
     ['holds', () => `pre-${ISSUED_VALUE}-post`],
     ['is a piece of', () => ISSUED_VALUE.slice(2, 18)],
+    ['wraps a piece of', () => `pre-${ISSUED_VALUE.slice(2, 18)}-post`],
+    ['wraps a short piece of', () => `zz-${ISSUED_VALUE.slice(5, 12)}-zzzzzzzzzz`],
   ])('withholds a secret that %s the access token', async (_how, secret) => {
     const gw = register([{ id: REGISTRATION_ID, secret: secret() }]);
     const error = await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1']).catch((e: unknown) => e as Error);
@@ -375,6 +381,7 @@ describe('a registration secret that is or holds another secret of the instance'
     ['starts with', `${FIRST}-and-more`],
     ['holds', `zz-${FIRST}-zz`],
     ['is a piece of', FIRST.slice(2, 18)],
+    ['wraps a piece of', `pre-${FIRST.slice(2, 18)}-post`],
   ])('withholds a new secret that %s an earlier registration secret', async (_how, secret) => {
     const gw = register([{ id: REGISTRATION_ID, secret: FIRST }, { id: 'reg-fjord-two', secret }]);
     expect((await gw.registerPaymentEvents(ADDRESS, ['epayments.payment.captured.v1'])).secret).toBe(FIRST);

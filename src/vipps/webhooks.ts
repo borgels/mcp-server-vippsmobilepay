@@ -109,24 +109,36 @@ function operationKey(...parts: string[]): string {
   return `wh-${createHash('sha256').update(parts.join('\n')).digest('base64url').replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`;
 }
 
-/** Every text in a value, to a fixed depth and count: what an answer holds wherever it holds it. */
-function textsIn(value: unknown, out: string[] = [], depth = 0): string[] {
-  if (out.length >= 64) return out;
-  if (typeof value === 'string') out.push(value);
-  else if (depth < 8 && value !== null && typeof value === 'object') {
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (!Array.isArray(value)) textsIn(key, out, depth + 1);
-      textsIn(item, out, depth + 1);
+/**
+ * Every text in a value, keys included, with no cap on count or depth: what an answer holds wherever it holds it. The
+ * answer is already bounded by the client's cap on a response's bytes (VIPPS_MAX_RESPONSE_BYTES), so nothing is cut off
+ * here. Walked with a stack, so a deep answer cannot exhaust the call stack.
+ */
+function allTexts(value: unknown): string[] {
+  const out: string[] = [];
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (typeof item === 'string') out.push(item);
+    else if (Array.isArray(item)) stack.push(...item);
+    else if (item !== null && typeof item === 'object') {
+      for (const [key, entry] of Object.entries(item as Record<string, unknown>)) {
+        out.push(key);
+        stack.push(entry);
+      }
     }
   }
   return out;
 }
 
-/** What a registration answer holds in its `secret` field, given to the host's instance before anything else is done. */
+/** What a registration answer holds, given to the host's instance before anything else is done with the answer. */
 export interface SigningValueSeen {
-  /** The field itself, when it is a text: the value the host may get. */
+  /** The `secret` field, when it is one text: the value the host may get. */
   readonly value: string | undefined;
-  /** Every text in the field, whatever its form, the value included. */
+  /**
+   * What the instance masks at once: the value, when `secret` is one text; otherwise every text anywhere in the whole
+   * answer, since where the secret stands is then not known. Such an answer is refused.
+   */
   readonly texts: readonly string[];
 }
 
@@ -146,7 +158,7 @@ export async function registerPaymentEvents(
   const answer = await client.post<unknown>(WEBHOOKS_PATH, { url, events: chosen }, { idempotencyKey: operationKey('register', url, ...chosen) });
   const record = answer !== null && typeof answer === 'object' ? (answer as Record<string, unknown>) : {};
   const { id, secret } = record;
-  seen({ value: typeof secret === 'string' ? secret : undefined, texts: textsIn(secret) });
+  seen(typeof secret === 'string' ? { value: secret, texts: [secret] } : { value: undefined, texts: allTexts(answer) });
   if (typeof id !== 'string' || !WEBHOOK_ID.test(id) || typeof secret !== 'string' || !SECRET.test(secret)) {
     // Never quoted: the answer may hold the secret.
     throw new Error('Vipps MobilePay answered the registration in an unexpected form.');
