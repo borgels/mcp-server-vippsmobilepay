@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 - All four `Vipps-System-*` headers are sent on every request, as Vipps
   MobilePay requires of partners and plugins. An embedding host can give its
