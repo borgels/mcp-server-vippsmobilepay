@@ -9,7 +9,11 @@
   secret back, once. Host functions only, never tools. The fixed request list
   gains `GET` and `POST /webhooks/v1/webhooks` and
   `DELETE /webhooks/v1/webhooks/{id}`; an answer that cannot be used is never
-  quoted, since it may hold the secret.
+  quoted, since it may hold the secret. The secret is masked by the instance
+  from then on, like its keys. The address must be https on a public host
+  name: IP literals, single labels, non-default ports and local or internal
+  names are refused before anything is sent. The events are sent sorted, so
+  the same set always gives the same request and operation key.
 - All four `Vipps-System-*` headers are sent on every request, as Vipps
   MobilePay requires of partners and plugins. An embedding host can give its
   own solution as `systemName` and `systemVersion`; the host is then sent as

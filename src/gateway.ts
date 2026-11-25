@@ -433,11 +433,18 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     keyType: client.keyType,
     /**
      * Host only, never a tool: register `address` (https, the host's own) for this sales unit's ePayment `events`.
-     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here.
-     * Registering the same address and events again sends the same operation key.
+     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here, and
+     * the instance masks it from then on. Registering the same address and set of events again sends the same operation
+     * key (Vipps MobilePay does not document it for this API).
      */
     registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
-      return hostCall(() => registerPaymentEvents(client, address, events));
+      return hostCall(async () => {
+        const registration = await registerPaymentEvents(client, address, events);
+        // From now on the secret is masked like the keys: in every later error, failure metadata, result and audit
+        // record of this instance.
+        redactor.addSecret(registration.secret);
+        return registration;
+      });
     },
     /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
     listWebhooks(): Promise<Webhook[]> {

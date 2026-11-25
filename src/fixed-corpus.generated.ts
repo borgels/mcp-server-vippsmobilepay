@@ -332,6 +332,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "Refused: only an authorized payment can be captured. Nothing was sent.",
   "Refused: register only known ePayment events. Nothing was sent.",
   "Refused: the address for events must be an https URL. Nothing was sent.",
+  "Refused: the address for events must be on a public host name. Nothing was sent.",
   "Refused: the charge could not be read in the expected form, so nothing was sent.",
   "Refused: the charge is in ",
   "Refused: the payment could not be read in the expected form, so nothing was sent.",

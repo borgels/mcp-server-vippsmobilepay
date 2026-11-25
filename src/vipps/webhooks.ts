@@ -46,7 +46,32 @@ const WEBHOOKS_PATH = '/webhooks/v1/webhooks';
 const WEBHOOK_ID = /^[A-Za-z0-9-]{8,64}$/;
 const SECRET = /^[\x21-\x7e]{16,256}$/;
 
-/** The address must be the host's own: https, no credentials, no fragment. */
+/**
+ * Host names that never reach a public address: a single label, and the names kept for local or internal use. Vipps
+ * MobilePay requires an address it can reach on the internet; one of these could only aim its messages inward.
+ */
+const INTERNAL_NAMES = /(^|\.)(localhost|local|internal|intranet|lan|home|corp|private|home\.arpa|localdomain|test|invalid|example)$/i;
+
+/**
+ * Whether the host is a public name: never an IP literal (IPv4 in any form the URL parser accepts, or IPv6), never a
+ * single label, and never a name kept for local or internal use. A host registers its own published name.
+ */
+function isPublicName(hostname: string): boolean {
+  const name = hostname.replace(/\.$/, '');
+  if (name.startsWith('[') || name.includes(':')) return false;
+  if (/^[0-9.]+$/.test(name) || /^0x/i.test(name)) return false;
+  if (!name.includes('.')) return false;
+  const labels = name.split('.');
+  if (labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) return false;
+  // A top-level label of digits only is how an IP literal ends; no public top-level domain is one.
+  if (/^\d+$/.test(labels[labels.length - 1] ?? '')) return false;
+  return !INTERNAL_NAMES.test(name);
+}
+
+/**
+ * The address must be the host's own and public: https on the default port, a public name, no credentials, no
+ * fragment. An IP literal, a single label and a local or internal name are refused before anything is sent.
+ */
 function checkedAddress(value: unknown): string {
   if (typeof value !== 'string' || value.length > 2048) throw new Error('Refused: the address for events must be an https URL. Nothing was sent.');
   let url: URL;
@@ -58,6 +83,9 @@ function checkedAddress(value: unknown): string {
   if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.href !== value) {
     throw new Error('Refused: the address for events must be an https URL. Nothing was sent.');
   }
+  if (url.port !== '' || !isPublicName(url.hostname)) {
+    throw new Error('Refused: the address for events must be on a public host name. Nothing was sent.');
+  }
   return value;
 }
 
@@ -66,10 +94,15 @@ function checkedEvents(events: readonly unknown[]): PaymentEvent[] {
   if (events.length === 0 || events.some(event => typeof event !== 'string' || !known.has(event))) {
     throw new Error('Refused: register only known ePayment events. Nothing was sent.');
   }
-  return [...new Set(events as PaymentEvent[])];
+  // One order whatever order they came in: the same set gives the same request and the same operation key.
+  return [...new Set(events as PaymentEvent[])].sort();
 }
 
-/** An operation key from the request's own content, so a repeated registration of the same address is one. */
+/**
+ * An operation key from the request's own content: the same address and set of events give the same key. Vipps
+ * MobilePay's Webhooks API does not document Idempotency-Key, so a repeat is not promised to be one registration; a
+ * host that is unsure lists the registrations and removes a duplicate.
+ */
 function operationKey(...parts: string[]): string {
   return `wh-${createHash('sha256').update(parts.join('\n')).digest('base64url').replace(/[^A-Za-z0-9]/g, '').slice(0, 32)}`;
 }
