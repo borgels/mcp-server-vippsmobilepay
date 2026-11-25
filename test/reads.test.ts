@@ -104,6 +104,54 @@ describe('transactions and funds summary', () => {
     expect(requests.every(call => !('includeGDPRSensitiveData' in call.query))).toBe(true);
   });
 
+  it('reads every page of a date that is still open: tryLater with hasMore does not end the pages', async () => {
+    const route = reportRoute({
+      '2026-11-03': [
+        { items: [entry(), entry({ entryType: 'refund', amount: -10_000 })], hasMore: true, cursor: '1', tryLater: true },
+        { items: [entry({ amount: 20_000 })], hasMore: true, cursor: '2', tryLater: true },
+        { items: [entry({ entryType: 'fees-retained', amount: -300 })], hasMore: false, tryLater: true },
+      ],
+    });
+    const { gw, calls } = gateway({ [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: route });
+    const input = { ledgerId: LEDGER, fromDate: '2026-11-03', toDate: '2026-11-03' };
+
+    const listed = await gw.callTool('list_transactions', input);
+    expect(listed.isError).toBeUndefined();
+    expect(listed.structuredContent).toMatchObject({ complete: false, openDates: ['2026-11-03'], count: 4 });
+    expect(apiCalls(calls).map(call => call.query.cursor ?? '')).toEqual(['', '1', '2']);
+
+    const summed = await gw.callTool('get_funds_summary', input);
+    expect(summed.structuredContent).toMatchObject({
+      complete: false,
+      openDates: ['2026-11-03'],
+      period: { entries: 4, totalsByEntryType: { capture: 69_900, refund: -10_000, 'fees-retained': -300 } },
+      days: [{ ledgerDate: '2026-11-03', open: true, entries: 4 }],
+    });
+  });
+
+  it('keeps a date open when an earlier page said tryLater and the last page does not', async () => {
+    const { gw } = gateway({
+      [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: reportRoute({
+        '2026-11-03': [
+          { items: [entry()], hasMore: true, cursor: '1', tryLater: true },
+          { items: [entry()], hasMore: false },
+        ],
+      }),
+    });
+    const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-03', toDate: '2026-11-03' });
+    expect(result.structuredContent).toMatchObject({ complete: false, openDates: ['2026-11-03'], count: 2 });
+  });
+
+  it('refuses an open date that says there are more pages without a new cursor', async () => {
+    const { gw, calls } = gateway({
+      [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: () => ({ body: { items: [entry()], hasMore: true, tryLater: true } }),
+    });
+    const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-03', toDate: '2026-11-03' });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(apiCalls(calls)).toHaveLength(1);
+  });
+
   describe('a period that reaches past today', () => {
     const day = (date: string) => `GET /report/v2/ledgers/${LEDGER}/funds/dates/${date}`;
     const closed = (date: string, amount: number) =>
