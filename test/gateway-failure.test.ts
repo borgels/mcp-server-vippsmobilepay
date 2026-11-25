@@ -276,6 +276,37 @@ describe("Vipps MobilePay's error code and trace id", () => {
     expect(error?.traceId).toBe(TRACE);
   });
 
+  it('logs the metadata of an HTTP error wrapped as the cause of our own error in the audit too', async () => {
+    const reference = 'fjord-order-10042';
+    const path = `/epayment/v1/payments/${reference}`;
+    const records: Array<Record<string, unknown>> = [];
+    const { gw } = gateway(
+      {
+        [`GET ${path}`]: { body: payment() },
+        [`GET ${path}/events`]: {
+          status: 503,
+          body: { ...EPAYMENT_ERROR, extraDetails: [{ name: 'ErrorCode', reason: '3010' }] },
+          headers: { 'x-request-id': UUID, 'content-type': 'application/problem+json' },
+        },
+      },
+      { policy: { enableWrites: true, audit: record => void records.push(record) } },
+    );
+    const result = await gw.callTool('capture_payment', { reference, amount: 60_000, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' });
+    expect(result.content[0]?.text).toMatch(/^Refused: /);
+    const expected = {
+      httpStatus: 503,
+      method: 'GET',
+      pathTemplate: '/epayment/v1/payments/{reference}/events',
+      errorCode: '3010',
+      traceId: TRACE,
+    };
+    expect(result.failure).toEqual({ ...expected, requestId: UUID });
+    const start = records.find(record => record.action === 'start');
+    const error = records.find(record => record.action === 'error');
+    expect(error).toMatchObject({ ...expected, vendorRequestId: UUID, requestId: start?.requestId });
+    expect(JSON.stringify(records)).not.toContain('Jane Doe');
+  });
+
   it('takes a trace id only in its exact form: traceId as a trace context, contextId as a UUID', () => {
     for (const odd of ['4512345678', '12345678', '+4512345678', 'agr_5kSeqz', 'chr-123ab', 'deadbeef', 'deadbeef00112233', 'order-1001', UUID.toUpperCase().replace(/-/g, '')]) {
       expect(vendorErrorFields({ traceId: odd }), odd).toEqual({});

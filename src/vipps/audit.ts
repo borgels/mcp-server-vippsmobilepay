@@ -26,8 +26,10 @@ export interface AuditEvent {
 const MAX_AUDIT_MESSAGE_LENGTH = 200;
 
 /**
- * Error summary for the audit log: for an HTTP error the failure metadata (method, path template, status, request
- * id, Vipps MobilePay's error code and trace id, each in its fixed form), or this server's own message, redacted
+ * Error summary for the audit log: for an HTTP error, also one wrapped as the `cause` of our own error (a capture
+ * refused after a failed read of the events, a charge id that is ambiguous), the failure metadata (method, path
+ * template, status, request id, Vipps MobilePay's error code and trace id, each in its fixed form, from
+ * failureMetadata); and the message, a fixed text for a direct HTTP error or this server's own message, redacted
  * before it is shortened. Nothing else the upstream controls (body, message) is logged: it can quote input or part of
  * the key.
  */
@@ -35,16 +37,15 @@ export function auditErrorSummary(
   error: unknown,
   redactor?: SecretRedactor,
 ): { httpStatus?: number; message: string; failure?: Omit<FailureMetadata, 'httpStatus'> } {
+  const metadata = failureMetadata(error);
+  const { httpStatus, ...failure } = metadata ?? {};
+  const http = metadata === undefined ? {} : { httpStatus, ...(Object.keys(failure).length > 0 ? { failure } : {}) };
   if (error instanceof VippsHttpError) {
-    const { httpStatus: _status, ...failure } = failureMetadata(error) ?? { httpStatus: error.status };
-    return {
-      httpStatus: error.status,
-      message: `Vipps MobilePay API request failed with HTTP ${error.status}`,
-      ...(Object.keys(failure).length > 0 ? { failure } : {}),
-    };
+    return { ...http, httpStatus: error.status, message: `Vipps MobilePay API request failed with HTTP ${error.status}` };
   }
   const message = formatUnknownError(error, redactor);
   return {
+    ...http,
     message: message.length > MAX_AUDIT_MESSAGE_LENGTH ? `${message.slice(0, MAX_AUDIT_MESSAGE_LENGTH)}…` : message,
   };
 }
