@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, constants, statSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { VippsHttpError, formatUnknownError, redactDeep, redactSecrets, type SecretRedactor } from '../errors.js';
+import { VippsHttpError, failureMetadata, formatUnknownError, redactDeep, redactSecrets, type FailureMetadata, type SecretRedactor } from '../errors.js';
 import { STDERR_WITHHELD, withheldAuditRecord } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import { ConfigError, readEnvString } from '../config-env.js';
@@ -26,22 +26,26 @@ export interface AuditEvent {
 const MAX_AUDIT_MESSAGE_LENGTH = 200;
 
 /**
- * Error summary for the audit log: the HTTP status, or this server's own
- * message, redacted before it is shortened. Nothing the upstream controls
- * (body, error code, message) is logged: it can quote input or part of the key.
+ * Error summary for the audit log: for an HTTP error, also one wrapped as the `cause` of our own error (a capture
+ * refused after a failed read of the events, a charge id that is ambiguous), the failure metadata (method, path
+ * template, status, request id, Vipps MobilePay's error code and trace id, each in its fixed form, from
+ * failureMetadata); and the message, a fixed text for a direct HTTP error or this server's own message, redacted
+ * before it is shortened. Nothing else the upstream controls (body, message) is logged: it can quote input or part of
+ * the key.
  */
 export function auditErrorSummary(
   error: unknown,
   redactor?: SecretRedactor,
-): { httpStatus?: number; message: string } {
+): { httpStatus?: number; message: string; failure?: Omit<FailureMetadata, 'httpStatus'> } {
+  const metadata = failureMetadata(error);
+  const { httpStatus, ...failure } = metadata ?? {};
+  const http = metadata === undefined ? {} : { httpStatus, ...(Object.keys(failure).length > 0 ? { failure } : {}) };
   if (error instanceof VippsHttpError) {
-    return {
-      httpStatus: error.status,
-      message: `Vipps MobilePay API request failed with HTTP ${error.status}`,
-    };
+    return { ...http, httpStatus: error.status, message: `Vipps MobilePay API request failed with HTTP ${error.status}` };
   }
   const message = formatUnknownError(error, redactor);
   return {
+    ...http,
     message: message.length > MAX_AUDIT_MESSAGE_LENGTH ? `${message.slice(0, MAX_AUDIT_MESSAGE_LENGTH)}…` : message,
   };
 }
@@ -146,8 +150,18 @@ export async function writeAuditEvent(
   }
 }
 
+/**
+ * The error's fields in the audit record. The vendor's request id goes in as vendorRequestId: the record's requestId
+ * is the server's own, shared by the call's start, finish and error records, and is never replaced.
+ */
 function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
-  return { httpStatus: summary.httpStatus, error: summary.message };
+  const { requestId: vendorRequestId, ...failure } = summary.failure ?? {};
+  return {
+    httpStatus: summary.httpStatus,
+    error: summary.message,
+    ...failure,
+    ...(vendorRequestId === undefined ? {} : { vendorRequestId }),
+  };
 }
 
 /**
