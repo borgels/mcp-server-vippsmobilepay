@@ -1,12 +1,12 @@
 # mcp-server-vippsmobilepay
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for the Vipps MobilePay APIs. It lets an MCP client (Claude or any other MCP-capable assistant) read a merchant's settlements, ledger entries, ePayment payments and Recurring agreements and charges, and, when enabled, ask a customer to pay and capture, refund or cancel payments and charges.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for the Vipps MobilePay APIs. It lets an MCP client (Claude or any other MCP-capable assistant) read a merchant's settlements, ledger entries, ePayment payments with their order lines, Recurring agreements and charges, sales units and fixed QR codes, and, when enabled, ask a customer to pay and capture, refund or cancel payments and charges.
 
 > This is an independent, unofficial project. It is not developed, endorsed or supported by Vipps MobilePay.
 
 - Read-only by default. The six write tools ask a customer to pay, or move or release money; they are off unless enabled per instance, and a host should have a person confirm every call.
-- Uses only the official [Access Token](https://developer.vippsmobilepay.com/docs/APIs/access-token-api/), [Report](https://developer.vippsmobilepay.com/docs/APIs/report-api/), [ePayment](https://developer.vippsmobilepay.com/docs/APIs/epayment-api/) and [Recurring](https://developer.vippsmobilepay.com/docs/APIs/recurring-api/) APIs.
-- Nothing can change an agreement (price, interval, status), merchant or sales unit settings, or the keys, and nothing creates a charge: every request is checked against a fixed list before it is sent.
+- Uses only the official [Access Token](https://developer.vippsmobilepay.com/docs/APIs/access-token-api/), [Report](https://developer.vippsmobilepay.com/docs/APIs/report-api/), [ePayment](https://developer.vippsmobilepay.com/docs/APIs/epayment-api/), [Recurring](https://developer.vippsmobilepay.com/docs/APIs/recurring-api/), [Order Management](https://developer.vippsmobilepay.com/docs/APIs/order-management-api/), [Management](https://developer.vippsmobilepay.com/docs/APIs/management-api/) and [QR](https://developer.vippsmobilepay.com/docs/APIs/qr-api/) APIs. Of the last three it only reads.
+- Nothing can change an agreement (price, interval, status), merchant or sales unit settings, a QR code, a receipt or the keys, and nothing creates a charge: every request is checked against a fixed list before it is sent.
 - Two transports: stdio for local clients, stateless streamable HTTP for containers and gateways.
 - Embeddable: the `./gateway` export exposes the same tools, validation, policy and audit to a host application, with a host policy and typed change descriptions for the host's own log.
 
@@ -25,6 +25,11 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 | `vipps_get_agreement` | read | One Recurring agreement. |
 | `vipps_list_charges` | read | The charges of one agreement, optionally by status. |
 | `vipps_get_charge` | read | One charge of an agreement. |
+| `vipps_find_charge` | read | One charge by its own id, when the agreement is not known. For looking one charge up, not for reading many. |
+| `vipps_get_receipt` | read | The order details stored with a payment (`reference`) or a Recurring charge (`chargeId`): order lines with VAT, the bottom line and the category. |
+| `vipps_list_sales_units` | read | The sales units the keys can read, with MSN and name. Merchant keys only, production only. |
+| `vipps_get_sales_unit` | read | The sales unit the keys are used for, and what Vipps MobilePay has enabled for it (capture type, payments the customer can pay later, requests without the landing page and more). Production only. |
+| `vipps_list_qr_codes` | read | The sales unit's fixed QR codes: those that send the customer to a web address and those that tell the business that a customer has scanned them. |
 | `vipps_create_payment` | write (confirm) | Ask a customer to pay: a payment request as a link, as a QR code or sent to the customer's phone number, optionally with a deadline of up to 60 days. Moves no money by itself. |
 | `vipps_capture_payment` | write (confirm) | Capture all or part of an authorized payment. |
 | `vipps_refund_payment` | write (confirm) | Refund all or part of a captured payment. |
@@ -101,6 +106,22 @@ A QR code's address is given only in the answer to the request that creates it; 
 
 **Every capture, refund and cancellation needs an operation key.** `idempotencyKey` (8-40 letters, digits or dashes) is required for these five write tools and is sent as `Idempotency-Key`; the server never makes one up, and a call without one is refused before anything is sent. The caller chooses a new key for each new change, records it before the call, and sends the same key when it repeats that change (after a timeout, an error or a lost answer). Vipps MobilePay carries out a key once and answers a repeat with the first result, so a repeated partial refund cannot pay out twice. The key comes back in the result. When a repeat reaches our own check after the change was carried out (a full refund whose answer was lost, say), the check would refuse it; the payment's events or the charge's history are then searched for a successful event with the same key and amount, and if one is found the result says `alreadyDone: true` and nothing is sent.
 
+**Looking things up.** Five reads for what a business asks about a payment or about its own setup:
+
+| Tool | Request | Notes |
+|---|---|---|
+| `find_charge` | [`GET /recurring/v3/charges/{chargeId}`](https://developer.vippsmobilepay.com/api/recurring/) | Vipps MobilePay documents it for looking into one charge when the agreement is unknown, "not intended for automation". When the id is the id of more than one charge it answers HTTP 409 (`ambiguous-charge-id`), and the tool says so in its own words. |
+| `get_receipt` | [`GET /order-management/v2/{paymentType}/{orderId}`](https://developer.vippsmobilepay.com/docs/APIs/order-management-api/order-management-api-guide/#fetching-category-and-order-details) | `ECOM` with the reference of a payment, `RECURRING` with the id of a charge. This is also how the order lines sent with `create_payment` are read back: the ePayment API has no request that returns them. Only what the business or its system sent is stored, so a payment without it is answered as not found. Amounts are in minor units; `taxRate` is in hundredths of a percent. |
+| `list_sales_units` | [`GET /management/v1/sales-units`](https://developer.vippsmobilepay.com/docs/APIs/management-api/) | With the merchant's own keys. With partner keys the request lists the sales units of every merchant of the partner, so the tool is not offered with them. |
+| `get_sales_unit` | `GET /management/v1/sales-units/{msn}` | Always the configured sales unit; the caller cannot name another. `longLivingPaymentAllowed` says whether `create_payment` can take `expiresAt`, `skipLandingPageAllowed` whether it can deliver to a phone number, and `captureType` whether an approved payment must be captured (`ReserveCapture`) or is drawn at once (`DirectCapture`). |
+| `list_qr_codes` | [`GET /qr/v1/merchant-redirect`](https://developer.vippsmobilepay.com/docs/APIs/qr-api/api-guide/merchant-redirect/) and [`GET /qr/v1/merchant-callback`](https://developer.vippsmobilepay.com/docs/APIs/qr-api/api-guide/merchant-callback/) | Both kinds unless `kind` is given, and the call fails when either cannot be read. The address of a code's image carries a token and [stops working after a while](https://developer.vippsmobilepay.com/docs/APIs/qr-api/api-guide/code-formats/); a new call gives a new one. |
+
+Vipps MobilePay [has no Management API in the test environment](https://developer.vippsmobilepay.com/docs/APIs/management-api/management-api-faq/#can-i-use-the-management-api-in-the-test-environment), where its requests are answered with HTTP 401 as if the keys were refused. The two sales unit tools are therefore offered in production only: in the test environment they are left out of the tool list and refused before anything is sent (`environments` in the catalog).
+
+Every answer passes a typed allow-list (`src/vipps/views.ts`). A list in an answer is passed on whole or not at all: when one order line, one event or one QR code is not in the documented form, the call fails instead of answering with the rest. The address of a QR code's image is passed on whole, like the link of a payment request; it is public by Vipps MobilePay's own description and is never logged.
+
+**Each sale with its lines and VAT is not here.** Vipps MobilePay's [Sales API](https://developer.vippsmobilepay.com/docs/APIs/sales-api/) gives the order lines and VAT of sales made with a Vippsnummer or MobilePay number and with the point-of-sale product. It is open to accounting partners only, with accounting keys and their own token request, in production only. This server takes the merchant's or a partner's keys, which the Sales API does not accept. A sales unit that takes payment by number also has no API keys of its own. `get_receipt` gives the order lines of a payment that was created through the API with them.
+
 **Cancelling a charge uses DELETE.** The Recurring API cancels a charge with `DELETE /recurring/v3/agreements/{agreementId}/charges/{chargeId}`. It is the only DELETE this server can send, and it deletes no record: the charge remains. A pending, due or reserved charge ends as `CANCELLED`; a partially captured charge ends as `CHARGED`, with the rest released to the customer.
 
 **Lists are complete or refused.** Every list is read to its end. When a cap is reached the call fails with a refusal and returns nothing, rather than a list that looks complete but is not:
@@ -118,7 +139,7 @@ Vipps MobilePay documents that a ledger date runs from midnight to midnight in t
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 
-**Personal data in results.** The known personal fields of the payer and the subscriber are left out: `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub`, `userinfoUrl`, phone numbers and the card number prefix. Payments, events, agreements and the answers to a capture, a refund and a cancellation pass through a typed allow-list (`src/vipps/views.ts`), so a field Vipps MobilePay adds later is left out until it is listed. This does not make the results free of personal data: a payment reference, a product name or a description is text the merchant or an integration chose, and it can hold a name or another personal detail. Treat results as data that may contain personal data.
+**Personal data in results.** The known personal fields of the payer and the subscriber are left out: `userDetails` (name, phone, e-mail), `shippingDetails` (address), `profile.sub`, `userinfoUrl`, phone numbers and the card number prefix. Payments, events, agreements, a charge read by its id, order details, sales units, QR codes and the answers to a capture, a refund and a cancellation pass through a typed allow-list (`src/vipps/views.ts`), so a field Vipps MobilePay adds later is left out until it is listed. This does not make the results free of personal data: a payment reference, a product name or a description is text the merchant or an integration chose, and it can hold a name or another personal detail. Treat results as data that may contain personal data.
 
 ## Keys and authentication
 
@@ -132,7 +153,7 @@ The token is kept until five minutes before it expires (Vipps MobilePay: one hou
 
 **Environments.** `test` uses `https://apitest.vipps.no` with the test keys; `production` uses `https://api.vipps.no`. The keys are never sent to another host (a loopback URL is allowed for a local mock).
 
-**Partner keys.** Set `VIPPS_KEY_TYPE=partner` (gateway: `keyType: 'partner'`) to use a partner's `client_id`, `client_secret` and subscription key with the merchant's MSN, which is then required. Vipps MobilePay documents partner keys for the ePayment and Recurring APIs, in production only, and not for the Report API; with partner keys the three report tools are not offered. Accounting keys (the Report API for accounting partners, without subscription key and MSN) are not supported yet.
+**Partner keys.** Set `VIPPS_KEY_TYPE=partner` (gateway: `keyType: 'partner'`) to use a partner's `client_id`, `client_secret` and subscription key with the merchant's MSN, which is then required. Vipps MobilePay documents partner keys for the main APIs and the Management API, in production only, and not for the Report API; with partner keys the three report tools are not offered, and neither is `list_sales_units`, which would list the sales units of every merchant of the partner. Accounting keys (the Report API for accounting partners, without subscription key and MSN) are not supported yet.
 
 ## Quick start
 
@@ -267,8 +288,8 @@ const result = await gateway.callTool('refund_payment', input, { caller: 'user-1
 
 - **Explicit credentials.** `clientId`, `clientSecret`, `subscriptionKey`, `merchantSerialNumber` and `environment` are required; a missing value throws when the gateway is created. A gateway never reads `VIPPS_*` credentials from the environment. Each key must be printable ASCII of at least 16 characters (see key admission below).
 - **Host policy.** `policy` takes `enableWrites` (default false), `disabledTools`, `allowedTools` (an allow-list: when given, only these tools are offered, reads included; it must name known tools and must not be empty) and `audit`, a function that receives each audit record (a write does not run if the sink throws on its start record). Unknown tool names and malformed values throw at creation. An instance with `policy` reads none of `VIPPS_ENABLE_WRITES`, `VIPPS_DISABLED_TOOLS`, `VIPPS_AUDIT_LOG` or `VIPPS_ALLOW_CUSTOM_BASE_URL`.
-- **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating charges, capturing a Recurring charge, and any other DELETE.
-- **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `write`; no tool is `destructive`, as none deletes or overwrites anything), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`create`, `capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney` (true when the call itself moves or releases money; false for `create_payment`, which only asks the customer to pay) and `logFields`, each with the one type its value must have:
+- **What no policy turns on.** Requests outside the fixed list in `src/vipps/client.ts`: changing an agreement (price, interval, status), merchant or sales unit settings or keys, creating charges, capturing a Recurring charge, creating, changing or deleting a QR code, adding or changing a receipt, category or image, ordering a product, reading another merchant, and any other DELETE.
+- **Tool catalog.** `vippsToolCatalog` is a frozen list of every tool: `name` (without the `vipps_` prefix), `title`, `description`, `riskLevel` (`read` or `write`; no tool is `destructive`, as none deletes or overwrites anything), `enabledByDefault` (false for every write), `inputSchema` (JSON Schema), `upstream` (the API requests the tool may make), `broad` (false for all), `keyTypes`, `environments` (`test` and `production`; the two sales unit tools work in production only), `requiresConfirmation` (true for every write: a host should have a person confirm the call outside the chat) and, for write tools, `change`: `action` (`create`, `capture`, `refund`, `cancel`), `record` (`payment` or `charge`), `movesMoney` (true when the call itself moves or releases money; false for `create_payment`, which only asks the customer to pay) and `logFields`, each with the one type its value must have:
 
   | Type | Fields | Value |
   |---|---|---|
@@ -313,7 +334,7 @@ Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
 ## Verified and not verified against Vipps MobilePay
 
-The client follows the published OpenAPI specifications (Access Token 2.0.0, Report 2.0, ePayment 1.8.5, Recurring 3.2.3) and is tested against mocked HTTP.
+The client follows the published OpenAPI specifications (Access Token 2.0.0, Report 2.0, ePayment 1.8.5, Recurring 3.2.3, Order Management 2.1, Management 2.0.10, QR 1.0) and is tested against mocked HTTP.
 
 **Observed in the test environment** (25 November 2026, one payment request of 100 minor units in DKK as a link, created with `metadata` and read back; only statuses, field names and yes or no were recorded, never a value):
 
@@ -325,7 +346,19 @@ The client follows the published OpenAPI specifications (Access Token 2.0.0, Rep
 - A reference that no payment has was answered with HTTP 404.
 - The link was an https address with no path and one query parameter, `token`, in the form of a JSON Web Token, 866 characters in all, and the `redirectUrl` read back was the same as the one in the answer to the create request.
 
+**Observed in the test environment for the reads** (25 November 2026, reads only, with nothing stored on the test sales unit; only statuses, content types, field names and counts were recorded):
+
+- `GET /qr/v1/merchant-redirect` answered HTTP 400 with `Accept: application/json`, and HTTP 200 with an empty JSON list for `image/svg+xml`, `image/png`, `image/*` and `text/targetUrl`. `list_qr_codes` asks with `image/svg+xml`.
+- `GET /qr/v1/merchant-callback` answered HTTP 200 with an empty JSON list.
+- `GET /order-management/v2/ECOM/{orderId}` and `.../RECURRING/{orderId}` answered HTTP 404 (`application/problem+json`) for an id nothing is stored with.
+- `GET /recurring/v3/charges/{chargeId}` answered HTTP 404 (`application/problem+json`) for an id no charge has.
+- `GET /management/v1/sales-units` and `GET /management/v1/sales-units/{msn}` answered HTTP 401, with keys that the other requests accepted.
+
 **Not tried:**
+
+- an answer with content from any of the five reads: a charge found by its id, stored order details, a sales unit and a QR code were not there to read, so their fields are taken from the specifications;
+- the Management API in production, with the merchant's own keys and with partner keys;
+- HTTP 409 (`ambiguous-charge-id`) from `GET /recurring/v3/charges/{chargeId}`;
 
 - production, where none of the above has been observed;
 - a QR code (`QR`), a request to a phone number (`PUSH_MESSAGE`, on an approved sales unit), and a request with `expiresAt` on a sales unit that has it enabled;
@@ -350,7 +383,8 @@ npm run build
 |---|---|
 | `src/tools/vipps.ts` | Shared tool table (MCP and gateway), log field types, policy and audit wrapper. |
 | `src/vipps/client.ts` | Access token, headers, retries, the fixed list of allowed requests. |
-| `src/vipps/reports.ts`, `payments.ts`, `recurring.ts` | API calls and paging. |
+| `src/vipps/reports.ts`, `payments.ts`, `payment-requests.ts`, `recurring.ts`, `order-details.ts`, `sales-units.ts`, `qr-codes.ts` | API calls and paging. |
+| `src/vipps/views.ts` | The typed allow-lists every answer passes. |
 | `src/gateway.ts` | Embeddable entry point (`./gateway` export). |
 | `src/transports/` | stdio and HTTP entry points. |
 

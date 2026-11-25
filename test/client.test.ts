@@ -146,7 +146,9 @@ describe('requests', () => {
     const client = makeClient(fetchImpl);
     await expect(client.post('/recurring/v3/agreements', {}, { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that POST/);
     await expect(client.delete('/recurring/v3/agreements/agr_1', { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that DELETE/);
-    await expect(client.get('/management/v1/sales-units')).rejects.toThrow(/never sends that GET/);
+    await expect(client.get('/management/v1/merchants/business:DK:CVR/10000008')).rejects.toThrow(/never sends that GET/);
+    await expect(client.get('/management/v1/merchants/business:DK:CVR/10000008/sales-units')).rejects.toThrow(/never sends that GET/);
+    await expect(client.get('/qr/v1/merchant-redirect/skilt_havnegade')).rejects.toThrow(/never sends that GET/);
     // Dot segments are resolved by the URL parser; the list is checked on what would be sent, and they are refused.
     await expect(client.delete('/recurring/v3/agreements/agr_1/charges/..', { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(/never sends that DELETE/);
     await expect(client.post('/epayment/v1/payments/../../recurring/v3/agreements/agr_1/charges/chr_1/refund', {}, { idempotencyKey: 'op-0001-aaaa' })).rejects.toThrow(
@@ -165,6 +167,40 @@ describe('requests', () => {
     expect(isAllowedRequest('DELETE', '/epayment/v1/payments')).toBe(false);
     expect(isAllowedRequest('POST', '/epayment/v1/payments/fjord-order-1')).toBe(false);
     expect(isAllowedRequest('GET', '/report/v2/ledgers/abc/funds/dates/2026-11-01')).toBe(false);
+    // The reads of a charge by its id, the order details, the sales units and the fixed QR codes: reads only.
+    const reads = [
+      '/recurring/v3/charges/chr-5kSeqz',
+      '/order-management/v2/ECOM/fjord-order-10042',
+      '/order-management/v2/RECURRING/chr-5kSeqz',
+      '/management/v1/sales-units',
+      '/management/v1/sales-units/212345',
+      '/qr/v1/merchant-redirect',
+      '/qr/v1/merchant-callback',
+    ];
+    for (const path of reads) {
+      expect(isAllowedRequest('GET', path), path).toBe(true);
+      expect(isAllowedRequest('POST', path), path).toBe(false);
+      expect(isAllowedRequest('DELETE', path), path).toBe(false);
+    }
+    const never = [
+      '/recurring/v3/charges',
+      '/recurring/v3/charges/chr-5kSeqz/refund',
+      '/order-management/v2/OTHER/fjord-order-10042',
+      '/order-management/v2/ECOM/receipts/fjord-order-10042',
+      '/order-management/v1/receipts/fjord-order-10042',
+      '/order-management/v3/categories',
+      '/management/v1/sales-units/abc',
+      '/management/v1/sales-units/212345/extra',
+      '/management/v2/product-orders',
+      '/management/v1/partners/price-packages',
+      '/qr/v1',
+      '/qr/v1/merchant-callback/kasse-1',
+      '/qr/v1/exchange',
+    ];
+    for (const path of never) expect(isAllowedRequest('GET', path), path).toBe(false);
+    expect(isAllowedRequest('POST', '/qr/v1')).toBe(false);
+    expect(isAllowedRequest('POST', '/management/v1/product-orders')).toBe(false);
+    expect(isAllowedRequest('POST', '/order-management/v2/ECOM/receipts/fjord-order-10042')).toBe(false);
   });
 
   it('sends the Idempotency-Key it is given and never makes one up', async () => {

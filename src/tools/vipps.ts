@@ -7,7 +7,7 @@ import {
   WRITE_TOOL_ANNOTATIONS,
 } from '../vipps/annotations.js';
 import { assertAuditLogWritable, auditTarget, newRequestId, writeAuditEvent } from '../vipps/audit.js';
-import { IDEMPOTENCY_KEY_PATTERN, readOnlyClient, type UpstreamClient, type VippsKeyType } from '../vipps/client.js';
+import { IDEMPOTENCY_KEY_PATTERN, readOnlyClient, type UpstreamClient, type VippsEnvironment, type VippsKeyType } from '../vipps/client.js';
 import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
 import { withheldResult } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
@@ -19,11 +19,14 @@ import {
   PAYMENT_DELIVERIES,
   QR_FORMATS,
 } from '../vipps/payment-requests.js';
+import { checkReceipt, getReceipt } from '../vipps/order-details.js';
 import { cancelPayment, capturePayment, getPayment, refundPayment } from '../vipps/payments.js';
+import { listQrCodes, MAX_QR_CODES, QR_KINDS } from '../vipps/qr-codes.js';
 import {
   AGREEMENT_STATUSES,
   cancelCharge,
   CHARGE_STATUSES,
+  findCharge,
   getAgreement,
   getCharge,
   listAgreements,
@@ -31,6 +34,7 @@ import {
   refundCharge,
 } from '../vipps/recurring.js';
 import { fundsSummary, listLedgers, listTransactions, MAX_REPORT_DAYS, MAX_TRANSACTIONS, periodNoteOf } from '../vipps/reports.js';
+import { getSalesUnit, listSalesUnits } from '../vipps/sales-units.js';
 import {
   checkInputPolicy,
   checkToolPolicy,
@@ -69,10 +73,11 @@ export interface UpstreamOperation {
   path: string;
 }
 
-/** A client that carries the redactor of its instance and what kind of keys it holds. */
+/** A client that carries the redactor of its instance, what kind of keys it holds and the environment it calls. */
 export interface RedactingClient extends UpstreamClient {
   readonly redactor: SecretRedactor;
   readonly keyType: VippsKeyType;
+  readonly environment: VippsEnvironment;
 }
 
 /** What a write tool does: to money (capture, refund, cancel), or `create` for a new payment request. */
@@ -144,6 +149,10 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   broad?: boolean;
   /** Key types the tool works with. The Report API does not accept partner keys. */
   keyTypes: readonly VippsKeyType[];
+  /** Why the tool does not work with the other key type, for the refusal. Default: the Report API's reason. */
+  keyTypeReason?: string;
+  /** The environments the tool works in. Default: both. Vipps MobilePay has no Management API in the test environment. */
+  environments?: readonly VippsEnvironment[];
   /** Write tools: what the change does. */
   change?: VippsChangeSpec;
   /** Cross-field checks the schema shape cannot express. Returns a refusal or undefined. */
@@ -178,6 +187,7 @@ const change = (
 
 const ALL_KEYS = ['merchant', 'partner'] as const;
 const MERCHANT_KEYS = ['merchant'] as const;
+const PRODUCTION_ONLY = ['production'] as const;
 
 const referenceSchema = z.string().trim().regex(REFERENCE_PATTERN).describe('The ePayment reference (8-64 letters, digits or dashes).');
 const agreementIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring agreement id, e.g. agr_5kSeqz.');
@@ -363,6 +373,85 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     upstream: [{ access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' }],
     keyTypes: ALL_KEYS,
     handler: async (client, input) => getCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_find_charge',
+    title: 'Find Recurring charge by its id (Vipps MobilePay)',
+    description:
+      "One Recurring charge by its own id, when the agreement is not known, e.g. from a customer's question about a charge: the agreement it belongs to, amount, status, due date, how much is captured, refunded and cancelled, and its history. For looking one charge up, not for reading many: list_charges and get_charge read the charges of a known agreement. Refused when more than one charge has the id.",
+    inputShape: { chargeId: chargeIdSchema },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Found charge.',
+    upstream: [{ access: 'read', method: 'GET', path: '/recurring/v3/charges/{chargeId}' }],
+    keyTypes: ALL_KEYS,
+    handler: async (client, input) => findCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_get_receipt',
+    title: 'Get order lines of a payment (Vipps MobilePay)',
+    description:
+      'The order details stored with an ePayment payment (reference) or a Recurring charge (chargeId): the order lines with amounts and VAT in minor units (taxRate is in hundredths of a percent: 2500 is 25 %), the bottom line, and the category with the address the business gave for the order. Give exactly one of reference and chargeId. Only what the business or its system sent with the payment is stored; a payment without it is answered as not found.',
+    inputShape: {
+      reference: referenceSchema.optional(),
+      chargeId: chargeIdSchema.optional(),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Fetched order details.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/order-management/v2/ECOM/{reference}' },
+      { access: 'read', method: 'GET', path: '/order-management/v2/RECURRING/{chargeId}' },
+    ],
+    keyTypes: ALL_KEYS,
+    check: checkReceipt,
+    handler: async (client, input) => getReceipt(client, input),
+  }),
+  defineTool({
+    name: 'vipps_list_sales_units',
+    title: 'List sales units (Vipps MobilePay)',
+    description:
+      'The sales units the keys can read, each with its MSN and name. Merchant keys only, and production only (Vipps MobilePay has no Management API in the test environment).',
+    inputShape: {},
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed sales units.',
+    upstream: [{ access: 'read', method: 'GET', path: '/management/v1/sales-units' }],
+    keyTypes: MERCHANT_KEYS,
+    keyTypeReason: 'with partner keys the list would hold the sales units of every merchant of the partner',
+    environments: PRODUCTION_ONLY,
+    handler: async client => listSalesUnits(client),
+  }),
+  defineTool({
+    name: 'vipps_get_sales_unit',
+    title: 'Get the sales unit (Vipps MobilePay)',
+    description:
+      'The sales unit the keys are used for: its name, the business it belongs to, and what Vipps MobilePay has enabled for it: payments, the capture type (reserve and capture, or direct capture), partial and late capture, Recurring, card payments, payment requests the customer can pay later (longLivingPaymentAllowed, needed for expiresAt in create_payment) and requests without the landing page (skipLandingPageAllowed, needed for delivery phone in create_payment). Production only (Vipps MobilePay has no Management API in the test environment).',
+    inputShape: {},
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Fetched sales unit.',
+    upstream: [{ access: 'read', method: 'GET', path: '/management/v1/sales-units/{msn}' }],
+    keyTypes: ALL_KEYS,
+    environments: PRODUCTION_ONLY,
+    handler: async client => getSalesUnit(client),
+  }),
+  defineTool({
+    name: 'vipps_list_qr_codes',
+    title: 'List fixed QR codes (Vipps MobilePay)',
+    description: `The sales unit's fixed QR codes, e.g. on a sticker, a sign or a till. kind redirect: a code that sends the customer to a web address of the business, with its id, that address and the address of its image. kind callback: a code that tells the business that a customer has scanned it, with its id, where it stands, its category and the address of its image. Both kinds unless kind is given. The address of an image works for a while only; a new call gives a new one. Refuses rather than truncates more than ${MAX_QR_CODES} codes of a kind.`,
+    inputShape: {
+      kind: z.enum(QR_KINDS).optional().describe('redirect or callback. Both when left out.'),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed QR codes.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/qr/v1/merchant-redirect' },
+      { access: 'read', method: 'GET', path: '/qr/v1/merchant-callback' },
+    ],
+    keyTypes: ALL_KEYS,
+    handler: async (client, input) => listQrCodes(client, input),
   }),
   defineTool({
     name: 'vipps_create_payment',
@@ -584,14 +673,19 @@ export function toolSupportsKeyType(tool: ToolDefinition, keyType: VippsKeyType)
   return tool.keyTypes.includes(keyType);
 }
 
-/** Tools enabled on this instance: not disabled, and usable with its keys. */
-export function enabledTools(keyType: VippsKeyType): ToolDefinition[] {
-  return VIPPS_TOOLS.filter(tool => !isToolDisabled(tool.name) && toolSupportsKeyType(tool, keyType));
+/** Whether a tool works in this environment. */
+export function toolSupportsEnvironment(tool: ToolDefinition, environment: VippsEnvironment): boolean {
+  return tool.environments === undefined || tool.environments.includes(environment);
+}
+
+/** Tools enabled on this instance: not disabled, and usable with its keys in its environment. */
+export function enabledTools(keyType: VippsKeyType, environment: VippsEnvironment): ToolDefinition[] {
+  return VIPPS_TOOLS.filter(tool => !isToolDisabled(tool.name) && toolSupportsKeyType(tool, keyType) && toolSupportsEnvironment(tool, environment));
 }
 
 export function registerTools(server: McpServer, client: RedactingClient): void {
   validateToolConfig();
-  for (const tool of enabledTools(client.keyType)) {
+  for (const tool of enabledTools(client.keyType, client.environment)) {
     server.registerTool(
       tool.name,
       {
@@ -661,7 +755,13 @@ export async function executeTool(
   if (policy.allowed && !toolSupportsKeyType(tool, client.keyType)) {
     policy = {
       allowed: false,
-      reason: `${tool.name} does not work with ${client.keyType} keys (the Report API needs the merchant's own keys).`,
+      reason: `${tool.name} does not work with ${client.keyType} keys (${tool.keyTypeReason ?? "the Report API needs the merchant's own keys"}).`,
+    };
+  }
+  if (policy.allowed && !toolSupportsEnvironment(tool, client.environment)) {
+    policy = {
+      allowed: false,
+      reason: `${tool.name} does not work in the ${client.environment} environment (Vipps MobilePay has no Management API there).`,
     };
   }
   const inputPolicy = policy.allowed ? checkInputPolicy(tool.name, input) : policy;

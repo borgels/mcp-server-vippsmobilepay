@@ -1,9 +1,10 @@
+import { VippsHttpError } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
 import { ChangeRefusedError } from './payments.js';
 import { TooMuchDataError } from './reports.js';
 import { isMerchantCurrency, isMinorUnits, type MerchantCurrency } from './values.js';
-import { agreementView } from './views.js';
+import { agreementView, chargeView } from './views.js';
 
 /**
  * Recurring API (v3): agreements and their charges; refund or cancel one
@@ -125,6 +126,27 @@ export async function listCharges(
 
 export async function getCharge(client: UpstreamClient, input: { agreementId: string; chargeId: string }): Promise<unknown> {
   return client.get(chargePath(input.agreementId, input.chargeId));
+}
+
+/** The refusal when Vipps MobilePay answers that the id is the id of more than one charge (HTTP 409, `ambiguous-charge-id`). */
+const AMBIGUOUS_CHARGE =
+  'Refused: more than one charge has this id, so Vipps MobilePay does not say which is meant. get_charge reads the charge of a known agreement (agreementId and chargeId).';
+
+/**
+ * One charge by its own id, when the agreement is not known (`GET /recurring/v3/charges/{chargeId}`). Vipps MobilePay
+ * documents it for looking into one charge, e.g. a customer's question, not for reading many. The charge passes the
+ * allow-list in views.ts.
+ */
+export async function findCharge(client: UpstreamClient, input: { chargeId: string }): Promise<unknown> {
+  let answer: unknown;
+  try {
+    answer = await client.get(`/recurring/v3/charges/${encodePathParam(input.chargeId, 'chargeId')}`);
+  } catch (error) {
+    // The text is ours and says what a 409 means here; the HTTP error is the cause, for the failure metadata.
+    if (error instanceof VippsHttpError && !error.tokenRequest && error.status === 409) throw new Error(AMBIGUOUS_CHARGE, { cause: error });
+    throw error;
+  }
+  return chargeView(answer);
 }
 
 export interface ChargeRefundInput {

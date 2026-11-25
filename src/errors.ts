@@ -403,12 +403,13 @@ export function describeUrl(url: string | URL): string {
 /** The longest customer link passed on. */
 export const MAX_CUSTOMER_LINK_LENGTH = 4096;
 /**
- * A link Vipps MobilePay made for the customer to open: the address of a
- * payment request, or of its QR code. It carries the customer's own token for
- * that one payment, and it is what a payment request exists to hand over, so
- * redactDeep passes it on unchanged. The credential-shaped patterns would
- * otherwise mask the token (it is a JSON Web Token) and leave a link that
- * opens nothing.
+ * A link Vipps MobilePay made to be opened: the address of a payment request
+ * or of its QR code, which carries the customer's own token for that one
+ * payment and is what a payment request exists to hand over, or the address
+ * of the image of one of the sales unit's fixed QR codes, which Vipps
+ * MobilePay documents as needing no authentication. redactDeep passes it on
+ * unchanged. The credential-shaped patterns would otherwise mask the token
+ * (it is a JSON Web Token) and leave a link that opens nothing.
  *
  * Only the patterns are set aside. The link still passes the sink check in
  * its final form (leaksSecret), so a link that holds this instance's key, a

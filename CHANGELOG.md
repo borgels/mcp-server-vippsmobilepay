@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased: reads
+
+- Five new read tools. `find_charge`: one Recurring charge by its own id,
+  when the agreement is not known. `get_receipt`: the order lines with VAT,
+  the bottom line and the category stored with a payment or a Recurring
+  charge (Order Management API). `list_sales_units` and `get_sales_unit`: the
+  sales units the keys can read, and what Vipps MobilePay has enabled for the
+  one the keys are used for (Management API). `list_qr_codes`: the sales
+  unit's fixed QR codes, of both kinds (QR API).
+- Seven GET requests are added to the fixed list of requests, and nothing
+  else: no request that creates or changes a QR code, a receipt, a category,
+  an image, a product order or a sales unit can be sent.
+- Gateway catalog: every entry has `environments`. The two sales unit tools
+  have `['production']`: Vipps MobilePay has no Management API in the test
+  environment, where they are left out of the offered tools and refused
+  before anything is sent. `list_sales_units` is for the merchant's own keys
+  only; with partner keys it would list the sales units of every merchant of
+  the partner.
+- Every answer of the new tools passes a typed allow-list. A list in an
+  answer is passed on whole or not at all: one order line, event or QR code
+  in another form fails the call.
+- The address of a QR code's image is passed on whole, as the link of a
+  payment request is: it carries a token in the form of a JSON Web Token,
+  which the redaction would otherwise mask. A host should treat it as answer
+  data and not log it.
+- `find_charge` leaves an operation key out of a charge's history when it has
+  the form this server makes from a request's content. `get_charge` and
+  `list_charges` are unchanged and pass the charge on as it comes.
+- Not added: each sale with its lines and VAT. The Sales API takes accounting
+  keys only, which this server does not hold (see the README).
+
 ## Unreleased: payment requests
 
 - New write tool `create_payment`: ask a customer to pay with an ePayment

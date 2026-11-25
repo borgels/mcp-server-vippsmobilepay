@@ -179,6 +179,16 @@ const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}$`),
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges$`),
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
+    // A charge by its own id, when the agreement is not known (find_charge).
+    new RegExp(`^/recurring/v3/charges/${SEGMENT}$`),
+    // The order lines and category stored with a payment or a charge (get_receipt).
+    new RegExp(`^/order-management/v2/(ECOM|RECURRING)/${SEGMENT}$`),
+    // The sales units the keys can read, and one of them (list_sales_units, get_sales_unit). Production only.
+    /^\/management\/v1\/sales-units$/,
+    /^\/management\/v1\/sales-units\/\d{4,10}$/,
+    // The sales unit's fixed QR codes (list_qr_codes).
+    /^\/qr\/v1\/merchant-redirect$/,
+    /^\/qr\/v1\/merchant-callback$/,
   ],
   POST: [
     // A new payment request (create_payment). The customer approves it in the app before any money moves.
