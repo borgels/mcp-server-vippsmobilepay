@@ -11,11 +11,19 @@
   `requiresConfirmation` like them. `POST /epayment/v1/payments` is added to
   the fixed list of requests; nothing else is.
 - The request's `Idempotency-Key` is not chosen by the caller: the server
-  derives it from the sales unit and the request's own content, so a request
-  repeated after a failure or a lost answer is created once and cannot be
-  repeated under a new key. A request refused because the reference is used
-  is answered with the existing payment (`alreadyExists`) when amount and
-  currency are the same, and refused when they differ.
+  derives it from a fingerprint of the sales unit and the request's own
+  content, so a request repeated after a failure or a lost answer is created
+  once and cannot be repeated under a new key. The fingerprint is also sent
+  as `metadata.requestFingerprint`. A request refused because the reference
+  is used is answered with the existing payment (`alreadyExists`, its state
+  and its link) only when the payment read back is proven to be the same
+  request: reference, amount, currency, payment method and fingerprint. Any
+  other payment with the reference is a conflict, and nothing of it is
+  returned. The README has the table of what a second call is answered with.
+- No refusal depends on the clock: whether a deadline is too near or too far
+  is for Vipps MobilePay to refuse, so an identical call made later is still
+  sent. In NOK a request with a deadline needs `productUrl` on every order
+  line.
 - Gateway catalog: `change.action` can be `create`, `change.movesMoney` is a
   boolean (false for `create_payment`, true for the others as before), and
   there is a log field type `delivery` (`link`, `qr` or `phone`, in clear).

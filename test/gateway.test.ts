@@ -191,13 +191,7 @@ describe('tool catalog', () => {
       const declared = entry.upstream.map(operation => `${operation.method} ${operation.path}`).sort();
       // The events of a payment are read only when a capture or refund would be refused (a retry of a change
       // already carried out); tested in writes.test.ts.
-      // The payment is read after a new request only when Vipps MobilePay refused it (a retry of a request already
-      // created); tested in create-payment.test.ts.
-      const conditional = ['capture_payment', 'refund_payment'].includes(entry.name)
-        ? ['GET /epayment/v1/payments/{reference}/events']
-        : entry.name === 'create_payment'
-          ? ['GET /epayment/v1/payments/{reference}']
-          : [];
+      const conditional = ['capture_payment', 'refund_payment'].includes(entry.name) ? ['GET /epayment/v1/payments/{reference}/events'] : [];
       const expected = (entry.name === 'list_transactions' ? declared.filter(item => item.includes('/fees/')) : declared).filter(
         item => !conditional.includes(item),
       );

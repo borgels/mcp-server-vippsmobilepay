@@ -221,7 +221,7 @@ const orderLineSchema = z.strictObject({
   totalAmountExcludingTax: z.number().int().min(0).max(MAX_AMOUNT_MINOR).describe('The line without VAT, in minor units.'),
   totalTaxAmount: z.number().int().min(0).max(MAX_AMOUNT_MINOR).describe('The VAT of the line, in minor units.'),
   taxRate: z.number().int().min(0).max(10_000).describe('VAT rate in hundredths of a percent: 25 % is 2500.'),
-  productUrl: httpsUrlSchema.optional().describe('An https address of the product at the business.'),
+  productUrl: httpsUrlSchema.optional().describe('An https address of the product at the business. Required on every line in NOK with expiresAt.'),
 });
 
 export const VIPPS_TOOLS: ToolDefinition[] = [
@@ -366,9 +366,9 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     name: 'vipps_create_payment',
     title: 'Create payment request (Vipps MobilePay)',
     description:
-      `Ask a customer to pay an amount: creates an ePayment payment request that the customer approves in the Vipps or MobilePay app. delivery says how it reaches the customer: link returns an address the customer opens (the app on a phone, otherwise the Vipps MobilePay landing page), qr returns the address of a QR code the customer scans, and phone sends the request to the app of the customer with that phone number. phone works only when Vipps MobilePay has approved the sales unit for it and the business has the number from the customer, with consent to be asked this way; otherwise use link or qr. The customer has ${DEFAULT_APPROVAL_MINUTES} minutes to approve. With expiresAt the customer can pay later, at most 60 days ahead; Vipps MobilePay enables that for each sales unit and sets its limit, and orderLines are then required. ` +
+      `Ask a customer to pay an amount: creates an ePayment payment request that the customer approves in the Vipps or MobilePay app. delivery says how it reaches the customer: link returns an address the customer opens (the app on a phone, otherwise the Vipps MobilePay landing page), qr returns the address of a QR code the customer scans, and phone sends the request to the app of the customer with that phone number. phone works only when Vipps MobilePay has approved the sales unit for it and the business has the number from the customer, with consent to be asked this way; otherwise use link or qr. The customer has ${DEFAULT_APPROVAL_MINUTES} minutes to approve. With expiresAt the customer can pay later, at most 60 days ahead; Vipps MobilePay enables that for each sales unit and sets its limit, and orderLines are then required (in NOK with productUrl on every line). ` +
       'Moves no money by itself: approval reserves the amount and capture_payment draws it, get_payment shows the state, and cancel_payment cancels the request. ' +
-      'The reference is the order or invoice number the business itself uses; it is shown to the customer and can be used once. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, so the same request is created only once. Never change the reference to try again. ' +
+      'The reference is the order or invoice number the business itself uses; it is shown to the customer and can be used once. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, so the same request is created only once, and the answer says whether it was created now or exists already (alreadyExists) and its state. Never change the reference to try again. A reference that another request has is refused, whatever the amount. ' +
       'A request the customer has seen cannot be taken back, only cancelled. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
     inputShape: {
       reference: z

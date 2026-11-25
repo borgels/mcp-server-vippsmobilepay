@@ -133,14 +133,23 @@ export function canonicalJson(value: unknown): string {
 }
 
 /**
- * The Idempotency-Key of a request this server builds itself: `kind`, a dash
- * and 32 hex characters of the SHA-256 of the request's own content. The
- * same content always gives the same key and any other content another, so a
- * request repeated after a failure or a lost answer is the same request to
- * Vipps MobilePay, and a caller cannot repeat it under a new key. The content
- * is not recoverable from the key by itself, but a key is no pseudonym: it is
- * sent to Vipps MobilePay only, never logged and never returned.
+ * The fingerprint of a request this server builds itself: 32 hex characters
+ * of the SHA-256 of its content. The same content always gives the same
+ * fingerprint and any other content another. It is no pseudonym: content
+ * with few possible values (a phone number) can be found from it by trying
+ * them, so it goes to Vipps MobilePay only, which has the content already,
+ * and is never logged and never returned.
  */
-export function derivedIdempotencyKey(kind: 'create', content: unknown): string {
-  return `${kind}-${createHash('sha256').update(canonicalJson(content)).digest('hex').slice(0, 32)}`;
+export function contentFingerprint(content: unknown): string {
+  return createHash('sha256').update(canonicalJson(content)).digest('hex').slice(0, 32);
+}
+
+/**
+ * The Idempotency-Key of a request this server builds itself: `kind`, a dash
+ * and the request's fingerprint. A request repeated after a failure or a
+ * lost answer is then the same request to Vipps MobilePay, and a caller
+ * cannot repeat it under a new key.
+ */
+export function derivedIdempotencyKey(kind: 'create', fingerprint: string): string {
+  return `${kind}-${fingerprint}`;
 }
