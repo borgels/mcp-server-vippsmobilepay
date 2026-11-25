@@ -11,6 +11,14 @@ import { IDEMPOTENCY_KEY_PATTERN, readOnlyClient, type UpstreamClient, type Vipp
 import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
 import { withheldResult } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
+import {
+  checkCreatePayment,
+  createPayment,
+  DEFAULT_APPROVAL_MINUTES,
+  MAX_ORDER_LINES,
+  PAYMENT_DELIVERIES,
+  QR_FORMATS,
+} from '../vipps/payment-requests.js';
 import { cancelPayment, capturePayment, getPayment, refundPayment } from '../vipps/payments.js';
 import {
   AGREEMENT_STATUSES,
@@ -34,14 +42,17 @@ import {
 import {
   daysBetween,
   isAmountMinor,
+  isHttpsUrl,
   isIsoDate,
   isMerchantCurrency,
   LEDGER_ID_PATTERN,
   MAX_AMOUNT_MINOR,
   MERCHANT_CURRENCIES,
+  PHONE_NUMBER_PATTERN,
   pseudonym,
   RECURRING_ID_PATTERN,
   REFERENCE_PATTERN,
+  timestampMs,
 } from '../vipps/values.js';
 
 type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATIONS;
@@ -64,8 +75,8 @@ export interface RedactingClient extends UpstreamClient {
   readonly keyType: VippsKeyType;
 }
 
-/** What a write tool does to money. */
-export type VippsChangeAction = 'capture' | 'refund' | 'cancel';
+/** What a write tool does: to money (capture, refund, cancel), or `create` for a new payment request. */
+export type VippsChangeAction = 'capture' | 'refund' | 'cancel' | 'create';
 
 /**
  * The type a logged value must have; anything else is left out of the values.
@@ -78,8 +89,10 @@ export type VippsChangeAction = 'capture' | 'refund' | 'cancel';
  *                in clear: the value is "sha256:" and 16 hex characters of its
  *                SHA-256, or "hmac:" and 16 hex characters of its HMAC-SHA-256
  *                when the host gives a key (see pseudonym()).
+ *   delivery     how a payment request reaches the customer: link, qr or
+ *                phone, in clear. Never the phone number itself.
  */
-export type VippsLogFieldType = 'amountMinor' | 'currency' | 'flag' | 'pseudonym';
+export type VippsLogFieldType = 'amountMinor' | 'currency' | 'flag' | 'pseudonym' | 'delivery';
 
 export interface VippsLogField {
   readonly name: string;
@@ -88,17 +101,21 @@ export interface VippsLogField {
 
 /**
  * Write tools only: what the change does, for a host that logs a change
- * before it is sent and asks a person to confirm it. `logFields` are the
- * input fields that identify the change, each with the one type its value
- * must have; never a name or a free text (a refund's description is not
- * among them).
+ * before it is sent and asks a person to confirm it. `logFields` are the input fields that identify the change, each with the
+ * one type its value must have; never a name, a phone number or a free text
+ * (a description is not among them).
  */
 export interface VippsChangeSpec {
   readonly action: VippsChangeAction;
   /** The kind of thing the change touches: 'payment' (ePayment) or 'charge' (Recurring). */
   readonly record: 'payment' | 'charge';
-  /** Always true here: every write tool moves or releases money. A host should have a person confirm it. */
-  readonly movesMoney: true;
+  /**
+   * True when the call itself moves or releases money (capture, refund,
+   * cancel). False for a new payment request: the customer approves it in
+   * the app, and only a capture draws it. A host should have a person
+   * confirm either kind.
+   */
+  readonly movesMoney: boolean;
   readonly logFields: readonly VippsLogField[];
 }
 
@@ -150,7 +167,8 @@ const change = (
 ): VippsChangeSpec => ({
   action,
   record,
-  movesMoney: true,
+  // A new payment request moves nothing until the customer approves it and it is captured.
+  movesMoney: action !== 'create',
   logFields: Object.entries(logFields).map(([name, type]) => ({ name, type })),
 });
 
@@ -192,6 +210,17 @@ function checkPeriod(input: Record<string, unknown>): string | undefined {
 
 const WRITE_NOTE =
   'Moves or releases money and cannot be undone. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.';
+
+const httpsUrlSchema = z.string().refine(value => isHttpsUrl(value, 500), 'must be an https:// address of at most 500 characters');
+const orderLineSchema = z.strictObject({
+  name: z.string().trim().min(1).max(100).describe('What is sold, as the customer sees it.'),
+  id: z.string().trim().min(1).max(64).describe('The product or line number the business uses.'),
+  totalAmount: z.number().int().min(0).max(MAX_AMOUNT_MINOR).describe('The line with VAT, in minor units.'),
+  totalAmountExcludingTax: z.number().int().min(0).max(MAX_AMOUNT_MINOR).describe('The line without VAT, in minor units.'),
+  totalTaxAmount: z.number().int().min(0).max(MAX_AMOUNT_MINOR).describe('The VAT of the line, in minor units.'),
+  taxRate: z.number().int().min(0).max(10_000).describe('VAT rate in hundredths of a percent: 25 % is 2500.'),
+  productUrl: httpsUrlSchema.optional().describe('An https address of the product at the business.'),
+});
 
 export const VIPPS_TOOLS: ToolDefinition[] = [
   defineTool({
@@ -328,6 +357,64 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     upstream: [{ access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' }],
     keyTypes: ALL_KEYS,
     handler: async (client, input) => getCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_create_payment',
+    title: 'Create payment request (Vipps MobilePay)',
+    description:
+      `Ask a customer to pay an amount: creates an ePayment payment request that the customer approves in the Vipps or MobilePay app. delivery says how it reaches the customer: link returns an address the customer opens (the app on a phone, otherwise the Vipps MobilePay landing page), qr returns the address of a QR code the customer scans, and phone sends the request to the app of the customer with that phone number. phone works only when Vipps MobilePay has approved the sales unit for it and the business has the number from the customer, with consent to be asked this way; otherwise use link or qr. The customer has ${DEFAULT_APPROVAL_MINUTES} minutes to approve. With expiresAt the customer can pay later, at most 60 days ahead; Vipps MobilePay enables that for each sales unit and sets its limit, and orderLines are then required. ` +
+      'Moves no money by itself: approval reserves the amount and capture_payment draws it, get_payment shows the state, and cancel_payment cancels the request. ' +
+      'The reference is the order or invoice number the business itself uses; it is shown to the customer and can be used once. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, so the same request is created only once. Never change the reference to try again. ' +
+      'A request the customer has seen cannot be taken back, only cancelled. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
+    inputShape: {
+      reference: z
+        .string()
+        .trim()
+        .regex(REFERENCE_PATTERN)
+        .describe('The order or invoice number the business itself uses for this request (8-64 letters, digits or dashes). Shown to the customer; used once per sales unit.'),
+      amount: amountSchema,
+      currency: currencySchema.describe('ISO 4217 currency code. Must be the currency of the sales unit.'),
+      description: z.string().trim().min(3).max(100).describe('What the customer is asked to pay for (3-100 characters), shown on the payment screen.'),
+      delivery: z.enum(PAYMENT_DELIVERIES).describe('link, qr or phone.'),
+      phoneNumber: z
+        .string()
+        .regex(PHONE_NUMBER_PATTERN)
+        .optional()
+        .describe('Only with delivery phone: the number of the customer as digits with country code and no plus sign, e.g. 4512345678.'),
+      returnUrl: httpsUrlSchema
+        .optional()
+        .describe('Required with delivery link: the https address the customer is sent to after the payment page, e.g. the website of the business.'),
+      expiresAt: z
+        .string()
+        .refine(value => timestampMs(value) !== undefined, 'must be a time with a time zone, e.g. 2026-12-15T23:59:59+01:00')
+        .optional()
+        .describe('Only for a request the customer can pay later: the deadline, more than 10 minutes and less than 60 days ahead, e.g. 2026-12-15T23:59:59+01:00.'),
+      orderLines: z
+        .array(orderLineSchema)
+        .min(1)
+        .max(MAX_ORDER_LINES)
+        .optional()
+        .describe('What is sold, shown to the customer in the app. Required with expiresAt. The lines must add up to the amount.'),
+      receiptNumber: z.string().trim().min(1).max(64).optional().describe('The receipt or invoice number the business uses, shown with the order lines.'),
+      customerPresent: z.boolean().optional().describe('True when the customer is at the point of sale, e.g. a QR code shown on a screen in the shop.'),
+      qrFormat: z.enum(QR_FORMATS).optional().describe('Only with delivery qr: an image (default IMAGE/SVG+XML) or TEXT/TARGETURL for the address the code holds.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Created payment request.',
+    upstream: [
+      { access: 'write', method: 'POST', path: '/epayment/v1/payments' },
+      { access: 'read', method: 'GET', path: '/epayment/v1/payments/{reference}' },
+    ],
+    keyTypes: ALL_KEYS,
+    change: change('create', 'payment', {
+      reference: 'pseudonym',
+      amount: 'amountMinor',
+      currency: 'currency',
+      delivery: 'delivery',
+    }),
+    check: input => checkCreatePayment(input),
+    handler: async (client, input) => createPayment(client, input),
   }),
   defineTool({
     name: 'vipps_capture_payment',
@@ -467,6 +554,8 @@ export function logFieldValue(
       return typeof value === 'boolean' ? value : undefined;
     case 'pseudonym':
       return typeof value === 'string' && value.length > 0 && value.length <= 100 ? pseudonym(value, pseudonymKey) : undefined;
+    case 'delivery':
+      return typeof value === 'string' && (PAYMENT_DELIVERIES as readonly string[]).includes(value) ? value : undefined;
     default:
       return undefined;
   }

@@ -54,7 +54,7 @@ import {
  * What no policy can turn on: a request outside the client's fixed list
  * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that changes an
  * agreement (price, interval, status), merchant or sales unit settings, or
- * the keys, and none that creates a payment or a charge.
+ * the keys, and none that creates a charge.
  */
 
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
@@ -117,17 +117,19 @@ export interface GatewayToolCatalogEntry {
   /** The key types the tool works with. Report tools need the merchant's own keys. */
   readonly keyTypes: readonly VippsKeyType[];
   /**
-   * Vipps MobilePay addition: true for every tool that moves or releases
-   * money (all write tools). A host should have a person confirm each call
-   * outside the chat before it runs.
+   * Vipps MobilePay addition: true for every write tool. A capture, refund
+   * or cancellation moves or releases money, and a payment request reaches
+   * a customer: a host should have a person confirm each call outside the
+   * chat before it runs. `change.movesMoney` tells the two kinds apart.
    */
   readonly requiresConfirmation: boolean;
   /**
    * Write tools only: what the change does, for a host that logs a change
    * before it is sent. `logFields` are the input fields that identify it,
    * each with the one type its value must have (amounts in minor units, ISO
-   * currency codes and flags in clear; references, agreement and charge
-   * ids and idempotency keys only as pseudonyms; never names or free text).
+   * currency codes, flags and the delivery of a payment request in clear;
+   * references, agreement and charge ids and idempotency keys only as
+   * pseudonyms; never names, phone numbers or free text).
    * `resolveVippsChange` returns their values.
    */
   readonly change?: VippsChangeSpec;
@@ -165,7 +167,8 @@ export interface VippsChange {
   readonly tool: string;
   readonly action: VippsChangeAction;
   readonly record: 'payment' | 'charge';
-  readonly movesMoney: true;
+  /** Whether the call itself moves or releases money (false for a new payment request). */
+  readonly movesMoney: boolean;
   /**
    * The values of the tool's `logFields` that are present and have their
    * field's type. A value of the wrong type is left out, so a name or a free
@@ -252,8 +255,9 @@ function toolByGatewayName(toolName: unknown): ToolDefinition | undefined {
 /**
  * Resolves what a write tool call will change, for a host that logs the
  * change (and asks a person to confirm it) before the call runs: the action,
- * the record kind and the values of the tool's `logFields` that are present
- * and well-formed. Identifiers the caller chose (reference, agreement and
+ * the record kind, whether the call itself moves money and the values of the
+ * tool's `logFields` that are present and well-formed. Identifiers the
+ * caller chose (reference, agreement and
  * charge id, idempotency key) come back only as pseudonyms: HMAC-SHA-256 with
  * `options.pseudonymKey` when the host gives one (recommended: a reference
  * such as an order number is easy to guess from a plain hash), otherwise
@@ -283,7 +287,7 @@ export function resolveVippsChange(
       tool: stripPrefix(tool.name),
       action: tool.change.action,
       record: tool.change.record,
-      movesMoney: true as const,
+      movesMoney: tool.change.movesMoney,
       values: Object.freeze(values),
     }),
   };

@@ -151,9 +151,12 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
 }
 
 /**
- * Fields logged in clear text: provider ledger ids (digits), dates, enum
- * values, amounts in minor units, currency codes and flags. They are checked
- * against the tool's input schema before a call runs.
+ * Fields logged in clear text: provider ledger ids (digits), dates and
+ * times, enum values, amounts in minor units, currency codes and flags. They
+ * are checked against the tool's input schema before a call runs. A payment
+ * request's phone number, return address, order lines and receipt number are
+ * not logged in any form: a phone number has too few digits for a hash to
+ * hide it.
  */
 const ID_FIELDS = [
   'ledgerId',
@@ -165,6 +168,10 @@ const ID_FIELDS = [
   'amount',
   'currency',
   'cancelTransactionOnly',
+  'delivery',
+  'expiresAt',
+  'customerPresent',
+  'qrFormat',
 ] as const;
 
 /**

@@ -15,6 +15,8 @@
  * short.
  */
 
+import { isHttpsUrl } from './vipps/values.js';
+
 /** Configured secrets shorter than this are not redacted by value (too likely to hit normal text). */
 export const MIN_SECRET_LENGTH = 8;
 /** Any piece of a secret this long or longer is redacted, wherever it appears. */
@@ -259,15 +261,18 @@ export class VippsHttpError extends Error {
   readonly retryAfter?: string;
   /** The vendor's own id for the request, when a response header gives one as a UUID or hex id. */
   readonly requestId?: string;
+  /** True when the Access Token API answered: no API request was sent. */
+  readonly tokenRequest: boolean;
 
-  constructor(input: { status: number; url: string; retryAfter?: string; tokenRequest?: boolean; requestId?: string }) {
-    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true));
+  constructor(input: { status: number; url: string; retryAfter?: string; tokenRequest?: boolean; requestId?: string; note?: string }) {
+    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note));
     this.name = 'VippsHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
     const retryMs = parseRetryAfterMs(input.retryAfter);
     this.retryAfter = retryMs === undefined ? undefined : String(Math.ceil(retryMs / 1000));
     this.requestId = vendorRequestId(input.requestId);
+    this.tokenRequest = input.tokenRequest === true;
   }
 }
 
@@ -341,14 +346,30 @@ export function failureMetadata(error: unknown): FailureMetadata | undefined {
   return requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId };
 }
 
-/** The whole text of an HTTP error: status, our hint, and a parsed Retry-After in seconds. */
-export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false): string {
+/**
+ * The same HTTP error with a note of our own added to its text: what the status means for the tool that met it. The
+ * note is a fixed text of ours; status, Retry-After and request id are kept, and nothing of the answer is read.
+ */
+export function withNote(error: VippsHttpError, note: string): VippsHttpError {
+  return new VippsHttpError({
+    status: error.status,
+    url: error.url,
+    retryAfter: error.retryAfter,
+    requestId: error.requestId,
+    tokenRequest: error.tokenRequest,
+    note,
+  });
+}
+
+/** The whole text of an HTTP error: status, our hint, a parsed Retry-After in seconds, and a tool's own note. */
+export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false, note?: string): string {
   const retryMs = parseRetryAfterMs(retryAfter);
   const hints = tokenRequest ? TOKEN_STATUS_HINTS : STATUS_HINTS;
   return [
     tokenRequest ? `Vipps MobilePay access token request failed with HTTP ${status}` : `Vipps MobilePay API request failed with HTTP ${status}`,
     Object.hasOwn(hints, status) ? hints[status] : undefined,
     retryMs === undefined ? undefined : `retry-after=${Math.ceil(retryMs / 1000)}s`,
+    note,
   ]
     .filter(Boolean)
     .join(' | ');
@@ -379,6 +400,37 @@ export function describeUrl(url: string | URL): string {
   }
 }
 
+/** The longest customer link passed on. */
+export const MAX_CUSTOMER_LINK_LENGTH = 4096;
+/**
+ * A link Vipps MobilePay made for the customer to open: the address of a
+ * payment request, or of its QR code. It carries the customer's own token for
+ * that one payment, and it is what a payment request exists to hand over, so
+ * redactDeep passes it on unchanged. The credential-shaped patterns would
+ * otherwise mask the token (it is a JSON Web Token) and leave a link that
+ * opens nothing.
+ *
+ * Only the patterns are set aside. The link still passes the sink check in
+ * its final form (leaksSecret), so a link that holds this instance's key, a
+ * piece of it or its access token withholds the whole result. A link is made
+ * only by CustomerLink.from: an https address of URL characters, with a host
+ * and without a user name or password, at most MAX_CUSTOMER_LINK_LENGTH
+ * characters. It cannot hold a sentence.
+ */
+export class CustomerLink {
+  private constructor(readonly href: string) {}
+
+  /** The link when the value is one in the form above; otherwise undefined. */
+  static from(value: unknown): CustomerLink | undefined {
+    return isHttpsUrl(value, MAX_CUSTOMER_LINK_LENGTH) ? new CustomerLink(value) : undefined;
+  }
+
+  /** The link as text: how it is written in a result. */
+  toJSON(): string {
+    return this.href;
+  }
+}
+
 /**
  * Copy of a JSON-like value with every string, object keys included, passed
  * through redactSecrets, and every number, boolean or bigint whose string form
@@ -387,6 +439,7 @@ export function describeUrl(url: string | URL): string {
  * a serialised secret is escaped, and the escaped form is easy to miss.
  * Anything nested deeper than MAX_REDACT_DEPTH is replaced, never passed on,
  * so a deep value cannot exhaust the stack when the copy is serialised.
+ * A CustomerLink is passed on as it is (see the class).
  */
 export function redactDeep(value: unknown, redactor?: SecretRedactor, depth = 0): unknown {
   if (depth > MAX_REDACT_DEPTH) {
@@ -401,6 +454,9 @@ export function redactDeep(value: unknown, redactor?: SecretRedactor, depth = 0)
     return typeof value === 'bigint' ? text : value;
   }
   if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  if (value instanceof CustomerLink) {
     return value;
   }
   const json = (value as { toJSON?: unknown }).toJSON;

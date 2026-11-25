@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased: payment requests
+
+- New write tool `create_payment`: ask a customer to pay with an ePayment
+  payment request, as a link (`WEB_REDIRECT`), as a QR code (`QR`) or sent to
+  the customer's phone number (`PUSH_MESSAGE`, only where Vipps MobilePay has
+  approved the sales unit for it), optionally with a deadline of up to 60
+  days (`expiresAt`, where Vipps MobilePay has enabled it for the sales unit;
+  order lines are then required). Off by default like the other writes, and
+  `requiresConfirmation` like them. `POST /epayment/v1/payments` is added to
+  the fixed list of requests; nothing else is.
+- The request's `Idempotency-Key` is not chosen by the caller: the server
+  derives it from the sales unit and the request's own content, so a request
+  repeated after a failure or a lost answer is created once and cannot be
+  repeated under a new key. A request refused because the reference is used
+  is answered with the existing payment (`alreadyExists`) when amount and
+  currency are the same, and refused when they differ.
+- Gateway catalog: `change.action` can be `create`, `change.movesMoney` is a
+  boolean (false for `create_payment`, true for the others as before), and
+  there is a log field type `delivery` (`link`, `qr` or `phone`, in clear).
+  A host that has typed `movesMoney` as `true` must widen it.
+- The customer's link in a result is passed on whole. It carries a token in
+  the form of a JSON Web Token, which the redaction would otherwise mask; the
+  check that withholds a result holding a piece of the instance's keys still
+  applies to it.
+- The capture, refund and cancel tools are unchanged, their caller-chosen
+  `idempotencyKey` included.
+
 ## Unreleased
 
 - `list_transactions` and `get_funds_summary` read every page of a ledger date

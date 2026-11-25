@@ -97,9 +97,11 @@ export interface ResponsePage<T> {
 /** Options of a request that changes something. */
 export interface WriteOptions {
   /**
-   * Idempotency-Key header. Required: the caller chooses it, logs it before
-   * the request, and sends the same key when it repeats the same change, so
-   * Vipps MobilePay carries the change out once. It is never generated here.
+   * Idempotency-Key header. Required, and never generated here. For a capture,
+   * refund or cancellation the caller chooses it, logs it before the request,
+   * and sends the same key when it repeats the same change, so Vipps MobilePay
+   * carries the change out once. For a new payment the tool derives it from
+   * the request's own content (derivedIdempotencyKey in values.ts).
    */
   idempotencyKey: string;
 }
@@ -161,8 +163,8 @@ const TRANSIENT_NETWORK_CODES = new Set([
  * Every API request this server can make, by method. A path is checked
  * against this list before anything is sent, whichever tool asks: nothing
  * outside it (agreement changes, merchant or sales unit settings, new
- * payments or charges) can be sent, whatever the policy says. Path segments
- * arrive already encoded by encodePathParam.
+ * charges) can be sent, whatever the policy says. Path segments arrive
+ * already encoded by encodePathParam.
  */
 const SEGMENT = '[^/?#]+';
 const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
@@ -177,6 +179,8 @@ const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
   ],
   POST: [
+    // A new payment request (create_payment). The customer approves it in the app before any money moves.
+    /^\/epayment\/v1\/payments$/,
     new RegExp(`^/epayment/v1/payments/${SEGMENT}/(capture|refund|cancel)$`),
     new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
   ],
@@ -206,6 +210,8 @@ export interface UpstreamClient {
   delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
+  /** The sales unit the keys are used for, when one is configured. Not a secret. */
+  readonly merchantSerialNumber?: string;
 }
 
 /** A view of the client that only allows GET. */
@@ -219,6 +225,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     post: refuse('POST'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
+    merchantSerialNumber: client.merchantSerialNumber,
   };
 }
 
