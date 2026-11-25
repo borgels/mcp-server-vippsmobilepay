@@ -36,6 +36,8 @@ export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonl
     // The sales unit's fixed QR codes (list_qr_codes).
     [/^\/qr\/v1\/merchant-redirect$/, '/qr/v1/merchant-redirect'],
     [/^\/qr\/v1\/merchant-callback$/, '/qr/v1/merchant-callback'],
+    // The host's registrations for events (listWebhooks, src/vipps/webhooks.ts). Never a tool.
+    [/^\/webhooks\/v1\/webhooks$/, '/webhooks/v1/webhooks'],
   ],
   POST: [
     // A new payment request (create_payment). The customer approves it in the app before any money moves.
@@ -47,6 +49,8 @@ export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonl
       new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
       '/recurring/v3/agreements/{agreementId}/charges/{chargeId}/refund',
     ],
+    // The host registers its own address for a sales unit's ePayment events (registerPaymentEvents). Never a tool.
+    [/^\/webhooks\/v1\/webhooks$/, '/webhooks/v1/webhooks'],
   ],
   // Vipps MobilePay cancels a Recurring charge with DELETE on the charge. It is
   // the only DELETE this server can send, and it deletes no record: the charge
@@ -57,6 +61,8 @@ export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonl
       new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
       '/recurring/v3/agreements/{agreementId}/charges/{chargeId}',
     ],
+    // The host also removes a registration of its own address for events (removeWebhook). Never a tool.
+    [/^\/webhooks\/v1\/webhooks\/[A-Za-z0-9-]{8,64}$/, '/webhooks/v1/webhooks/{id}'],
   ],
 };
 
