@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `list_transactions` and `get_funds_summary` no longer fail for a period that
+  reaches past today, such as the current month. Vipps MobilePay answers HTTP
+  400 for a ledger date more than 24 hours ahead, which made the whole call
+  fail. Dates after tomorrow (UTC) are not requested; they are listed in
+  `openDates`, `complete` is `false`, and the days that have been are
+  returned.
+
 ## 0.4.0
 
 - The write tools (capture, refund and cancel of payments and charges) are no

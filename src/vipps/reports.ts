@@ -9,6 +9,9 @@ import { datesBetween } from './values.js';
  * call fails with our own text and returns nothing, rather than a list that
  * looks complete but is not. A ledger date that Vipps MobilePay has not closed
  * yet (`tryLater`) is named in the result, which then says it is incomplete.
+ * So is a date that has not come yet: it is not requested, because Vipps
+ * MobilePay answers HTTP 400 for a ledger date more than 24 hours ahead and the
+ * whole period would fail with it.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -112,6 +115,16 @@ async function readLedgerDate(
   }
 }
 
+/**
+ * The last ledger date worth asking for: tomorrow in UTC. Ledger dates follow the sales unit's time zone, which is
+ * ahead of UTC in Vipps MobilePay's markets, so late in the evening UTC the sales unit's own day is already
+ * tomorrow's date and has entries. A date after that starts more than 24 hours from now, and Vipps MobilePay
+ * refuses it.
+ */
+export function lastAskableLedgerDate(now: number): string {
+  return new Date(now + 86_400_000).toISOString().slice(0, 10);
+}
+
 export interface PeriodInput {
   ledgerId: string;
   fromDate: string;
@@ -126,7 +139,12 @@ export async function listTransactions(
   const budget = { pages: 0 };
   const items: Array<Record<string, unknown>> = [];
   const openDates: string[] = [];
+  const lastAskable = lastAskableLedgerDate(client.currentTime());
   for (const date of datesBetween(input.fromDate, input.toDate)) {
+    if (date > lastAskable) {
+      openDates.push(date);
+      continue;
+    }
     const report = await readLedgerDate(client, input.ledgerId, topic, date, budget);
     if (report.open) openDates.push(date);
     items.push(...report.items);
@@ -189,7 +207,12 @@ export async function fundsSummary(client: UpstreamClient, input: PeriodInput): 
   const budget = { pages: 0 };
   const days: Array<Totals & { ledgerDate: string; open: boolean }> = [];
   const all: Array<Record<string, unknown>> = [];
+  const lastAskable = lastAskableLedgerDate(client.currentTime());
   for (const date of datesBetween(input.fromDate, input.toDate)) {
+    if (date > lastAskable) {
+      days.push({ ledgerDate: date, open: true, ...totalsOf([]) });
+      continue;
+    }
     const report = await readLedgerDate(client, input.ledgerId, 'funds', date, budget);
     days.push({ ledgerDate: date, open: report.open, ...totalsOf(report.items) });
     all.push(...report.items);

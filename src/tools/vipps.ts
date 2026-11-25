@@ -226,7 +226,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     name: 'vipps_get_funds_summary',
     title: 'Settlement and funds summary (Vipps MobilePay)',
     description:
-      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet are listed in openDates. Merchant keys only.',
+      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet, and dates that have not come yet, are listed in openDates. Merchant keys only.',
     inputShape: periodShape,
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
@@ -239,7 +239,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'vipps_list_transactions',
     title: 'Ledger entries for a period (Vipps MobilePay)',
-    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet are listed in openDates, and complete is false. Customer names and messages are not requested. Merchant keys only.`,
+    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet, and dates that have not come yet, are listed in openDates, and complete is false. Customer names and messages are not requested. Merchant keys only.`,
     inputShape: {
       ...periodShape,
       topic: z.enum(['funds', 'fees']).optional().describe('funds (default) or fees.'),

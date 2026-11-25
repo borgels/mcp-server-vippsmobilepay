@@ -46,7 +46,7 @@ Amounts are in minor units (øre, cent): 125,50 kr is `12550`.
 | Agreements | 10 pages of 500 |
 | Charges of one agreement | 20 pages (`Continuation-Token`) |
 
-A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`.
+A ledger date Vipps MobilePay has not closed yet (`tryLater`) is listed in `openDates`, and `complete` is `false`. So is a date that has not come yet: it is not requested, since Vipps MobilePay refuses a ledger date more than 24 hours ahead.
 
 **Data, not instructions.** Results from Vipps MobilePay are labelled as data: references, texts and metadata are written by merchants, integrations and customers. The Report API is called without `includeGDPRSensitiveData`, so customer names, messages and phone numbers are not requested.
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_LEDGER_PAGES, MAX_TRANSACTIONS } from '../src/vipps/reports.js';
+import { lastAskableLedgerDate, MAX_LEDGER_PAGES, MAX_TRANSACTIONS } from '../src/vipps/reports.js';
 import { AGREEMENT_PAGE_SIZE, MAX_AGREEMENT_PAGES, MAX_CHARGE_PAGES } from '../src/vipps/recurring.js';
 import { apiCalls, charge, gateway, payment, texts, type Reply } from './helpers.js';
 
@@ -102,6 +102,68 @@ describe('transactions and funds summary', () => {
     ]);
     // Names, messages and phone numbers are never asked for.
     expect(requests.every(call => !('includeGDPRSensitiveData' in call.query))).toBe(true);
+  });
+
+  describe('a period that reaches past today', () => {
+    const day = (date: string) => `GET /report/v2/ledgers/${LEDGER}/funds/dates/${date}`;
+    const closed = (date: string, amount: number) =>
+      reportRoute({ [date]: [{ items: [entry({ ledgerDate: date, amount })], hasMore: false, tryLater: false }] });
+    /** Vipps MobilePay's answer for a ledger date more than 24 hours ahead. */
+    const refused = () => ({ status: 400, body: { title: 'Bad Request', detail: 'ledgerDate is in the future' } });
+    const routes = {
+      [day('2026-11-24')]: closed('2026-11-24', 30_000),
+      [day('2026-11-25')]: reportRoute({ '2026-11-25': [{ items: [entry({ ledgerDate: '2026-11-25', amount: 12_500 })], tryLater: true }] }),
+      [day('2026-11-26')]: reportRoute({ '2026-11-26': [{ items: [], tryLater: true }] }),
+      [day('2026-11-27')]: refused,
+      [day('2026-11-28')]: refused,
+    };
+    const period = { ledgerId: LEDGER, fromDate: '2026-11-24', toDate: '2026-11-28' };
+    const midday = () => Date.parse('2026-11-25T11:00:00Z');
+
+    it('asks only for dates Vipps MobilePay can answer for, and names the rest as open', async () => {
+      const { gw, calls } = gateway(routes, { now: midday });
+      const result = await gw.callTool('list_transactions', period);
+      expect(result.isError).toBeUndefined();
+      expect(result.structuredContent).toMatchObject({
+        complete: false,
+        openDates: ['2026-11-25', '2026-11-26', '2026-11-27', '2026-11-28'],
+        count: 2,
+      });
+      expect(apiCalls(calls).map(call => call.path.split('/').pop())).toEqual(['2026-11-24', '2026-11-25', '2026-11-26']);
+    });
+
+    it('sums the days that have been, with the days to come as open days without entries', async () => {
+      const { gw, calls } = gateway(routes, { now: midday });
+      const result = await gw.callTool('get_funds_summary', period);
+      expect(result.isError).toBeUndefined();
+      expect(result.structuredContent).toMatchObject({
+        complete: false,
+        openDates: ['2026-11-25', '2026-11-26', '2026-11-27', '2026-11-28'],
+        period: { entries: 2, totalsByEntryType: { capture: 42_500 } },
+        days: [
+          { ledgerDate: '2026-11-24', open: false, entries: 1 },
+          { ledgerDate: '2026-11-25', open: true, entries: 1 },
+          { ledgerDate: '2026-11-26', open: true, entries: 0 },
+          { ledgerDate: '2026-11-27', open: true, entries: 0, openingBalance: null, closingBalance: null },
+          { ledgerDate: '2026-11-28', open: true, entries: 0, openingBalance: null, closingBalance: null },
+        ],
+      });
+      expect(apiCalls(calls)).toHaveLength(3);
+    });
+
+    it('asks nothing for a period that has not begun', async () => {
+      const { gw, calls } = gateway(routes, { now: midday });
+      const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-27', toDate: '2026-11-28' });
+      expect(result.isError).toBeUndefined();
+      expect(result.structuredContent).toMatchObject({ complete: false, openDates: ['2026-11-27', '2026-11-28'], count: 0, items: [] });
+      expect(apiCalls(calls)).toHaveLength(0);
+    });
+
+    it("asks for tomorrow's date in UTC: late in the evening it is already the sales unit's day", () => {
+      expect(lastAskableLedgerDate(Date.parse('2026-11-25T00:00:00Z'))).toBe('2026-11-26');
+      expect(lastAskableLedgerDate(Date.parse('2026-11-25T23:59:59Z'))).toBe('2026-11-26');
+      expect(lastAskableLedgerDate(Date.parse('2026-12-31T23:30:00Z'))).toBe('2027-01-01');
+    });
   });
 
   it('reads the fees ledger when asked', async () => {
