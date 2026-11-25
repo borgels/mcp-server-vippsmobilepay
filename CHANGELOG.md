@@ -27,6 +27,11 @@
 - `check_connection` with accounting keys is connected only when a ledger of
   the call's organisation is visible; otherwise its result carries `outcome`:
   `no_ledger_for_owner`, `keys_refused`, `unavailable` or `owner_missing`.
+- The envelope of every page of a funds or fees ledger date is read strictly,
+  with every kind of keys: `items` a list, `tryLater` and `hasMore` present
+  as booleans, and a non-empty `cursor` when `hasMore` is true. A page that
+  lacks one of them, or has one in another type, refuses the report, where
+  it used to be read as the last page of a closed date.
 
 ### Reads
 
@@ -59,8 +64,9 @@
 - `find_charge` leaves an operation key out of a charge's history when it has
   the form this server makes from a request's content. `get_charge` and
   `list_charges` are unchanged and pass the charge on as it comes.
-- Not added: each sale with its lines and VAT. The Sales API takes accounting
-  keys only, which this server does not hold (see the README).
+- Each sale with its lines and VAT comes from the Sales API, which takes
+  accounting keys only: see `list_sales` and `get_sale` under Accounting
+  keys above.
 
 ## 0.6.0
 

@@ -131,18 +131,39 @@ async function readLedgerDate(
         `The report needs more than ${MAX_REPORT_PAGES} pages; choose a shorter period. Refused rather than returned incomplete.`,
       );
     }
-    const body = asRecord(await client.get(path, cursor ? { cursor } : undefined));
-    if (!Array.isArray(body.items)) throw unexpected('a report');
-    // Accounting keys: read strictly from the start. The merchant's own keys: as it came, as before.
-    items.push(...(client.ownLedgers ? ledgerEntriesView(body.items) : body.items.map(asRecord)));
-    if (body.tryLater === true) open = true;
-    if (body.hasMore !== true) {
+    const page = reportPage(await client.get(path, cursor ? { cursor } : undefined));
+    // Accounting keys: the entries read strictly from the start. The merchant's own keys: as they came, as before.
+    items.push(...(client.ownLedgers ? ledgerEntriesView(page.items) : page.items.map(asRecord)));
+    if (page.tryLater) open = true;
+    if (!page.hasMore) {
       return { ledgerDate, open, items };
     }
-    const next = typeof body.cursor === 'string' ? body.cursor : '';
-    if (!next || next === cursor) throw unexpected('a report (more pages without a new cursor)');
-    cursor = next;
+    if (page.cursor === cursor) throw unexpected('a report (more pages without a new cursor)');
+    cursor = page.cursor;
   }
+}
+
+/**
+ * The envelope of one page of a funds or fees ledger date, read strictly with every kind of keys: `items` a list,
+ * `tryLater` and `hasMore` present as booleans (the specification has `hasMore` always present on the dates
+ * endpoint), and with `hasMore` a non-empty `cursor`. Anything else refuses the report: a page that does not say
+ * positively that the date is closed and that there is no more is never taken for the whole date.
+ */
+function reportPage(answer: unknown):
+  | { items: unknown[]; tryLater: boolean; hasMore: false }
+  | { items: unknown[]; tryLater: boolean; hasMore: true; cursor: string } {
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw unexpected('a report');
+  const { items, tryLater, hasMore, cursor } = answer as Record<string, unknown>;
+  if (!Array.isArray(items) || typeof tryLater !== 'boolean' || typeof hasMore !== 'boolean') throw unexpected('a report');
+  if (!hasMore) {
+    // Absent on the last page by the specification; when it is there, it must still be a text.
+    if (cursor !== undefined && cursor !== null && typeof cursor !== 'string') throw unexpected('a report');
+    return { items, tryLater, hasMore };
+  }
+  if (typeof cursor !== 'string' || cursor === '' || cursor.length > 4096) {
+    throw unexpected('a report (more pages without a new cursor)');
+  }
+  return { items, tryLater, hasMore, cursor };
 }
 
 /** The time zone furthest ahead among Vipps MobilePay's markets (Denmark, Finland, Norway and Sweden): Finland's. */

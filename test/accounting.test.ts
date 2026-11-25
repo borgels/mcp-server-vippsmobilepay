@@ -609,3 +609,100 @@ describe('accounting keys: audit', () => {
     expect(text).toContain('policy_denied');
   });
 });
+
+/** Report pages whose envelope does not say positively that the date is read to its end and closed. */
+const BAD_REPORT_PAGES: Array<Record<string, unknown>> = [
+  { items: [], hasMore: 'true', cursor: 'next', tryLater: false },
+  { items: [], hasMore: false, tryLater: 'true' },
+  { items: [] },
+  { items: [], tryLater: false },
+  { items: [], hasMore: false },
+  { hasMore: false, tryLater: false },
+  { items: {}, hasMore: false, tryLater: false },
+  { items: [], hasMore: 1, tryLater: false },
+  { items: [], hasMore: false, tryLater: null },
+  { items: [], hasMore: null, tryLater: false },
+  { items: [], hasMore: true, tryLater: false },
+  { items: [], hasMore: true, cursor: '', tryLater: false },
+  { items: [], hasMore: true, cursor: 7, tryLater: false },
+  { items: [], hasMore: false, cursor: 7, tryLater: false },
+];
+
+describe('accounting keys: the envelope of a report page', () => {
+  it('refuses a page whose control fields are missing or of another type, for every Report tool', async () => {
+    for (const body of BAD_REPORT_PAGES) {
+      for (const name of ['list_transactions', 'get_funds_summary']) {
+        const { gw } = accountingGateway(
+          { ...ledgerList(BOTH), 'GET /report/v2/ledgers/302321/funds/dates/2026-11-03': { body } },
+          { now: NOW },
+        );
+        const result = await gw.callTool(name, SAMPLES[name] as GatewayJsonObject, { owner: OWNER });
+        expect(result.isError, `${name} ${JSON.stringify(body)}`).toBe(true);
+        expect(result.structuredContent, `${name} ${JSON.stringify(body)}`).toBeUndefined();
+      }
+    }
+  });
+
+  it('is complete only when the last page says hasMore false and tryLater false', async () => {
+    for (const [body, complete] of [
+      [{ items: [entry()], hasMore: false, tryLater: false }, true],
+      [{ items: [entry()], hasMore: false, tryLater: true }, false],
+    ] as const) {
+      const { gw } = accountingGateway({ ...ledgerList(BOTH), 'GET /report/v2/ledgers/302321/funds/dates/2026-11-03': { body } }, { now: NOW });
+      const result = await gw.callTool('list_transactions', SAMPLES.list_transactions as GatewayJsonObject, { owner: OWNER });
+      expect(result.isError).toBeUndefined();
+      expect((result.structuredContent as { complete: boolean }).complete).toBe(complete);
+    }
+  });
+});
+
+describe('accounting keys: more', () => {
+  it('serves overlapping calls for different owners with one token request and separate ledger sets', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const { gw, calls } = accountingGateway(
+      {
+        [`POST ${ACCOUNTING_TOKEN_PATH}`]: async () => {
+          await gate;
+          return { body: { access_token: 'notreal-access-shared-xxxxxxxxxxxxxxxxxxxxxxxx', expires_in: 900, token_type: 'Bearer' } };
+        },
+        ...ledgerList(BOTH),
+        ...everyRead(),
+      },
+      { now: NOW },
+    );
+    const pending = [
+      gw.callTool('list_sales', SAMPLES.list_sales as GatewayJsonObject, { owner: OWNER }),
+      gw.callTool('list_sales', { ...SAMPLES.list_sales, ledgerId: OTHER_LEDGER } as GatewayJsonObject, { owner: OTHER }),
+      gw.callTool('list_sales', { ...SAMPLES.list_sales, ledgerId: OTHER_LEDGER } as GatewayJsonObject, { owner: OWNER }),
+      gw.callTool('list_sales', SAMPLES.list_sales as GatewayJsonObject, { owner: OTHER }),
+    ];
+    release();
+    const [own, other, crossA, crossB] = await Promise.all(pending);
+    expect(own?.isError).toBeUndefined();
+    expect(other?.isError).toBeUndefined();
+    expect(crossA?.isError).toBe(true);
+    expect(crossB?.isError).toBe(true);
+    expect(calls.filter(call => call.path === ACCOUNTING_TOKEN_PATH)).toHaveLength(1);
+    expect(calls.filter(call => call.path === '/settlement/v1/ledgers')).toHaveLength(4);
+    const salesPaths = calls.filter(call => call.path.startsWith('/sales/')).map(call => call.path).sort();
+    expect(salesPaths).toEqual([
+      '/sales/report/v1/ledgers/302321/dates/2026-11-03',
+      '/sales/report/v1/ledgers/402432/dates/2026-11-03',
+    ]);
+  });
+
+  it('refuses a sale answered with another pspReference than the one asked for', async () => {
+    const { gw } = accountingGateway({
+      ...ledgerList(BOTH),
+      'GET /sales/report/v1/ledgers/302321/psp-references/3343121302': {
+        body: { items: [sale(), sale({ pspReference: '3343121399' })], cursor: null, hasMore: false },
+      },
+    });
+    const result = await gw.callTool('get_sale', { ledgerId: OWN_LEDGER, pspReference: '3343121302' }, { owner: OWNER });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('3343121399');
+  });
+});
