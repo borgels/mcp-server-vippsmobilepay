@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: reads
+## 0.7.0
 
 - Five new read tools. `find_charge`: one Recurring charge by its own id,
   when the agreement is not known. `get_receipt`: the order lines with VAT,
