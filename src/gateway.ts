@@ -1,5 +1,6 @@
 import { z } from 'zod/v4';
 import { UNTRUSTED_CONTENT_NOTE } from './vipps/annotations.js';
+import { readLedgerOwners, type LedgerOwners } from './vipps/owner-binding.js';
 import {
   VippsMobilePayClient,
   type VippsClientOptions,
@@ -88,6 +89,7 @@ export type {
   VippsLogFieldType,
 } from './tools/vipps.js';
 export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
+export type { LedgerOwnerCount, LedgerOwners } from './vipps/owner-binding.js';
 /** The ePayment events a host can register its address for (registerPaymentEvents). */
 export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
 
@@ -571,6 +573,18 @@ function buildGateway(options: VippsGatewayOptions, secrets: Partial<Record<Secr
         if (id !== registration.id || redactor.matches(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
         return { id, secret: registration.secret };
       }, undefined, false);
+    },
+    /**
+     * Host only, never a tool, and accounting keys only: which organisations have given the accounting partner access,
+     * by the owner each ledger names, with the number of their ledgers and sales units. For the host's operator, to see
+     * that an access has arrived and whose it is. Nothing else of a ledger is returned (no ids, names or accounts), and
+     * nothing is bound to an organisation: never give it to a customer or to an AI.
+     */
+    ledgerOwners(): Promise<LedgerOwners> {
+      return hostCall(async () => {
+        if (client.keyType !== 'accounting') throw new Error('ledgerOwners works with accounting keys only.');
+        return readLedgerOwners(client);
+      });
     },
     /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
     listWebhooks(): Promise<Webhook[]> {

@@ -6,6 +6,7 @@ import {
   ACCOUNTING_KEYS,
   ACCOUNTING_TOKEN_PATH,
   accountingGateway,
+  KEYS,
   apiCalls,
   makeClient,
   OWNER,
@@ -704,5 +705,49 @@ describe('accounting keys: more', () => {
     const result = await gw.callTool('get_sale', { ledgerId: OWN_LEDGER, pspReference: '3343121302' }, { owner: OWNER });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result)).not.toContain('3343121399');
+  });
+});
+
+describe('accounting keys: which organisations have given access (ledgerOwners, for the host operator)', () => {
+  it('counts ledgers and sales units per owner over every page, and gives nothing else of a ledger', async () => {
+    const unreadable = ledger('502543', { scheme: 'business:DK:CVR' });
+    const twoUnits = ledger('302399', OWNER, {
+      salesUnits: [
+        { name: 'Fjordbageriet', recipientHandle: 'DK:90601', businessIdentifier: OWNER },
+        { name: 'Fjordbageriet Havnen', recipientHandle: 'DK:90602', businessIdentifier: OWNER },
+      ],
+    });
+    const { gw, calls } = accountingGateway({
+      'GET /settlement/v1/ledgers': url =>
+        url.searchParams.get('cursor') === 'page-2'
+          ? { body: { cursor: '', items: [twoUnits, unreadable] } }
+          : { body: { cursor: 'page-2', items: [ledger(OWN_LEDGER, OWNER), ledger(OTHER_LEDGER, OTHER)] } },
+    });
+    const owners = await gw.ledgerOwners();
+    expect(owners).toEqual({
+      owners: [
+        { scheme: OWNER.scheme, id: OWNER.id, ledgers: 2, salesUnits: 3 },
+        { scheme: OTHER.scheme, id: OTHER.id, ledgers: 1, salesUnits: 1 },
+      ],
+      notAttributed: 1,
+    });
+    const text = JSON.stringify(owners);
+    for (const hidden of ['Fjordbageriet', '90601', OWN_LEDGER, '12345678901234', 'DKK']) expect(text).not.toContain(hidden);
+    expect(apiCalls(calls).map(call => call.path)).toEqual(['/settlement/v1/ledgers', '/settlement/v1/ledgers']);
+  });
+
+  it('is refused with the merchant’s own keys, before anything is sent', async () => {
+    const calls: string[] = [];
+    const gw = createVippsMobilePayGateway({
+      ...KEYS,
+      environment: 'production',
+      fetchImpl: async input => {
+        calls.push(new URL(String(input)).pathname);
+        return new Response('{}', { status: 500 });
+      },
+      policy: { enableWrites: false },
+    });
+    await expect(gw.ledgerOwners()).rejects.toThrow(/accounting keys only/);
+    expect(calls).toEqual([]);
   });
 });

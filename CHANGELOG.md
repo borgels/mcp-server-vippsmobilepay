@@ -24,6 +24,10 @@
 - `payoutBankAccount` is never passed on with accounting keys, and the
   customer fields of the Sales API are left out. Every answer read with
   accounting keys passes a strict allow-list.
+- `ledgerOwners()`, a host function for the host's operator (never a tool):
+  which organisations have given access, as `{ scheme, id, ledgers,
+  salesUnits }` per owner and a count of ledgers that name none. Nothing else
+  of a ledger is returned. Accounting keys only.
 - `check_connection` with accounting keys is connected only when a ledger of
   the call's organisation is visible; otherwise its result carries `outcome`:
   `no_ledger_for_owner`, `keys_refused`, `unavailable` or `owner_missing`.

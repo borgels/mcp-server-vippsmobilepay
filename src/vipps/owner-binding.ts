@@ -209,3 +209,55 @@ export async function requireOwnLedger(client: UpstreamClient, ledgerId: string)
   if (!client.ownLedgers) return;
   if (!(await client.ownLedgers()).ids.has(ledgerId)) throw new NotOwnLedgerError();
 }
+
+/** One organisation that has given the accounting partner access, as the host's operator may see it: counts only. */
+export interface LedgerOwnerCount {
+  readonly scheme: string;
+  readonly id: string;
+  /** Its ledgers in the list. */
+  readonly ledgers: number;
+  /** The sales units those ledgers settle for. */
+  readonly salesUnits: number;
+}
+
+/** Every organisation in the ledger list, with counts, and the ledgers that name no organisation. */
+export interface LedgerOwners {
+  readonly owners: readonly LedgerOwnerCount[];
+  readonly notAttributed: number;
+}
+
+/**
+ * For the host's operator, never for a tool: which organisations have given the accounting partner access, by the
+ * owner each ledger names, with the number of ledgers and sales units. The whole list is read, as for a call (every
+ * page, the same cap, the same refusals); nothing else of a ledger is returned: no ledger id, no name, no number of a
+ * sales unit, no currency and nothing of the payout account. An owner that cannot be read is counted in notAttributed.
+ */
+export async function readLedgerOwners(client: Pick<UpstreamClient, 'get'>): Promise<LedgerOwners> {
+  const counts = new Map<string, { scheme: string; id: string; ledgers: number; salesUnits: number }>();
+  let notAttributed = 0;
+  let cursor: string | undefined;
+  for (let page = 1; page <= MAX_OWNER_LEDGER_PAGES; page += 1) {
+    const answer = ledgerPageView(await client.get(LEDGERS_PATH, cursor ? { cursor } : undefined));
+    for (const item of answer.items) {
+      const named = ledgerOwnerOf(item);
+      if (named === undefined || !OWNER_SCHEME_PATTERN.test(named.scheme) || !OWNER_ID_PATTERN.test(named.id)) {
+        notAttributed += 1;
+        continue;
+      }
+      const key = `${named.scheme} ${named.id}`;
+      const count = counts.get(key) ?? { scheme: named.scheme, id: named.id, ledgers: 0, salesUnits: 0 };
+      count.ledgers += 1;
+      if (Array.isArray(item.salesUnits)) count.salesUnits += item.salesUnits.length;
+      counts.set(key, count);
+    }
+    if (answer.cursor === '' || (answer.cursor === cursor && answer.items.length === 0)) {
+      const owners = [...counts.values()].sort((a, b) => (a.scheme + a.id).localeCompare(b.scheme + b.id));
+      return Object.freeze({ owners: Object.freeze(owners.map(owner => Object.freeze({ ...owner }))), notAttributed });
+    }
+    if (answer.cursor === cursor) throw new UnexpectedAnswerError('the ledger list (a cursor that does not move)');
+    cursor = answer.cursor;
+  }
+  throw new TooMuchDataError(
+    `The ledger list did not end within ${MAX_OWNER_LEDGER_PAGES} pages; refused rather than read in part.`,
+  );
+}
