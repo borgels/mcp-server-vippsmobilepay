@@ -1,6 +1,47 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
+
+### Accounting keys
+
+- A third key type, `keyType: 'accounting'`, for an accounting partner
+  approved by Vipps MobilePay: a client id and a client secret only, in
+  production only, and through the gateway only (the stdio and HTTP servers
+  refuse them, and `VIPPS_KEY_TYPE` cannot name them). The token comes from
+  `POST /miami/v1/token` with Basic credentials and
+  `grant_type=client_credentials`; no subscription key and no MSN is sent.
+- Two new read tools for the Sales API, with accounting keys only:
+  `list_sales` (every sale of a ledger date) and `get_sale` (one sale by
+  `reference` or `pspReference`), each with order lines and VAT. The Report
+  tools work with accounting keys too; every other tool is left out of
+  `tools` and refused before anything is sent.
+- The owner binding: every call with accounting keys must carry
+  `context.owner` (a scheme such as `business:DK:CVR` and a number). The
+  whole ledger list is read for each call, only ledgers whose `owner`
+  matches exactly are kept, and any other ledger id is refused before a
+  report or sales request is sent. Nothing about an organisation is kept
+  between calls; the token is shared.
+- `payoutBankAccount` is never passed on with accounting keys, and the
+  customer fields of the Sales API are left out. Every answer read with
+  accounting keys passes a strict allow-list.
+  A field the Sales API lets be null (`pspReference` for cash,
+  `orderDate`, `classification` and its fields, `amounts.net`, `amounts.vat`,
+  `lines` and the line fields but `quantity`, `cursor`) is left out when null
+  and never refuses the answer.
+- `ledgerOwners()`, a host function for the host's operator (never a tool):
+  which organisations have given access, as `{ scheme, id, ledgers,
+  salesUnits }` per owner and a count of ledgers that name none. Nothing else
+  of a ledger is returned. Accounting keys only.
+- `check_connection` with accounting keys is connected only when a ledger of
+  the call's organisation is visible; otherwise its result carries `outcome`:
+  `no_ledger_for_owner`, `keys_refused`, `unavailable` or `owner_missing`.
+- The envelope of every page of a funds or fees ledger date is read strictly,
+  with every kind of keys: `items` a list, `tryLater` and `hasMore` present
+  as booleans, and a non-empty `cursor` when `hasMore` is true. A page that
+  lacks one of them, or has one in another type, refuses the report, where
+  it used to be read as the last page of a closed date.
+
+### Recurring changes
 
 - Four new Recurring write tools, off by default like every write and
   confirmed (`requiresConfirmation`):
@@ -167,8 +208,9 @@
 - `find_charge` leaves an operation key out of a charge's history when it has
   the form this server makes from a request's content. `get_charge` and
   `list_charges` are unchanged and pass the charge on as it comes.
-- Not added: each sale with its lines and VAT. The Sales API takes accounting
-  keys only, which this server does not hold (see the README).
+- Each sale with its lines and VAT comes from the Sales API, which takes
+  accounting keys only: see `list_sales` and `get_sale` under Accounting
+  keys above.
 
 ## 0.6.0
 

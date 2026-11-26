@@ -1,5 +1,6 @@
 import { z } from 'zod/v4';
 import { UNTRUSTED_CONTENT_NOTE } from './vipps/annotations.js';
+import { readLedgerOwners, type LedgerOwners } from './vipps/owner-binding.js';
 import {
   VippsMobilePayClient,
   type VippsClientOptions,
@@ -27,6 +28,7 @@ import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
   auditRejectedCall,
+  connectionFailureOutcome,
   enabledTools,
   executeTool,
   findTool,
@@ -34,6 +36,7 @@ import {
   validateStartupConfig,
   VIPPS_TOOLS,
   type CallContext,
+  type ConnectionFailureOutcome,
   type ToolDefinition,
   type UpstreamOperation,
   type VippsChangeAction,
@@ -55,6 +58,16 @@ import {
  * (never VIPPS_* credentials from the environment), keeps its own access
  * token, and redacts with its own secrets only.
  *
+ * An instance with accounting keys (keyType accounting) is not one
+ * merchant's: its token reads every business that has given the accounting
+ * partner access. Such an instance offers only the Report and Sales tools,
+ * and every call must name the organisation the caller may see
+ * (`context.owner`). The call reads the ledgers owned by exactly that
+ * organisation and nothing else, and a call without it is refused before
+ * anything is sent (src/vipps/owner-binding.ts). The instance keeps the
+ * token and nothing about any organisation: one instance can serve calls for
+ * many organisations, and nothing read for one call is there for the next.
+ *
  * Instance policy comes from the host when it passes `policy`: that instance
  * then reads none of VIPPS_ENABLE_WRITES, VIPPS_DISABLED_TOOLS,
  * VIPPS_AUDIT_LOG or VIPPS_ALLOW_CUSTOM_BASE_URL. Limits (timeouts, retries)
@@ -67,8 +80,16 @@ import {
 
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
 export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
-export type { VippsChangeAction, VippsChangeRecord, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
+export type {
+  ConnectionFailureOutcome,
+  VippsChangeAction,
+  VippsChangeRecord,
+  VippsChangeSpec,
+  VippsLogField,
+  VippsLogFieldType,
+} from './tools/vipps.js';
 export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
+export type { LedgerOwnerCount, LedgerOwners } from './vipps/owner-binding.js';
 /** The ePayment events a host can register its address for (registerPaymentEvents). */
 export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
 
@@ -96,6 +117,10 @@ export type GatewayFailure = FailureMetadata;
 
 export interface GatewayToolResult {
   content: Array<{ type: 'text'; text: string }>;
+  /**
+   * The data of a successful call. One error result has it too: a connection check with accounting keys that did
+   * not end in a working connection gives `{ connected: false, outcome }` (see ConnectionFailureOutcome).
+   */
   structuredContent?: GatewayJsonValue;
   isError?: boolean;
   /** On an error result from the upstream API only: method, path template, status, ids and error code (see GatewayFailure). */
@@ -127,7 +152,11 @@ export interface GatewayToolCatalogEntry {
   readonly upstream: readonly GatewayUpstreamOperation[];
   /** True when the tool can read more than its name says. False for every tool here. */
   readonly broad: boolean;
-  /** The key types the tool works with. Report tools and the list of sales units need the merchant's own keys. */
+  /**
+   * The key types the tool works with. The list of sales units needs the merchant's own keys; the Report tools
+   * work with those and with accounting keys, the Sales tools with accounting keys only, and with accounting keys
+   * no other tool works.
+   */
   readonly keyTypes: readonly VippsKeyType[];
   /**
    * The environments the tool works in. The two sales unit tools work in
@@ -170,7 +199,9 @@ export interface VippsGatewayOptions
   /**
    * merchant (default): the sales unit's own keys. partner: a partner's keys
    * used for this merchant's MSN; production only, and without the Report
-   * API tools (Vipps MobilePay does not accept partner keys there).
+   * API tools (Vipps MobilePay does not accept partner keys there). For
+   * accounting keys use VippsAccountingGatewayOptions: with them a
+   * subscriptionKey or a merchantSerialNumber is refused.
    */
   keyType?: VippsKeyType;
   /**
@@ -180,6 +211,22 @@ export interface VippsGatewayOptions
    * should always pass it.
    */
   policy?: InstancePolicy;
+}
+
+/**
+ * The options of an instance with an accounting partner's keys: a client id
+ * and a client secret, and nothing else. There is no subscription key and no
+ * Merchant-Serial-Number, and giving one is refused; the keys work in
+ * production only. Every call to such an instance must carry
+ * `context.owner`.
+ */
+export interface VippsAccountingGatewayOptions
+  extends Omit<VippsGatewayOptions, 'subscriptionKey' | 'merchantSerialNumber' | 'environment' | 'keyType'> {
+  keyType: 'accounting';
+  /** Accounting keys exist in production only. */
+  environment: 'production';
+  subscriptionKey?: undefined;
+  merchantSerialNumber?: undefined;
 }
 
 /** What a write tool call will change, resolved from its input before anything is sent. */
@@ -324,6 +371,8 @@ export function resolveVippsChange(
 
 const SECRET_OPTIONS = ['clientId', 'clientSecret', 'subscriptionKey'] as const;
 type SecretOption = (typeof SECRET_OPTIONS)[number];
+/** Accounting keys have no subscription key. */
+const ACCOUNTING_SECRET_OPTIONS = ['clientId', 'clientSecret'] as const;
 
 function requiredSecret(options: Partial<VippsGatewayOptions> | undefined, name: SecretOption): string {
   const value: unknown = options?.[name];
@@ -344,9 +393,15 @@ function requiredSecret(options: Partial<VippsGatewayOptions> | undefined, name:
  * Create one gateway instance for one merchant. clientId, clientSecret,
  * subscriptionKey, merchantSerialNumber and environment are required and are
  * the only credentials the instance uses; a missing value fails here.
+ *
+ * With `keyType: 'accounting'` the instance is an accounting partner's:
+ * clientId, clientSecret and `environment: 'production'` are required, and a
+ * subscription key or a Merchant-Serial-Number is refused.
  */
-export function createVippsMobilePayGateway(options: VippsGatewayOptions) {
+export function createVippsMobilePayGateway(options: VippsGatewayOptions | VippsAccountingGatewayOptions) {
   const given = options as Partial<VippsGatewayOptions> | undefined;
+  const accounting = (given as { keyType?: unknown } | undefined)?.keyType === 'accounting';
+  const required: readonly SecretOption[] = accounting ? ACCOUNTING_SECRET_OPTIONS : SECRET_OPTIONS;
   // What the host gave, admitted or not: every error is masked against it.
   const secrets = SECRET_OPTIONS.flatMap(name => {
     const value: unknown = given?.[name];
@@ -354,14 +409,23 @@ export function createVippsMobilePayGateway(options: VippsGatewayOptions) {
   });
   let guard: SecretRedactor | undefined;
   try {
-    const admitted = Object.fromEntries(SECRET_OPTIONS.map(name => [name, requiredSecret(given, name)])) as Record<SecretOption, string>;
+    if (accounting && (given?.subscriptionKey !== undefined || given?.merchantSerialNumber !== undefined)) {
+      throw new ConfigError(
+        'Accounting keys are a client id and a client secret only: give no subscriptionKey and no merchantSerialNumber with them.',
+      );
+    }
+    const admitted = Object.fromEntries(required.map(name => [name, requiredSecret(given, name)])) as Partial<Record<SecretOption, string>>;
     guard = new SecretRedactor();
-    for (const name of SECRET_OPTIONS) guard.addSecret(admitted[name]);
+    for (const name of required) guard.addSecret(admitted[name]);
+    if (accounting) {
+      // The two keys are also sent joined, as HTTP Basic credentials: that form is a secret of the instance too.
+      guard.addSecret(Buffer.from(`${admitted.clientId}:${admitted.clientSecret}`, 'utf8').toString('base64'));
+    }
     // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of a key.
     if (leaksSecret(fixedOutputs(), guard)) {
       throw new ConfigError(keyRefusedText(''));
     }
-    const gateway = buildGateway(options, admitted);
+    const gateway = buildGateway(options as VippsGatewayOptions, admitted, accounting);
     // The tool list leaves the gateway as it is: a key that shares a piece with it is refused.
     if (leaksSecret(gateway.tools, guard)) {
       throw new ConfigError(keyRefusedText(''));
@@ -384,7 +448,7 @@ export function createVippsMobilePayGateway(options: VippsGatewayOptions) {
   }
 }
 
-function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption, string>) {
+function buildGateway(options: VippsGatewayOptions, secrets: Partial<Record<SecretOption, string>>, accounting: boolean) {
   const {
     policy: hostPolicy,
     clientId: _clientId,
@@ -392,12 +456,16 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
     subscriptionKey: _subscriptionKey,
     merchantSerialNumber,
     environment,
+    keyType: _keyType,
     ...clientOptions
   } = options;
   if (environment !== 'test' && environment !== 'production') {
     throw new ConfigError('createVippsMobilePayGateway requires options.environment: "test" or "production".');
   }
-  if (typeof merchantSerialNumber !== 'string' || !/^\d{4,10}$/.test(merchantSerialNumber)) {
+  if (accounting && environment !== 'production') {
+    throw new ConfigError('Accounting keys work only in the production environment: options.environment must be "production".');
+  }
+  if (!accounting && (typeof merchantSerialNumber !== 'string' || !/^\d{4,10}$/.test(merchantSerialNumber))) {
     throw new ConfigError('createVippsMobilePayGateway requires options.merchantSerialNumber: 4 to 10 digits.');
   }
   const policy = hostPolicy === undefined ? undefined : resolveInstancePolicy(hostPolicy, VIPPS_TOOLS.map(tool => tool.name));
@@ -409,7 +477,8 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
   const client = new VippsMobilePayClient({
     ...clientOptions,
     ...secrets,
-    merchantSerialNumber,
+    // The key type as the host gave it; an unknown one is refused by the client.
+    ...(accounting ? { keyType: 'accounting' as const } : { keyType: options.keyType ?? 'merchant', merchantSerialNumber }),
     environment,
     credentialEnv: {},
     // Under a host's policy nothing is read from the environment, this switch included.
@@ -505,6 +574,18 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
         return { id, secret: registration.secret };
       }, undefined, false);
     },
+    /**
+     * Host only, never a tool, and accounting keys only: which organisations have given the accounting partner access,
+     * by the owner each ledger names, with the number of their ledgers and sales units. For the host's operator, to see
+     * that an access has arrived and whose it is. Nothing else of a ledger is returned (no ids, names or accounts), and
+     * nothing is bound to an organisation: never give it to a customer or to an AI.
+     */
+    ledgerOwners(): Promise<LedgerOwners> {
+      return hostCall(async () => {
+        if (client.keyType !== 'accounting') throw new Error('ledgerOwners works with accounting keys only.');
+        return readLedgerOwners(client);
+      });
+    },
     /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
     listWebhooks(): Promise<Webhook[]> {
       return hostCall(() => listWebhooks(client));
@@ -558,13 +639,20 @@ function buildGateway(options: VippsGatewayOptions, secrets: Record<SecretOption
       const text = tool.returnsUpstreamContent ? `${said} ${UNTRUSTED_CONTENT_NOTE}` : said;
       return jsonResult(text, data);
     } catch (error) {
-      return errorResult(formatUnknownError(error, redactor), failureMetadata(error));
+      const result = errorResult(formatUnknownError(error, redactor), failureMetadata(error));
+      // A connection check with accounting keys says in data, too, what it ended in.
+      return client.keyType === 'accounting' && toolByGatewayName(toolName)?.name === CONNECTION_CHECK
+        ? { ...result, structuredContent: { connected: false, outcome: connectionFailureOutcome(error) satisfies ConnectionFailureOutcome } }
+        : result;
     }
   }
 }
 
 /** A host function's value that held a piece of a secret after redaction: withheld whole. */
 const HOST_ANSWER_WITHHELD = 'The answer from Vipps MobilePay was withheld: it held a piece of a key of this instance.';
+
+/** The connection check: with accounting keys its failures carry an outcome in their data. */
+const CONNECTION_CHECK = `${TOOL_PREFIX}check_connection`;
 
 /** One gateway instance, as returned by createVippsMobilePayGateway. */
 export type VippsMobilePayGateway = ReturnType<typeof createVippsMobilePayGateway>;

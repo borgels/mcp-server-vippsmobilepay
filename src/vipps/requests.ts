@@ -77,11 +77,37 @@ export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonl
   ],
 };
 
+/**
+ * Every API request a client with accounting keys can make: the ledger list,
+ * the funds and fees ledgers of a ledger date, and the sales of a ledger (by
+ * ledger date, by the business's reference, by Vipps MobilePay's
+ * reference). All are GET. Nothing else of ALLOWED_REQUESTS is among them, and
+ * the sales paths are in no other list: the Sales API takes accounting keys
+ * only. The feed of a ledger is not here: it is for keeping a copy, and this
+ * server keeps none.
+ */
+export const ACCOUNTING_REQUESTS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^\/settlement\/v1\/ledgers$/, '/settlement/v1/ledgers'],
+  [/^\/report\/v2\/ledgers\/\d{1,20}\/funds\/dates\/\d{4}-\d{2}-\d{2}$/, '/report/v2/ledgers/{ledgerId}/funds/dates/{date}'],
+  [/^\/report\/v2\/ledgers\/\d{1,20}\/fees\/dates\/\d{4}-\d{2}-\d{2}$/, '/report/v2/ledgers/{ledgerId}/fees/dates/{date}'],
+  [/^\/sales\/report\/v1\/ledgers\/\d{1,20}\/dates\/\d{4}-\d{2}-\d{2}$/, '/sales/report/v1/ledgers/{ledgerId}/dates/{date}'],
+  [new RegExp(`^/sales/report/v1/ledgers/\\d{1,20}/references/${SEGMENT}$`), '/sales/report/v1/ledgers/{ledgerId}/references/{reference}'],
+  [
+    new RegExp(`^/sales/report/v1/ledgers/\\d{1,20}/psp-references/${SEGMENT}$`),
+    '/sales/report/v1/ledgers/{ledgerId}/psp-references/{pspReference}',
+  ],
+];
+
 /** The path of the access token request, which is not in ALLOWED_REQUESTS. */
 export const TOKEN_PATH = '/accesstoken/get';
 
-/** Every template a failure may name: those of ALLOWED_REQUESTS and the access token request. */
+/** The path of the access token request with accounting keys (HTTP Basic, no subscription key). */
+export const ACCOUNTING_TOKEN_PATH = '/miami/v1/token';
+
+/** Every template a failure may name: those of ALLOWED_REQUESTS, ACCOUNTING_REQUESTS and the two token requests. */
 export const REQUEST_TEMPLATES: ReadonlySet<string> = new Set([
   TOKEN_PATH,
+  ACCOUNTING_TOKEN_PATH,
   ...Object.values(ALLOWED_REQUESTS).flatMap(entries => entries.map(([, template]) => template)),
+  ...ACCOUNTING_REQUESTS.map(([, template]) => template),
 ]);

@@ -8,7 +8,8 @@ import {
 } from '../vipps/annotations.js';
 import { assertAuditLogWritable, auditTarget, newRequestId, writeAuditEvent } from '../vipps/audit.js';
 import { IDEMPOTENCY_KEY_PATTERN, readOnlyClient, type UpstreamClient, type VippsEnvironment, type VippsKeyType } from '../vipps/client.js';
-import { formatUnknownError, redactDeep, type SecretRedactor } from '../errors.js';
+import { ConfigError } from '../config-env.js';
+import { formatUnknownError, redactDeep, VippsHttpError, type SecretRedactor } from '../errors.js';
 import { withheldResult } from '../fallbacks.js';
 import { leaksSecret } from '../key-admission.js';
 import {
@@ -20,6 +21,7 @@ import {
   QR_FORMATS,
 } from '../vipps/payment-requests.js';
 import { checkReceipt, getReceipt } from '../vipps/order-details.js';
+import { ledgerOwnerFrom, NoLedgerForOwnerError, ownerBoundClient, OwnerMissingError, type LedgerOwner } from '../vipps/owner-binding.js';
 import { cancelPayment, capturePayment, getPayment, refundPayment } from '../vipps/payments.js';
 import { listQrCodes, MAX_QR_CODES, QR_KINDS } from '../vipps/qr-codes.js';
 import {
@@ -45,6 +47,7 @@ import {
   updateAgreement,
 } from '../vipps/recurring.js';
 import { fundsSummary, listLedgers, listTransactions, MAX_REPORT_DAYS, MAX_TRANSACTIONS, periodNoteOf } from '../vipps/reports.js';
+import { getSale, listSales, MAX_SALES } from '../vipps/sales.js';
 import { getSalesUnit, listSalesUnits } from '../vipps/sales-units.js';
 import {
   checkInputPolicy,
@@ -67,6 +70,7 @@ import {
   pseudonym,
   RECURRING_ID_PATTERN,
   REFERENCE_PATTERN,
+  SALE_REFERENCE_PATTERN,
   timestampMs,
 } from '../vipps/values.js';
 
@@ -167,9 +171,12 @@ export interface ToolDefinition<S extends z.ZodRawShape = z.ZodRawShape> {
   upstream: readonly UpstreamOperation[];
   /** True when the tool can read more than its name says. None of these tools does. */
   broad?: boolean;
-  /** Key types the tool works with. The Report API does not accept partner keys. */
+  /**
+   * Key types the tool works with. The Report API does not accept partner keys; accounting keys work with the
+   * Report and Sales tools only, and the Sales tools with no other keys.
+   */
   keyTypes: readonly VippsKeyType[];
-  /** Why the tool does not work with the other key type, for the refusal. Default: the Report API's reason. */
+  /** Why the tool does not work with partner keys, for the refusal. Default: the Report API's reason. */
   keyTypeReason?: string;
   /** The environments the tool works in. Default: both. Vipps MobilePay has no Management API in the test environment. */
   environments?: readonly VippsEnvironment[];
@@ -209,12 +216,24 @@ const change = (
 
 const ALL_KEYS = ['merchant', 'partner'] as const;
 const MERCHANT_KEYS = ['merchant'] as const;
+/** The Report tools: the merchant's own keys, or an accounting partner's for the organisation of the call. */
+const REPORT_KEYS = ['merchant', 'accounting'] as const;
+/** The Sales tools: Vipps MobilePay documents the Sales API for accounting keys only. */
+const ACCOUNTING_KEYS = ['accounting'] as const;
+const EVERY_KEY = ['merchant', 'partner', 'accounting'] as const;
 const PRODUCTION_ONLY = ['production'] as const;
+
+/** The ledger list: read for every call with accounting keys, to bind the call to its organisation. */
+const LEDGER_LIST: UpstreamOperation = { access: 'read', method: 'GET', path: '/settlement/v1/ledgers' };
+
+const ACCOUNTING_NOTE =
+  'With accounting keys: only for a ledger owned by the organisation of the call; any other ledger is refused.';
 
 const referenceSchema = z.string().trim().regex(REFERENCE_PATTERN).describe('The ePayment reference (8-64 letters, digits or dashes).');
 const agreementIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring agreement id, e.g. agr_5kSeqz.');
 const chargeIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring charge id, e.g. chr-Kq7wZp.');
 const ledgerIdSchema = z.string().trim().regex(LEDGER_ID_PATTERN).describe('The ledger id, from list_ledgers.');
+const saleReferenceSchema = z.string().trim().regex(SALE_REFERENCE_PATTERN);
 const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
 const amountSchema = z
   .number()
@@ -262,14 +281,27 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'vipps_check_connection',
     title: 'Check Vipps MobilePay connection',
-    description: 'Check that the keys work, by requesting an access token. Returns only whether the connection works.',
+    description:
+      'Check that the keys work, by requesting an access token. Returns only whether the connection works. With accounting keys the connection works only when at least one ledger owned by the organisation of the call is visible; the answer then gives their number.',
     inputShape: {},
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: false,
     summary: 'Checked the connection.',
-    upstream: [],
-    keyTypes: ALL_KEYS,
+    // Accounting keys only: the ledger list is read. The other keys ask for an access token and nothing else.
+    upstream: [LEDGER_LIST],
+    keyTypes: EVERY_KEY,
     handler: async client => {
+      if (client.ownLedgers) {
+        // A token is not enough with accounting keys: it says nothing of whether this organisation has given access.
+        const own = await client.ownLedgers();
+        if (own.ledgers.length === 0) throw new NoLedgerForOwnerError(own.notAttributed);
+        return {
+          connected: true,
+          outcome: 'connected',
+          ledgers: own.ledgers.length,
+          ...(own.notAttributed > 0 ? { ledgersNotAttributed: own.notAttributed } : {}),
+        };
+      }
       await client.verifyCredentials();
       return { connected: true };
     },
@@ -278,34 +310,36 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     name: 'vipps_list_ledgers',
     title: 'List settlement ledgers (Vipps MobilePay)',
     description:
-      'List the ledgers (settlement accounts) the keys can read, with their currency and the sales units they settle for. The payout bank account is shown only as its last four characters. Merchant keys only (the Report API does not accept partner keys).',
+      'List the ledgers (settlement accounts) the keys can read, with their currency and the sales units they settle for. With the merchant’s own keys the payout bank account is shown only as its last four characters. With accounting keys only the ledgers owned by the organisation of the call are listed, and nothing of the payout bank account is shown. Not with partner keys (the Report API does not accept them).',
     inputShape: {},
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
     summary: 'Listed ledgers.',
-    upstream: [{ access: 'read', method: 'GET', path: '/settlement/v1/ledgers' }],
-    keyTypes: MERCHANT_KEYS,
+    resultNote: periodNoteOf,
+    upstream: [LEDGER_LIST],
+    keyTypes: REPORT_KEYS,
     handler: async client => listLedgers(client),
   }),
   defineTool({
     name: 'vipps_get_funds_summary',
     title: 'Settlement and funds summary (Vipps MobilePay)',
     description:
-      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, note says in words what is missing, and period is null when no date was read. Merchant keys only.',
+      'Totals of the funds ledger for a period, per ledger date and in all: sales (capture), refunds, fees retained, payouts (payout-scheduled) and the balance before and after. Amounts are in minor units. Reads every entry of the period and returns only the sums; refuses rather than returns a partial sum. Dates Vipps MobilePay has not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, note says in words what is missing, and period is null when no date was read. Not with partner keys. ' +
+      ACCOUNTING_NOTE,
     inputShape: periodShape,
     annotations: READ_TOOL_ANNOTATIONS,
     returnsUpstreamContent: true,
     summary: 'Summarised the funds ledger.',
     resultNote: periodNoteOf,
-    upstream: [{ access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/funds/dates/{ledgerDate}' }],
-    keyTypes: MERCHANT_KEYS,
+    upstream: [{ access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/funds/dates/{ledgerDate}' }, LEDGER_LIST],
+    keyTypes: REPORT_KEYS,
     check: checkPeriod,
     handler: async (client, input) => fundsSummary(client, input),
   }),
   defineTool({
     name: 'vipps_list_transactions',
     title: 'Ledger entries for a period (Vipps MobilePay)',
-    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, and note says in words what is missing. Customer names and messages are not requested. Merchant keys only.`,
+    description: `Every entry of the funds ledger (sales, refunds, payouts, fees retained) or the fees ledger for a period, with amounts in minor units. Refuses, rather than truncates, a period with more than ${MAX_TRANSACTIONS} entries. Dates not closed yet are listed in openDates; dates that have not come yet are not read and are listed in futureDates. readFrom and readTo are the dates actually read, complete says whether that is the whole period, and note says in words what is missing. Customer names and messages are not requested. Not with partner keys. ${ACCOUNTING_NOTE}`,
     inputShape: {
       ...periodShape,
       topic: z.enum(['funds', 'fees']).optional().describe('funds (default) or fees.'),
@@ -317,10 +351,52 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
     upstream: [
       { access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/funds/dates/{ledgerDate}' },
       { access: 'read', method: 'GET', path: '/report/v2/ledgers/{ledgerId}/fees/dates/{ledgerDate}' },
+      LEDGER_LIST,
     ],
-    keyTypes: MERCHANT_KEYS,
+    keyTypes: REPORT_KEYS,
     check: checkPeriod,
     handler: async (client, input) => listTransactions(client, input),
+  }),
+  defineTool({
+    name: 'vipps_list_sales',
+    title: 'Sales of a ledger date (Vipps MobilePay)',
+    description: `Every sale of one ledger date for a ledger owned by the organisation of the call: each capture and refund with its gross, net and VAT amounts (minor units), its order lines with quantity, prices, VAT rate (hundredths of a percent) and VAT amount, the kind of payment and the sales category. Covers sales paid to a Vippsnummer or MobilePay number and in mPOS, not ePayment payments. Nothing about the customer is returned. Refuses, rather than truncates, a date with more than ${MAX_SALES} entries, and a date that has not begun. complete is false, and note says so, when more sales can still come for the date. Accounting keys only, and production only.`,
+    inputShape: {
+      ledgerId: ledgerIdSchema,
+      ledgerDate: dateSchema.describe('The ledger date, YYYY-MM-DD.'),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Listed sales.',
+    resultNote: periodNoteOf,
+    upstream: [{ access: 'read', method: 'GET', path: '/sales/report/v1/ledgers/{ledgerId}/dates/{ledgerDate}' }, LEDGER_LIST],
+    keyTypes: ACCOUNTING_KEYS,
+    environments: PRODUCTION_ONLY,
+    handler: async (client, input) => listSales(client, input),
+  }),
+  defineTool({
+    name: 'vipps_get_sale',
+    title: 'Get a sale (Vipps MobilePay)',
+    description:
+      'One sale in a ledger owned by the organisation of the call, with its order lines and VAT: by reference (the business’s own reference of the sale: every capture and refund of it) or by pspReference (Vipps MobilePay’s reference of one capture or refund, as in the ledger entries). Give exactly one of the two. Amounts are in minor units, VAT rates in hundredths of a percent. Covers sales paid to a Vippsnummer or MobilePay number and in mPOS, not ePayment payments: count 0 means the Sales API has no such sale in this ledger. Nothing about the customer is returned. Accounting keys only, and production only.',
+    inputShape: {
+      ledgerId: ledgerIdSchema,
+      reference: saleReferenceSchema.optional().describe('The business’s own reference of the sale (1-64 letters, digits, dashes or underscores).'),
+      pspReference: saleReferenceSchema.optional().describe('Vipps MobilePay’s reference of one capture or refund.'),
+    },
+    annotations: READ_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: true,
+    summary: 'Fetched sale.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/sales/report/v1/ledgers/{ledgerId}/references/{reference}' },
+      { access: 'read', method: 'GET', path: '/sales/report/v1/ledgers/{ledgerId}/psp-references/{pspReference}' },
+      LEDGER_LIST,
+    ],
+    keyTypes: ACCOUNTING_KEYS,
+    environments: PRODUCTION_ONLY,
+    check: input =>
+      (input.reference === undefined) === (input.pspReference === undefined) ? 'Give exactly one of reference and pspReference.' : undefined,
+    handler: async (client, input) => getSale(client, input),
   }),
   defineTool({
     name: 'vipps_get_payment',
@@ -858,6 +934,12 @@ export function enabledTools(keyType: VippsKeyType, environment: VippsEnvironmen
 
 export function registerTools(server: McpServer, client: RedactingClient): void {
   validateToolConfig();
+  if (client.keyType === 'accounting') {
+    // A call over MCP names no organisation, and with these keys nothing may be read without one.
+    throw new ConfigError(
+      'Accounting keys are served through the gateway entry point only, where the host names the organisation of every call.',
+    );
+  }
   for (const tool of enabledTools(client.keyType, client.environment)) {
     server.registerTool(
       tool.name,
@@ -893,6 +975,13 @@ export interface CallContext {
    * one per call, so no text of the host reaches the record through it.
    */
   requestId?: string;
+  /**
+   * Accounting keys only, and required with them: the organisation the caller may see, as the Report API names an
+   * owner (`{ scheme: 'business:DK:CVR', id: '<the number>' }`). The call reads only ledgers with exactly this
+   * owner. A call without it, or with a value in another form, is refused before anything is sent. It is not
+   * written to the audit. With other keys it is not read.
+   */
+  owner?: { scheme: string; id: string };
 }
 
 function contextString(value: unknown, max: number): string | undefined {
@@ -926,10 +1015,7 @@ export async function executeTool(
 
   let policy = checkToolPolicy(tool.name, tool.annotations.readOnlyHint);
   if (policy.allowed && !toolSupportsKeyType(tool, client.keyType)) {
-    policy = {
-      allowed: false,
-      reason: `${tool.name} does not work with ${client.keyType} keys (${tool.keyTypeReason ?? "the Report API needs the merchant's own keys"}).`,
-    };
+    policy = { allowed: false, reason: keyTypeRefusal(tool, client.keyType) };
   }
   if (policy.allowed && !toolSupportsEnvironment(tool, client.environment)) {
     policy = {
@@ -937,12 +1023,17 @@ export async function executeTool(
       reason: `${tool.name} does not work in the ${client.environment} environment (Vipps MobilePay has no Management API there).`,
     };
   }
+  // Accounting keys: the call must name its organisation. Without one nothing is sent, the token request included.
+  const owner: LedgerOwner | undefined =
+    client.keyType === 'accounting' ? ledgerOwnerFrom((context as { owner?: unknown } | undefined)?.owner) : undefined;
+  const ownerMissing = policy.allowed && client.keyType === 'accounting' && owner === undefined ? new OwnerMissingError() : undefined;
+  if (ownerMissing) policy = { allowed: false, reason: ownerMissing.message };
   const inputPolicy = policy.allowed ? checkInputPolicy(tool.name, input) : policy;
   const refusal = inputPolicy.allowed ? tool.check?.(input) : undefined;
   if (!inputPolicy.allowed || refusal) {
     const reason = inputPolicy.allowed ? (refusal as string) : inputPolicy.reason;
     await writeAuditEvent({ requestId, tool: tool.name, caller, action: 'policy_denied', target, reason }, { redactor });
-    throw new Error(reason);
+    throw ownerMissing ?? new Error(reason);
   }
 
   // Write tools fail closed: no write runs without its start record.
@@ -953,7 +1044,9 @@ export async function executeTool(
   const startedAt = performance.now();
 
   try {
-    const handlerClient = tool.annotations.readOnlyHint ? readOnlyClient(client, tool.name) : client;
+    // Accounting keys: the handler gets a view bound to the call's organisation, made for this call and no other.
+    const callClient: UpstreamClient = owner === undefined ? client : ownerBoundClient(client, owner);
+    const handlerClient = tool.annotations.readOnlyHint ? readOnlyClient(callClient, tool.name) : callClient;
     const result = await tool.handler(handlerClient, input as never);
     await writeAuditEvent(
       {
@@ -984,6 +1077,40 @@ export async function executeTool(
     );
     throw error;
   }
+}
+
+/** Why a tool does not work with the keys of the instance. */
+function keyTypeRefusal(tool: ToolDefinition, keyType: VippsKeyType): string {
+  if (keyType === 'accounting') {
+    return `${tool.name} does not work with accounting keys (they give access to settlements and sales only).`;
+  }
+  if (tool.keyTypes.every(type => type === 'accounting')) {
+    return `${tool.name} does not work with ${keyType} keys (Vipps MobilePay gives the sales with order lines to accounting keys only).`;
+  }
+  return `${tool.name} does not work with ${keyType} keys (${tool.keyTypeReason ?? "the Report API needs the merchant's own keys"}).`;
+}
+
+/**
+ * What a connection check with accounting keys ended in when the connection does not work, for a host that shows
+ * the person what to do next:
+ *   owner_missing        the call named no organisation (the host's own error);
+ *   no_ledger_for_owner  the keys work, and no ledger owned by the organisation is visible: the business has not
+ *                        given the accounting partner access, or has given it for another organisation;
+ *   keys_refused         Vipps MobilePay refused the keys (the token request answered 400, 401 or 403, or the
+ *                        ledger list 401 or 403);
+ *   unavailable          anything else: throttling, a server error, a network error, an answer in another form.
+ */
+export type ConnectionFailureOutcome = 'owner_missing' | 'no_ledger_for_owner' | 'keys_refused' | 'unavailable';
+
+/** The outcome of a failed connection check with accounting keys, from its error. */
+export function connectionFailureOutcome(error: unknown): ConnectionFailureOutcome {
+  if (error instanceof OwnerMissingError) return 'owner_missing';
+  if (error instanceof NoLedgerForOwnerError) return 'no_ledger_for_owner';
+  if (error instanceof VippsHttpError) {
+    const refused = error.tokenRequest ? [400, 401, 403] : [401, 403];
+    if (refused.includes(error.status)) return 'keys_refused';
+  }
+  return 'unavailable';
 }
 
 /** The tool name in the audit record of a call to a tool this server does not have. */

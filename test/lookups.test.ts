@@ -479,6 +479,9 @@ describe('the sales units (production only)', () => {
   it('are marked in the catalog as working in production only, and every other tool as working in both', () => {
     const only = vippsToolCatalog.filter(entry => entry.environments.length !== 2).map(entry => [entry.name, entry.environments]);
     expect(only).toEqual([
+      // The Sales tools: accounting keys, which exist in production only (accounting.test.ts).
+      ['list_sales', ['production']],
+      ['get_sale', ['production']],
       ['list_sales_units', ['production']],
       ['get_sales_unit', ['production']],
     ]);

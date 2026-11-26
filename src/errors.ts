@@ -268,6 +268,13 @@ const TOKEN_STATUS_HINTS: Record<number, string> = {
   403: 'The keys have no access. Check that they belong to this sales unit and environment.',
 };
 
+/** Hints for the token request of accounting keys (a client id and a client secret, nothing else). */
+const ACCOUNTING_TOKEN_STATUS_HINTS: Record<number, string> = {
+  400: 'The token request was refused. Check the client id and the client secret of the accounting keys.',
+  401: 'The accounting keys were rejected: the client id or the client secret is wrong.',
+  403: 'The accounting keys have no access.',
+};
+
 /**
  * An HTTP error from Vipps MobilePay. It keeps the status, the parsed Retry-After, the request's method and path
  * template, and from the response body only the vendor's error code and trace id in their fixed forms
@@ -290,6 +297,8 @@ export class VippsHttpError extends Error {
   readonly errorCode?: string;
   /** Vipps MobilePay's trace id from the body, in its fixed form only. */
   readonly traceId?: string;
+  /** True when the keys are accounting keys: the hints of a token request name those. */
+  readonly accountingKeys: boolean;
 
   constructor(input: {
     status: number;
@@ -302,8 +311,9 @@ export class VippsHttpError extends Error {
     pathTemplate?: string;
     errorCode?: string;
     traceId?: string;
+    accountingKeys?: boolean;
   }) {
-    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note));
+    super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note, input.accountingKeys === true));
     this.name = 'VippsHttpError';
     this.status = input.status;
     this.url = describeUrl(input.url);
@@ -315,6 +325,7 @@ export class VippsHttpError extends Error {
     this.pathTemplate = templateInForm(input.pathTemplate);
     this.errorCode = vendorErrorCode(input.errorCode);
     this.traceId = vendorTraceId(input.traceId);
+    this.accountingKeys = input.accountingKeys === true;
   }
 }
 
@@ -492,6 +503,7 @@ export function withNote(error: VippsHttpError, note: string): VippsHttpError {
     retryAfter: error.retryAfter,
     requestId: error.requestId,
     tokenRequest: error.tokenRequest,
+    accountingKeys: error.accountingKeys,
     note,
     method: error.method,
     pathTemplate: error.pathTemplate,
@@ -501,9 +513,9 @@ export function withNote(error: VippsHttpError, note: string): VippsHttpError {
 }
 
 /** The whole text of an HTTP error: status, our hint, a parsed Retry-After in seconds, and a tool's own note. */
-export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false, note?: string): string {
+export function httpErrorMessage(status: number, retryAfter?: string, tokenRequest = false, note?: string, accountingKeys = false): string {
   const retryMs = parseRetryAfterMs(retryAfter);
-  const hints = tokenRequest ? TOKEN_STATUS_HINTS : STATUS_HINTS;
+  const hints = !tokenRequest ? STATUS_HINTS : accountingKeys ? ACCOUNTING_TOKEN_STATUS_HINTS : TOKEN_STATUS_HINTS;
   return [
     tokenRequest ? `Vipps MobilePay access token request failed with HTTP ${status}` : `Vipps MobilePay API request failed with HTTP ${status}`,
     Object.hasOwn(hints, status) ? hints[status] : undefined,

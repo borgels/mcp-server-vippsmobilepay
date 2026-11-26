@@ -81,7 +81,7 @@ describe('transactions and funds summary', () => {
         ],
       }),
       [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: reportRoute({
-        '2026-11-03': [{ items: [entry()], tryLater: true }],
+        '2026-11-03': [{ items: [entry()], hasMore: false, tryLater: true }],
       }),
     });
     const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-01', toDate: '2026-11-03' });
@@ -135,7 +135,7 @@ describe('transactions and funds summary', () => {
       [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: reportRoute({
         '2026-11-03': [
           { items: [entry()], hasMore: true, cursor: '1', tryLater: true },
-          { items: [entry()], hasMore: false },
+          { items: [entry()], hasMore: false, tryLater: false },
         ],
       }),
     });
@@ -690,5 +690,27 @@ describe('Recurring reads', () => {
     });
     expect((await gw.callTool('get_agreement', { agreementId: 'agr_7TqP2m' })).structuredContent).toEqual({ id: 'agr_7TqP2m', status: 'ACTIVE' });
     expect((await gw.callTool('get_charge', { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz' })).structuredContent).toEqual(charge());
+  });
+});
+
+describe('the envelope of a report page, with the merchant’s own keys', () => {
+  const BAD: Array<Record<string, unknown>> = [
+    { items: [], hasMore: 'true', cursor: 'next', tryLater: false },
+    { items: [], hasMore: false, tryLater: 'true' },
+    { items: [] },
+    { items: [], tryLater: false },
+    { items: [], hasMore: false },
+    { hasMore: false, tryLater: false },
+    { items: [], hasMore: true, tryLater: false },
+    { items: [], hasMore: true, cursor: '', tryLater: false },
+    { items: [], hasMore: false, cursor: 7, tryLater: false },
+  ];
+  it('refuses a page whose control fields are missing or of another type', async () => {
+    for (const body of BAD) {
+      const { gw } = gateway({ [`GET /report/v2/ledgers/${LEDGER}/funds/dates/2026-11-03`]: { body } });
+      const result = await gw.callTool('list_transactions', { ledgerId: LEDGER, fromDate: '2026-11-03', toDate: '2026-11-03' });
+      expect(result.isError, JSON.stringify(body)).toBe(true);
+      expect(result.structuredContent, JSON.stringify(body)).toBeUndefined();
+    }
   });
 });

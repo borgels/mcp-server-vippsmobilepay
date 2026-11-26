@@ -1,6 +1,10 @@
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
+import { requireOwnLedger } from './owner-binding.js';
 import { datesBetween } from './values.js';
+import { ledgerEntriesView, TooMuchDataError } from './views.js';
+
+export { TooMuchDataError };
 
 /**
  * Report API: ledgers, and the funds and fees ledgers per ledger date.
@@ -15,6 +19,13 @@ import { datesBetween } from './values.js';
  * with it. It is named apart from the open dates (`futureDates`), the dates
  * actually read are given (`readFrom`, `readTo`), and `note` says in words
  * what the answer lacks.
+ *
+ * With accounting keys the client is bound to one organisation
+ * (owner-binding.ts): the ledger list is that organisation's ledgers only,
+ * without the payout account, a period is read only for one of them, and
+ * every entry is read strictly through an allow-list. Nothing of those
+ * answers had been seen when this was written, so nothing is passed on that
+ * is not named.
  */
 
 /** Pages of GET /settlement/v1/ledgers read in one call. */
@@ -27,14 +38,6 @@ export const MAX_REPORT_PAGES = 200;
 export const MAX_TRANSACTIONS = 5_000;
 
 export type ReportTopic = 'funds' | 'fees';
-
-/** A refusal because a list is longer than this server reads in one call. */
-export class TooMuchDataError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'TooMuchDataError';
-  }
-}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -59,7 +62,27 @@ function maskLedger(ledger: unknown): unknown {
   };
 }
 
+/**
+ * The ledgers of the organisation an accounting call is bound to. Ledgers that could not be attributed to one
+ * organisation are left out and counted, and the answer says so: they may be this organisation's.
+ */
+async function listOwnLedgers(ownLedgers: NonNullable<UpstreamClient['ownLedgers']>): Promise<unknown> {
+  const own = await ownLedgers();
+  const left = own.notAttributed;
+  return {
+    count: own.ledgers.length,
+    ledgers: own.ledgers,
+    ...(left > 0
+      ? {
+          ledgersNotAttributed: left,
+          note: `${left} ${left === 1 ? 'ledger was' : 'ledgers were'} left out: Vipps MobilePay names no single organisation as ${left === 1 ? 'its' : 'their'} owner, so it is not known whose ${left === 1 ? 'it is' : 'they are'}. The list may lack ledgers of this organisation.`,
+        }
+      : {}),
+  };
+}
+
 export async function listLedgers(client: UpstreamClient): Promise<unknown> {
+  if (client.ownLedgers) return listOwnLedgers(() => (client.ownLedgers as NonNullable<UpstreamClient['ownLedgers']>)());
   const ledgers: unknown[] = [];
   let cursor: string | undefined;
   for (let page = 1; page <= MAX_LEDGER_PAGES; page += 1) {
@@ -108,17 +131,39 @@ async function readLedgerDate(
         `The report needs more than ${MAX_REPORT_PAGES} pages; choose a shorter period. Refused rather than returned incomplete.`,
       );
     }
-    const body = asRecord(await client.get(path, cursor ? { cursor } : undefined));
-    if (!Array.isArray(body.items)) throw unexpected('a report');
-    items.push(...body.items.map(asRecord));
-    if (body.tryLater === true) open = true;
-    if (body.hasMore !== true) {
+    const page = reportPage(await client.get(path, cursor ? { cursor } : undefined));
+    // Accounting keys: the entries read strictly from the start. The merchant's own keys: as they came, as before.
+    items.push(...(client.ownLedgers ? ledgerEntriesView(page.items) : page.items.map(asRecord)));
+    if (page.tryLater) open = true;
+    if (!page.hasMore) {
       return { ledgerDate, open, items };
     }
-    const next = typeof body.cursor === 'string' ? body.cursor : '';
-    if (!next || next === cursor) throw unexpected('a report (more pages without a new cursor)');
-    cursor = next;
+    if (page.cursor === cursor) throw unexpected('a report (more pages without a new cursor)');
+    cursor = page.cursor;
   }
+}
+
+/**
+ * The envelope of one page of a funds or fees ledger date, read strictly with every kind of keys: `items` a list,
+ * `tryLater` and `hasMore` present as booleans (the specification has `hasMore` always present on the dates
+ * endpoint), and with `hasMore` a non-empty `cursor`. Anything else refuses the report: a page that does not say
+ * positively that the date is closed and that there is no more is never taken for the whole date.
+ */
+function reportPage(answer: unknown):
+  | { items: unknown[]; tryLater: boolean; hasMore: false }
+  | { items: unknown[]; tryLater: boolean; hasMore: true; cursor: string } {
+  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw unexpected('a report');
+  const { items, tryLater, hasMore, cursor } = answer as Record<string, unknown>;
+  if (!Array.isArray(items) || typeof tryLater !== 'boolean' || typeof hasMore !== 'boolean') throw unexpected('a report');
+  if (!hasMore) {
+    // Absent on the last page by the specification; when it is there, it must still be a text.
+    if (cursor !== undefined && cursor !== null && typeof cursor !== 'string') throw unexpected('a report');
+    return { items, tryLater, hasMore };
+  }
+  if (typeof cursor !== 'string' || cursor === '' || cursor.length > 4096) {
+    throw unexpected('a report (more pages without a new cursor)');
+  }
+  return { items, tryLater, hasMore, cursor };
 }
 
 /** The time zone furthest ahead among Vipps MobilePay's markets (Denmark, Finland, Norway and Sweden): Finland's. */
@@ -175,6 +220,8 @@ async function readPeriod(
   topic: ReportTopic,
   onDate?: (report: DateReport) => void,
 ): Promise<PeriodReading> {
+  // Accounting keys: the ledger must be one of the organisation's, also when no date of the period is asked for.
+  await requireOwnLedger(client, input.ledgerId);
   const budget = { pages: 0 };
   const lastBegun = lastBegunLedgerDate(client.currentTime());
   const reading: PeriodReading = { reports: [], openDates: [], futureDates: [] };

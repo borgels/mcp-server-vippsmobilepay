@@ -187,6 +187,9 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   list_sales_units: {},
   get_sales_unit: {},
   list_qr_codes: {},
+  // Accounting keys only: refused with these keys before anything is sent, and swept all the same.
+  list_sales: { ledgerId: '302321', date: '2026-11-01' },
+  get_sale: { ledgerId: '302321', reference: 'fjord-order-10042' },
   create_payment: { reference: 'fjord-order-10077', amount: 24_900, currency: 'DKK', description: 'Kagebord', delivery: 'link', returnUrl: 'https://fjordbakeriet.example.com/tak' },
   capture_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },
   refund_payment: { reference: 'fjord-order-10042', amount: 100, currency: 'DKK', idempotencyKey: 'op-0001-aaaa' },

@@ -15,6 +15,9 @@ export const RECURRING_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 /** A Report API ledger id (numeric). */
 export const LEDGER_ID_PATTERN = /^\d{1,20}$/;
 
+/** The reference of a sale in the Sales API: the business's own, or Vipps MobilePay's (`pspReference`). */
+export const SALE_REFERENCE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
 /** An ISO date (YYYY-MM-DD). Whether it exists is checked by isIsoDate. */
 export const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
