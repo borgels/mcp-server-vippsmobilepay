@@ -34,7 +34,6 @@ import {
   findCharge,
   getAgreement,
   getCharge,
-  INTERVAL_TYPES,
   INTERVAL_UNITS,
   listAgreements,
   listCharges,
@@ -756,12 +755,11 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       currency: currencySchema.optional().describe('With price or suggestedMaxAmount: the currency of the agreement.'),
       interval: z
         .strictObject({
-          type: z.enum(INTERVAL_TYPES).describe('RECURRING (every count units) or FLEXIBLE (no fixed interval).'),
-          unit: z.enum(INTERVAL_UNITS).optional().describe('With RECURRING: YEAR, MONTH, WEEK or DAY.'),
-          count: z.number().int().min(1).max(31).optional().describe('With RECURRING: how many units, 1-31.'),
+          unit: z.enum(INTERVAL_UNITS).describe('YEAR, MONTH, WEEK or DAY.'),
+          count: z.number().int().min(1).max(31).describe('How many units, 1-31: every 2 WEEK is every second week.'),
         })
         .optional()
-        .describe('A new interval: type RECURRING with unit and count, or type FLEXIBLE alone.'),
+        .describe('A new fixed interval: every count units. A flexible interval cannot be set here.'),
     },
     annotations: WRITE_TOOL_ANNOTATIONS,
     returnsUpstreamContent: false,

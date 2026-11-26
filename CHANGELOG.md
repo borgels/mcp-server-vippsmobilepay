@@ -16,9 +16,11 @@
     `movesMoney` true.
   - `update_agreement` changes an agreement's product name and description,
     its address for the customer, its fixed price (`price`) or a variable
-    price's suggested maximum, or its interval
+    price's suggested maximum, or its fixed interval (a unit and a count)
     (`PATCH /recurring/v3/agreements/{agreementId}`), and sends only what
-    differs from the agreement. It never sends `status`. `action` `update`,
+    differs from the agreement. It never sends `status`, and it does not set a
+    flexible interval, which cannot be read back from the agreement, so a
+    repeat could not see that it was set. `action` `update`,
     `record` `agreement`, `movesMoney` false.
   - `stop_agreement` stops an agreement (the same `PATCH`, with `status`
     `STOPPED` alone). Its description says that it cannot be undone and that
@@ -44,7 +46,9 @@
 - Error texts are our own for each change: HTTP 429 and 423 say that nothing
   was done and to call again with the same input after the wait, 408, 5xx, a
   timeout and a lost connection that the outcome is not known, and 400, 404
-  and 409 what they can mean for that change.
+  and 409 what they can mean for that change. For `update_agreement` they say
+  that the agreement is read first and what it has is not sent again, since
+  its key is new for every request.
 - The fixed request list gains `POST .../charges`, `POST .../capture` and one
   `PATCH /recurring/v3/agreements/{agreementId}`; the client gets `patch`,
   which read-only tools cannot use, and `PATCH` is a method in failure

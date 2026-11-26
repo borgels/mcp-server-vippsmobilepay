@@ -297,11 +297,16 @@ export async function cancelCharge(
 
 const REPEAT_SAME_INPUT =
   'Call again with exactly the same input: the server sends the same Idempotency-Key, so the change is made at most once.';
+/** For a change of an agreement, whose key is new for every request: a repeat is safe because the agreement is read first. */
+const REPEAT_UPDATE =
+  'Call again with exactly the same input: the agreement is read first, and what it already has is not sent again.';
 
 /** What a change says when it was not made, and when it is not known whether it was. */
 interface ChangeTexts {
   none: string;
   unknown: string;
+  /** What a repeat of the same input does. Default: the same Idempotency-Key is sent. */
+  repeat?: string;
   /** Our explanation of HTTP 400 for this change. */
   badRequest: string;
   /** Our explanation of HTTP 409 for this change. */
@@ -312,18 +317,19 @@ const NOT_FOUND = 'Vipps MobilePay does not know the agreement or the charge for
 
 /** The error of a failed change request, with our own note. Never anything of the vendor's answer or of the input. */
 function changeFailure(error: unknown, texts: ChangeTexts): unknown {
+  const repeat = texts.repeat ?? REPEAT_SAME_INPUT;
   if (!(error instanceof VippsHttpError)) {
     // A timeout, a lost connection, a redirect or an answer that could not be read: the request may have arrived. Our
     // own refusals (nothing sent) pass as they are.
     if (error instanceof Error && !error.message.startsWith('Refused:')) {
-      return new Error(`${error.message} ${texts.unknown} ${REPEAT_SAME_INPUT}`, { cause: error });
+      return new Error(`${error.message} ${texts.unknown} ${repeat}`, { cause: error });
     }
     return error;
   }
   // The Access Token API refused or failed: the change was never sent.
   if (error.tokenRequest) return withNote(error, texts.none);
-  if (error.status === 429 || error.status === 423) return withNote(error, `${texts.none} After the wait: ${REPEAT_SAME_INPUT}`);
-  if (error.status === 408 || error.status >= 500) return withNote(error, `${texts.unknown} ${REPEAT_SAME_INPUT}`);
+  if (error.status === 429 || error.status === 423) return withNote(error, `${texts.none} After the wait: ${repeat}`);
+  if (error.status === 408 || error.status >= 500) return withNote(error, `${texts.unknown} ${repeat}`);
   const why = error.status === 400 ? texts.badRequest : error.status === 404 ? NOT_FOUND : error.status === 409 ? texts.conflict : undefined;
   return withNote(error, why === undefined ? texts.none : `${texts.none} ${why}`);
 }
@@ -640,7 +646,6 @@ export async function captureCharge(client: UpstreamClient, input: CaptureCharge
 
 /* ---- update_agreement and stop_agreement ---- */
 
-export const INTERVAL_TYPES = ['RECURRING', 'FLEXIBLE'] as const;
 export const INTERVAL_UNITS = ['YEAR', 'MONTH', 'WEEK', 'DAY'] as const;
 
 export interface UpdateAgreementInput {
@@ -653,7 +658,11 @@ export interface UpdateAgreementInput {
   /** A variable price's suggested maximum, in minor units. */
   suggestedMaxAmount?: number;
   currency?: MerchantCurrency;
-  interval?: { type: (typeof INTERVAL_TYPES)[number]; unit?: (typeof INTERVAL_UNITS)[number]; count?: number };
+  /**
+   * A fixed interval: every `count` `unit`s. A flexible interval (type FLEXIBLE) is not offered: the agreement shows its
+   * interval only as a unit and a count, so a repeat could not see that the change was made and would send it again.
+   */
+  interval?: { unit: (typeof INTERVAL_UNITS)[number]; count: number };
 }
 
 const UPDATE_FIELDS = ['productName', 'productDescription', 'merchantAgreementUrl', 'price', 'suggestedMaxAmount', 'interval'] as const;
@@ -667,15 +676,13 @@ export function checkUpdateAgreement(input: Record<string, unknown>): string | u
   const priced = input.price !== undefined || input.suggestedMaxAmount !== undefined;
   if (priced && input.currency === undefined) return 'A price needs currency.';
   if (!priced && input.currency !== undefined) return 'currency is only for price or suggestedMaxAmount.';
-  const interval = input.interval as UpdateAgreementInput['interval'];
-  if (interval?.type === 'RECURRING' && (interval.unit === undefined || interval.count === undefined)) return 'An interval of type RECURRING needs unit and count.';
-  if (interval?.type === 'FLEXIBLE' && (interval.unit !== undefined || interval.count !== undefined)) return 'An interval of type FLEXIBLE has no unit or count.';
   return undefined;
 }
 
 const UPDATE_TEXTS: ChangeTexts = {
   none: 'Nothing was changed.',
   unknown: 'It is not known whether the agreement was changed.',
+  repeat: REPEAT_UPDATE,
   badRequest:
     'A change is refused when the agreement is stopped, when the price does not fit its kind of price (price only for a fixed price, suggestedMaxAmount only for a variable one) or the limits of the currency, or when the address is not https.',
 };
@@ -695,13 +702,15 @@ function updateBody(input: UpdateAgreementInput): Record<string, unknown> {
     ...(input.merchantAgreementUrl === undefined ? {} : { merchantAgreementUrl: input.merchantAgreementUrl }),
     ...(input.price === undefined ? {} : { pricing: { amount: input.price } }),
     ...(input.suggestedMaxAmount === undefined ? {} : { pricing: { suggestedMaxAmount: input.suggestedMaxAmount } }),
-    ...(interval === undefined
-      ? {}
-      : { interval: interval.type === 'FLEXIBLE' ? { type: 'FLEXIBLE' } : { type: 'RECURRING', period: { unit: interval.unit, count: interval.count } } }),
+    ...(interval === undefined ? {} : { interval: { type: 'RECURRING', period: { unit: interval.unit, count: interval.count } } }),
   };
 }
 
-/** Whether the agreement already has what a field of the body asks for. What cannot be read is never the same. */
+/**
+ * Whether the agreement already has what a field of the body asks for. What cannot be read is never the same. Every
+ * field the tool can send can be read back here (the specification requires each in an agreement), so a repeat after a
+ * lost answer sends nothing.
+ */
 function alreadyHas(agreement: Record<string, unknown>, field: string, value: unknown): boolean {
   const asked = asRecord(value);
   switch (field) {
@@ -714,8 +723,6 @@ function alreadyHas(agreement: Record<string, unknown>, field: string, value: un
       return asked.amount !== undefined ? pricing.amount === asked.amount : pricing.suggestedMaxAmount === asked.suggestedMaxAmount;
     }
     case 'interval': {
-      // The agreement shows its interval as a unit and a count; a flexible one cannot be told from that.
-      if (asked.type !== 'RECURRING') return false;
       const now = asRecord(agreement.interval);
       const period = asRecord(asked.period);
       return now.unit === period.unit && now.count === period.count;

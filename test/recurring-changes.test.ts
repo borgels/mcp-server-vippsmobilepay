@@ -81,6 +81,7 @@ function recurringStandIn(repeat: Repeat = 'refuse', agreement: Record<string, u
     productDescription: 'Friskt brød hver lørdag',
     pricing: { type: 'LEGACY', currency: 'DKK', amount: 19_900 },
     interval: { unit: 'MONTH', count: 1, text: 'every month' },
+    merchantAgreementUrl: 'https://fjordbakeriet.example/abonnement',
     ...agreement,
   } as Record<string, unknown>;
   const keys = new KeyMemory(repeat, { status: 409, body: vendorText });
@@ -634,7 +635,7 @@ describe('update_agreement', () => {
       productDescription: 'Friskt brød hver lørdag',
       price: 24_900,
       currency: 'DKK',
-      interval: { type: 'RECURRING', unit: 'WEEK', count: 2 },
+      interval: { unit: 'WEEK', count: 2 },
     });
     expect(result.isError).toBeUndefined();
     expect(data(result)).toMatchObject({
@@ -655,7 +656,7 @@ describe('update_agreement', () => {
     expect(vendor.agreement).toMatchObject({ productName: 'Brødabonnement, stor', pricing: { amount: 24_900 }, interval: { unit: 'WEEK', count: 2 } });
   });
 
-  it('sends a flexible interval, an address and a variable price’s suggested maximum', async () => {
+  it('sends an address and a variable price’s suggested maximum', async () => {
     const vendor = recurringStandIn('refuse', { pricing: { type: 'VARIABLE', currency: 'DKK', suggestedMaxAmount: 30_000 } });
     const { gw, calls } = gateway(vendor.routes, WRITES);
     const result = await gw.callTool('update_agreement', {
@@ -663,13 +664,11 @@ describe('update_agreement', () => {
       suggestedMaxAmount: 40_000,
       currency: 'DKK',
       merchantAgreementUrl: 'https://fjordbakeriet.example/mit-abonnement',
-      interval: { type: 'FLEXIBLE' },
     });
     expect(result.isError).toBeUndefined();
     expect(writesOf(calls)[0]?.body).toEqual({
       merchantAgreementUrl: 'https://fjordbakeriet.example/mit-abonnement',
       pricing: { suggestedMaxAmount: 40_000 },
-      interval: { type: 'FLEXIBLE' },
     });
   });
 
@@ -692,8 +691,10 @@ describe('update_agreement', () => {
     ['both kinds of price are given', {}, { agreementId: AGREEMENT_ID, price: 100, suggestedMaxAmount: 100, currency: 'DKK' }, /not both/],
     ['a price has no currency', {}, { agreementId: AGREEMENT_ID, price: 100 }, /A price needs currency\./],
     ['a currency has no price', {}, { ...rename, currency: 'DKK' }, /currency is only for price or suggestedMaxAmount\./],
-    ['a recurring interval has no unit', {}, { agreementId: AGREEMENT_ID, interval: { type: 'RECURRING', count: 2 } }, /needs unit and count/],
-    ['a flexible interval has a unit', {}, { agreementId: AGREEMENT_ID, interval: { type: 'FLEXIBLE', unit: 'WEEK' } }, /has no unit or count/],
+    ['an interval has no unit', {}, { agreementId: AGREEMENT_ID, interval: { count: 2 } }, /Invalid input/],
+    // A flexible interval cannot be read back from the agreement, so a repeat could not see that it was set.
+    ['a flexible interval is asked for', {}, { agreementId: AGREEMENT_ID, interval: { type: 'FLEXIBLE' } }, /Invalid input/],
+    ['an interval names its type', {}, { agreementId: AGREEMENT_ID, interval: { type: 'RECURRING', unit: 'WEEK', count: 2 } }, /Invalid input/],
     ['the address is not https', {}, { agreementId: AGREEMENT_ID, merchantAgreementUrl: 'http://fjordbakeriet.example/mit' }, /Invalid input/],
     ['a status is given', {}, { agreementId: AGREEMENT_ID, status: 'STOPPED' }, /Invalid input/],
   ];
@@ -710,9 +711,10 @@ describe('update_agreement', () => {
 
   it('says what HTTP 429 with Retry-After and HTTP 400 mean, in our own words', async () => {
     for (const [reply, said] of [
-      [{ status: 429, headers: { 'retry-after': '3' }, body: vendorText }, /HTTP 429 .*retry-after=3s.*Nothing was changed\. After the wait: Call again with exactly the same input/],
+      [{ status: 429, headers: { 'retry-after': '3' }, body: vendorText }, /HTTP 429 .*retry-after=3s.*Nothing was changed\. After the wait: Call again with exactly the same input: the agreement is read first, and what it already has is not sent again\./],
       [{ status: 400, body: vendorText }, /HTTP 400 .*Nothing was changed\. A change is refused when the agreement is stopped/],
-      [{ status: 503, body: vendorText }, /It is not known whether the agreement was changed\. Call again with exactly the same input/],
+      [{ status: 503, body: vendorText }, /It is not known whether the agreement was changed\. Call again with exactly the same input: the agreement is read first, and what it already has is not sent again\./],
+      [timeout, /It is not known whether the agreement was changed\. Call again with exactly the same input: the agreement is read first/],
     ] as const) {
       const vendor = recurringStandIn();
       const routes = new Proxy({} as Record<string, Route>, {
@@ -721,25 +723,39 @@ describe('update_agreement', () => {
       const { gw, calls } = gateway(routes, WRITES);
       const result = await gw.callTool('update_agreement', rename);
       expect(texts(result)[0]).toMatch(said);
-      expect(result.failure).toMatchObject({ method: 'PATCH', pathTemplate: '/recurring/v3/agreements/{agreementId}' });
+      // Its key is new for every request, so the text never promises the same key.
+      expect(texts(result)[0]).not.toMatch(/same Idempotency-Key/);
+      if (typeof reply !== 'function') expect(result.failure).toMatchObject({ method: 'PATCH', pathTemplate: '/recurring/v3/agreements/{agreementId}' });
       // A PATCH is never retried by the client itself, also not on 503.
       expect(writesOf(calls)).toHaveLength(1);
       expectNothingLeaks(result, ['Charge rejected']);
     }
   });
 
+  // One row per field the tool can send: a repeat after a lost answer must see each of them as made.
+  const everyField: Array<[string, Record<string, unknown>, GatewayJsonObject, string]> = [
+    ['the product name', {}, rename, 'productName'],
+    ['the product description', {}, { agreementId: AGREEMENT_ID, productDescription: 'Friskt brød hver fredag' }, 'productDescription'],
+    ['the address', {}, { agreementId: AGREEMENT_ID, merchantAgreementUrl: 'https://fjordbakeriet.example/mit-abonnement' }, 'merchantAgreementUrl'],
+    ['a fixed price', {}, { agreementId: AGREEMENT_ID, price: 24_900, currency: 'DKK' }, 'pricing'],
+    ['a suggested maximum', { pricing: { type: 'VARIABLE', currency: 'DKK', suggestedMaxAmount: 30_000 } }, { agreementId: AGREEMENT_ID, suggestedMaxAmount: 40_000, currency: 'DKK' }, 'pricing'],
+    ['the interval', {}, { agreementId: AGREEMENT_ID, interval: { unit: 'WEEK', count: 2 } }, 'interval'],
+  ];
   for (const repeat of REPEATS) {
-    it(`changes once when the answer is lost and the call is repeated (${repeat})`, async () => {
-      const vendor = recurringStandIn(repeat);
-      const { gw, calls } = gateway(vendor.routes, WRITES);
-      vendor.loseNextAnswer();
-      const first = await gw.callTool('update_agreement', rename);
-      expect(texts(first)[0]).toMatch(/It is not known whether the agreement was changed/);
-      const second = await gw.callTool('update_agreement', rename);
-      expect(data(second)).toMatchObject({ updateRequested: false, alreadyAsAsked: ['productName'] });
-      expect(writesOf(calls)).toHaveLength(1);
-      expect(vendor.patches).toHaveLength(1);
-    });
+    for (const [name, agreement, input, field] of everyField) {
+      it(`changes ${name} once when the answer is lost and the call is repeated (${repeat})`, async () => {
+        const vendor = recurringStandIn(repeat, agreement);
+        const { gw, calls } = gateway(vendor.routes, WRITES);
+        vendor.loseNextAnswer();
+        const first = await gw.callTool('update_agreement', input);
+        expect(texts(first)[0]).toMatch(/It is not known whether the agreement was changed/);
+        const second = await gw.callTool('update_agreement', input);
+        expect(second.isError).toBeUndefined();
+        expect(data(second)).toMatchObject({ updateRequested: false, changed: [], alreadyAsAsked: [field] });
+        expect(writesOf(calls)).toHaveLength(1);
+        expect(vendor.patches).toHaveLength(1);
+      });
+    }
   }
 
   for (const repeat of REPEATS) {
