@@ -656,7 +656,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       'Create a charge on an active Recurring agreement: Vipps MobilePay draws the amount from the customer on the due date, without the customer approving it again, and tries again for retryDays days if that fails. ' +
       'transactionType DIRECT_CAPTURE charges on the due date; RESERVE_CAPTURE reserves the amount on the due date, and capture_charge draws it once the product or service is delivered. ' +
       'The due date must be at least one day and at most two years ahead. Reads the agreement first and refuses, without sending anything, when it is not active, when the currency differs, or when the amount is outside the limits of the currency or above the maximum of a variable price. ' +
-      'orderId is the business’s own number for the charge (recommended); it becomes the charge’s id and can be used once. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, so the same charge is created only once, and the answer says whether it was created now or exists already (alreadyExists). Never change the input to try again. ' +
+      'orderId is the business’s own number for the charge and is required; it becomes the charge’s id and can be used once per sales unit. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, and the orderId keeps the charge from being created twice, so the answer says whether it was created now or exists already (alreadyExists). Never change the orderId to try again. ' +
       'cancel_charge cancels a charge before it is drawn. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
     inputShape: {
       agreementId: agreementIdSchema,
@@ -667,7 +667,11 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       retryDays: z.number().int().min(0).max(MAX_RETRY_DAYS).describe(`Days Vipps MobilePay tries again after the due date if the charge fails, 0-${MAX_RETRY_DAYS}. Vipps MobilePay recommends at least 2.`),
       transactionType: z.enum(CHARGE_TRANSACTION_TYPES).describe('DIRECT_CAPTURE (charged on the due date) or RESERVE_CAPTURE (reserved on the due date and drawn with capture_charge).'),
       processingMode: z.enum(PROCESSING_MODES).optional().describe('MULTIPLE_ATTEMPTS (default) or SINGLE_ATTEMPT: one try only, and then retryDays must be 0.'),
-      orderId: z.string().trim().regex(ORDER_ID_PATTERN).optional().describe('The business’s own number for the charge (1-64 letters, digits or dashes). It becomes the charge’s id; used once per sales unit.'),
+      orderId: z
+        .string()
+        .trim()
+        .regex(ORDER_ID_PATTERN)
+        .describe('The business’s own number for this charge (1-64 letters, digits or dashes), e.g. its invoice or subscription period number. It becomes the charge’s id and can be used once per sales unit, so the same charge is never created twice. Never change it to try again.'),
     },
     annotations: WRITE_TOOL_ANNOTATIONS,
     returnsUpstreamContent: false,
@@ -676,7 +680,6 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}' },
       { access: 'write', method: 'POST', path: '/recurring/v3/agreements/{agreementId}/charges' },
       { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' },
-      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges' },
     ],
     keyTypes: ALL_KEYS,
     change: change(
@@ -732,7 +735,7 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       'Change a pending or active Recurring agreement: the product name and description the customer sees, the address where the customer manages the agreement, the price, or the interval. Give only what changes. ' +
       'price changes a fixed price (pricing type LEGACY) and suggestedMaxAmount the suggested maximum of a variable price (VARIABLE), each with currency; the kind of price cannot be changed. Vipps MobilePay does not tell the customer of a new price: the business tells the customer itself, as its terms say. ' +
       'Reads the agreement first and refuses, without sending anything, when it is stopped or expired, when the price does not fit its kind of price, or when the currency differs; what the agreement already has is not sent again. Moves no money. To stop an agreement, use stop_agreement. ' +
-      'After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input and the agreement as it was, so the change is made only once. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
+      'After a failure or a lost answer, call again with exactly the same input: the agreement is read first, and what it already has is not sent again. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
     inputShape: {
       agreementId: agreementIdSchema,
       productName: z.string().trim().min(1).max(45).optional().describe('The product name the customer sees (1-45 characters).'),

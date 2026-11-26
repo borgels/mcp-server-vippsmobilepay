@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveVippsChange, vippsToolCatalog, type GatewayJsonObject, type GatewayToolResult } from '../src/gateway.js';
 import { isDerivedIdempotencyKey, pseudonym } from '../src/vipps/values.js';
 import { chargeView } from '../src/vipps/views.js';
-import { apiCalls, connect, gateway, KEYS, TOKEN, texts, type Call, type Reply, type Route } from './helpers.js';
+import { apiCalls, connect, fakeKey, gateway, KEYS, TOKEN, texts, type Call, type Reply, type Route } from './helpers.js';
 import { KeyMemory, REPEATS, type Repeat } from './second-call.js';
 
 /**
@@ -15,6 +15,8 @@ const AGREEMENT_ID = 'agr_7TqP2m';
 const AGREEMENT_PATH = `/recurring/v3/agreements/${AGREEMENT_ID}`;
 const CHARGES_PATH = `${AGREEMENT_PATH}/charges`;
 const RESERVED_ID = 'chr-Rz4mQ8';
+/** The business's own number for the new charge, which becomes its id. */
+const ORDER_ID = 'brod-2026-12';
 const WRITES = { policy: { enableWrites: true }, maxAttempts: 5, retryBaseDelayMs: 1 };
 
 const newCharge = {
@@ -25,6 +27,7 @@ const newCharge = {
   due: '2026-12-01',
   retryDays: 3,
   transactionType: 'RESERVE_CAPTURE',
+  orderId: 'brod-2026-12',
 } as const;
 const capture = { agreementId: AGREEMENT_ID, chargeId: RESERVED_ID, amount: 19_900, currency: 'DKK', alreadyCaptured: 0 } as const;
 const rename = { agreementId: AGREEMENT_ID, productName: 'Brødabonnement, stor' } as const;
@@ -206,7 +209,6 @@ describe('the four Recurring changes in the catalogue', () => {
           { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}' },
           { access: 'write', method: 'POST', path: '/recurring/v3/agreements/{agreementId}/charges' },
           { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' },
-          { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges' },
         ],
       },
       capture_charge: {
@@ -277,7 +279,7 @@ describe('the four Recurring changes in the catalogue', () => {
   });
 
   it('resolve to a change with identifiers as pseudonyms and never a free text', () => {
-    expect(resolveVippsChange('create_charge', { ...newCharge, orderId: 'brod-2026-12' })).toEqual({
+    expect(resolveVippsChange('create_charge', newCharge)).toEqual({
       ok: true,
       change: {
         tool: 'create_charge',
@@ -307,7 +309,7 @@ describe('create_charge', () => {
       created: true,
       alreadyExists: false,
       agreementId: AGREEMENT_ID,
-      chargeId: 'chr-New1',
+      chargeId: ORDER_ID,
       amount: 19_900,
       currency: 'DKK',
       transactionType: 'RESERVE_CAPTURE',
@@ -324,7 +326,7 @@ describe('create_charge', () => {
     });
     expect(keysOf(calls)[0]).toMatch(/^charge-[0-9a-f]{32}$/);
     expect(isDerivedIdempotencyKey(keysOf(calls)[0])).toBe(true);
-    expect(apiCalls(calls).map(call => `${call.method} ${call.path}`)).toEqual([`GET ${AGREEMENT_PATH}`, `POST ${CHARGES_PATH}`, `GET ${CHARGES_PATH}/chr-New1`]);
+    expect(apiCalls(calls).map(call => `${call.method} ${call.path}`)).toEqual([`GET ${AGREEMENT_PATH}`, `POST ${CHARGES_PATH}`, `GET ${CHARGES_PATH}/${ORDER_ID}`]);
     // The key is in no answer and no audit record; the description only as a keyed hash.
     expectNothingLeaks([result, records], [keysOf(calls)[0]!, keysOf(calls)[0]!.slice(7), 'Brødabonnement: december']);
     expectNothingLeaks(records, [AGREEMENT_ID]);
@@ -337,12 +339,23 @@ describe('create_charge', () => {
     const vendor = recurringStandIn();
     const { gw, calls } = gateway(vendor.routes, WRITES);
     await gw.callTool('create_charge', newCharge);
-    await gw.callTool('create_charge', { ...newCharge, due: '2027-01-01' });
-    const withOrder = await gw.callTool('create_charge', { ...newCharge, transactionType: 'DIRECT_CAPTURE', orderId: 'brod-2026-12' });
-    expect(data(withOrder)).toMatchObject({ created: true, chargeId: 'brod-2026-12' });
-    expect(String(data(withOrder).note)).toMatch(/charged on the due date/);
+    await gw.callTool('create_charge', { ...newCharge, due: '2027-01-01', orderId: 'brod-2027-01' });
+    const direct = await gw.callTool('create_charge', { ...newCharge, transactionType: 'DIRECT_CAPTURE', orderId: 'brod-2027-02' });
+    expect(data(direct)).toMatchObject({ created: true, chargeId: 'brod-2027-02' });
+    expect(String(data(direct).note)).toMatch(/charged on the due date/);
     expect(new Set(keysOf(calls)).size).toBe(3);
-    expect(writesOf(calls)[2]?.body).toMatchObject({ orderId: 'brod-2026-12', transactionType: 'DIRECT_CAPTURE' });
+    expect(writesOf(calls)[2]?.body).toMatchObject({ orderId: 'brod-2027-02', transactionType: 'DIRECT_CAPTURE' });
+  });
+
+  it('needs the business’s orderId: without one nothing is sent', async () => {
+    const vendor = recurringStandIn();
+    const { gw, calls } = gateway(vendor.routes, WRITES);
+    const { orderId: _left, ...withoutOrder } = newCharge;
+    const result = await gw.callTool('create_charge', withoutOrder);
+    expect(result.isError).toBe(true);
+    expect(texts(result)[0]).toMatch(/Invalid input/);
+    expect(apiCalls(calls)).toHaveLength(0);
+    expect(resolveVippsChange('create_charge', withoutOrder).ok).toBe(false);
   });
 
   const refusals: Array<[string, Record<string, unknown>, GatewayJsonObject, RegExp]> = [
@@ -411,10 +424,10 @@ describe('create_charge', () => {
   it('is refused when its orderId is used by a charge that is not this request', async () => {
     const vendor = recurringStandIn();
     const { gw, calls } = gateway(vendor.routes, WRITES);
-    await gw.callTool('create_charge', { ...newCharge, orderId: 'brod-2026-12' });
-    const other = await gw.callTool('create_charge', { ...newCharge, amount: 100, orderId: 'brod-2026-12' });
+    await gw.callTool('create_charge', newCharge);
+    const other = await gw.callTool('create_charge', { ...newCharge, amount: 100 });
     expect(other.isError).toBe(true);
-    expect(texts(other)[0]).toMatch(/^Refused: a charge with this orderId exists and is not this request/);
+    expect(texts(other)[0]).toMatch(/^Refused: a charge with this orderId exists and cannot be shown to be this request/);
     expect(vendor.charges.get('brod-2026-12')?.amount).toBe(19_900);
     expect(new Set(keysOf(calls)).size).toBe(2);
     expectNothingLeaks(other);
@@ -438,7 +451,7 @@ describe('create_charge', () => {
     // A POST is never retried by the client itself.
     expect(writesOf(calls)).toHaveLength(1);
     busy = false;
-    expect(data(await gw.callTool('create_charge', newCharge))).toMatchObject({ created: true, chargeId: 'chr-New1' });
+    expect(data(await gw.callTool('create_charge', newCharge))).toMatchObject({ created: true, chargeId: ORDER_ID });
     expect(new Set(keysOf(calls)).size).toBe(1);
     expect(vendor.charges.size).toBe(2);
     expectNothingLeaks(first);
@@ -460,26 +473,40 @@ describe('create_charge', () => {
   });
 
   for (const repeat of REPEATS) {
-    for (const orderId of [undefined, 'brod-2026-12']) {
-      it(`creates one charge when the answer is lost and the call is repeated (${repeat}, ${orderId ? 'with' : 'without'} orderId)`, async () => {
-        const vendor = recurringStandIn(repeat);
-        const { gw, calls } = gateway(vendor.routes, WRITES);
-        const input = orderId === undefined ? newCharge : { ...newCharge, orderId };
-        vendor.loseNextAnswer();
-        const first = await gw.callTool('create_charge', input);
-        expect(texts(first)[0]).toMatch(/It is not known whether the charge was created/);
-        const second = await gw.callTool('create_charge', input);
-        expect(second.isError).toBeUndefined();
-        const id = orderId ?? 'chr-New1';
-        expect(data(second)).toMatchObject({ chargeId: id, status: 'PENDING' });
-        // A replay is the first answer again; a refused repeat is found by the key in the charge's history.
-        expect(data(second)).toMatchObject(repeat === 'replay' ? { created: true } : { created: false, alreadyExists: true });
-        expect(vendor.charges.size).toBe(2);
-        expect(keysOf(calls)).toHaveLength(2);
-        expect(new Set(keysOf(calls)).size).toBe(1);
-        expectNothingLeaks([first, second], [keysOf(calls)[0]!]);
-      });
-    }
+    it(`creates one charge when the answer is lost and the call is repeated (${repeat})`, async () => {
+      const vendor = recurringStandIn(repeat);
+      const { gw, calls } = gateway(vendor.routes, WRITES);
+      vendor.loseNextAnswer();
+      const first = await gw.callTool('create_charge', newCharge);
+      expect(texts(first)[0]).toMatch(/It is not known whether the charge was created/);
+      const second = await gw.callTool('create_charge', newCharge);
+      expect(second.isError).toBeUndefined();
+      expect(data(second)).toMatchObject({ chargeId: ORDER_ID, status: 'PENDING' });
+      // A replay is the first answer again; a refused repeat is found by the key in the charge's history.
+      expect(data(second)).toMatchObject(repeat === 'replay' ? { created: true } : { created: false, alreadyExists: true });
+      expect(vendor.charges.size).toBe(2);
+      expect(keysOf(calls)).toHaveLength(2);
+      expect(new Set(keysOf(calls)).size).toBe(1);
+      expectNothingLeaks([first, second], [keysOf(calls)[0]!]);
+    });
+
+    it(`creates one charge when the answer is lost and the call is repeated after the client secret was replaced (${repeat})`, async () => {
+      const vendor = recurringStandIn(repeat);
+      const before = gateway(vendor.routes, WRITES);
+      vendor.loseNextAnswer();
+      const first = await before.gw.callTool('create_charge', newCharge);
+      expect(texts(first)[0]).toMatch(/It is not known whether the charge was created/);
+      // The same input from an installation with a new client secret: another key, the same orderId.
+      const after = gateway(vendor.routes, { ...WRITES, clientSecret: fakeKey('fjordbakeriet-secret-2', 34) });
+      const second = await after.gw.callTool('create_charge', newCharge);
+      expect(keysOf(before.calls)[0]).not.toBe(keysOf(after.calls)[0]);
+      // Vipps MobilePay takes the orderId once: the second request is refused, and the charge is not shown to be it.
+      expect(second.isError).toBe(true);
+      expect(texts(second)[0]).toMatch(/^Refused: a charge with this orderId exists and cannot be shown to be this request: another request, or this one made before the client secret was replaced\. Nothing was created\./);
+      expect(vendor.charges.size).toBe(2);
+      expect([...vendor.charges.values()].filter(charge => charge.description === newCharge.description)).toHaveLength(1);
+      expectNothingLeaks(second, [keysOf(before.calls)[0]!, keysOf(after.calls)[0]!]);
+    });
   }
 
   it('never passes on the key it made, also not when the charge is read', async () => {
@@ -490,7 +517,7 @@ describe('create_charge', () => {
     await gw.callTool('capture_charge', { ...capture, amount: 100 });
     const captureKey = keysOf(calls)[1]!;
     for (const [tool, input] of [
-      ['get_charge', { agreementId: AGREEMENT_ID, chargeId: 'chr-New1' }],
+      ['get_charge', { agreementId: AGREEMENT_ID, chargeId: ORDER_ID }],
       ['get_charge', { agreementId: AGREEMENT_ID, chargeId: RESERVED_ID }],
       ['list_charges', { agreementId: AGREEMENT_ID }],
     ] as const) {
@@ -501,7 +528,7 @@ describe('create_charge', () => {
     }
     // A key the caller chose is still passed on.
     expect(JSON.stringify(await gw.callTool('get_charge', { agreementId: AGREEMENT_ID, chargeId: RESERVED_ID }))).toContain('op-reserve-0001');
-    const view = chargeView(vendor.charges.get('chr-New1'));
+    const view = chargeView(vendor.charges.get(ORDER_ID));
     expect((view.history as Array<Record<string, unknown>>)[0]).not.toHaveProperty('idempotencyKey');
   });
 });
@@ -715,14 +742,25 @@ describe('update_agreement', () => {
     });
   }
 
-  it('makes a change and its undoing two requests, with two keys', async () => {
-    const vendor = recurringStandIn('replay');
-    const { gw, calls } = gateway(vendor.routes, WRITES);
-    await gw.callTool('update_agreement', rename);
-    await gw.callTool('update_agreement', { agreementId: AGREEMENT_ID, productName: 'Brødabonnement' });
-    expect(vendor.agreement.productName).toBe('Brødabonnement');
-    expect(new Set(keysOf(calls)).size).toBe(2);
-  });
+  for (const repeat of REPEATS) {
+    it(`carries out A to B, back to A and to B again, each time (${repeat})`, async () => {
+      // Vipps MobilePay answers a key it has seen with its first answer, without changing the agreement again. Each
+      // change therefore has a key of its own, also the same change made a second time.
+      const vendor = recurringStandIn(repeat);
+      const { gw, calls } = gateway(vendor.routes, WRITES);
+      const steps = [rename, { agreementId: AGREEMENT_ID, productName: 'Brødabonnement' }, rename, { agreementId: AGREEMENT_ID, productName: 'Brødabonnement' }, rename];
+      for (const [index, step] of steps.entries()) {
+        const result = await gw.callTool('update_agreement', step);
+        expect(result.isError, `step ${index + 1}`).toBeUndefined();
+        expect(data(result), `step ${index + 1}`).toMatchObject({ updateRequested: true, changed: ['productName'] });
+        expect(vendor.agreement.productName, `step ${index + 1}`).toBe(step.productName);
+      }
+      expect(vendor.patches).toHaveLength(5);
+      expect(keysOf(calls)).toHaveLength(5);
+      expect(new Set(keysOf(calls)).size).toBe(5);
+      for (const key of keysOf(calls)) expect(key).toMatch(/^update-[0-9a-f]{32}$/);
+    });
+  }
 });
 
 describe('stop_agreement', () => {

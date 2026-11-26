@@ -7,7 +7,8 @@
   - `create_charge` creates a charge on an `ACTIVE` agreement
     (`POST /recurring/v3/agreements/{agreementId}/charges`), `DIRECT_CAPTURE`
     or `RESERVE_CAPTURE`, with `due`, `retryDays`, an optional
-    `processingMode` and an optional `orderId`, which becomes the charge's id.
+    `processingMode` and a required `orderId`, the business's own number for
+    the charge, which becomes its id and which Vipps MobilePay takes once.
     `change.action` `create`, `record` `charge`, `movesMoney` true.
   - `capture_charge` captures all or part of a reserved charge
     (`POST .../charges/{chargeId}/capture`). It takes `alreadyCaptured`, what
@@ -26,11 +27,15 @@
 - Each reads the agreement or the charge first and refuses, without sending
   anything, what Vipps MobilePay documents it would refuse (status, currency,
   the currency's amount limits, the kind of price, a variable price's maximum).
-- None takes an `idempotencyKey`: the key is made from the sales unit, the
-  agreement and the request's content with a keyed hash, as for
-  `create_payment` (`charge-`, `capture-`, `update-` or `stop-` and 32 hex
-  characters), so a call repeated after a failure or a lost answer is the
-  same request. A repeat finds a change already made (a charge by the
+- None takes an `idempotencyKey`. For `create_charge`, `capture_charge` and
+  `stop_agreement` the key is made from the sales unit, the agreement and the
+  request's content with a keyed hash, as for `create_payment` (`charge-`,
+  `capture-` or `stop-` and 32 hex characters), so a call repeated after a
+  failure or a lost answer is the same request. Since that key changes with
+  the client secret, the `orderId` of a charge, the captured amount of a
+  charge and the status of an agreement guard against a second change too.
+  `update_agreement` gets a new random key (`update-`) for every request, so
+  A to B, back to A and to B again is carried out each time. A repeat finds a change already made (a charge by the
   `CREATE` event with its key, a capture by its `CAPTURE` event, an agreement
   that already has what is asked or is stopped) and sends nothing again. The
   key is in no answer, error or audit record, and `get_charge` and

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { VippsHttpError, withNote } from '../errors.js';
 import { encodePathParam } from '../path-params.js';
 import type { UpstreamClient } from './client.js';
@@ -281,10 +282,13 @@ export async function cancelCharge(
 }
 
 /*
- * The four Recurring changes below make their Idempotency-Key from the request's content (derivedIdempotencyKey in
+ * Three of the Recurring changes below make their Idempotency-Key from the request's content (derivedIdempotencyKey in
  * values.ts): the sales unit, the agreement and what the request says. The same request is always the same key, so a
  * call repeated after a failure or a lost answer is carried out by Vipps MobilePay at most once, and the caller cannot
- * repeat it under a new key. Each reads the agreement or the charge first and refuses, without sending anything, what
+ * repeat it under a new key. That key changes when the client secret is replaced, so each also has a second guard that
+ * does not: a new charge has the business's orderId, which Vipps MobilePay takes once; a capture is checked against
+ * what the charge shows as captured; a stop against the agreement's status. A change of an agreement gets a new key
+ * for every request instead (see updateAgreement). Each reads the agreement or the charge first and refuses, without sending anything, what
  * Vipps MobilePay documents it would refuse; and a repeat finds a change that is already made, and says so.
  *
  * The texts are ours: what a status means for this request, and what to do. Nothing of the vendor's answer is read
@@ -331,6 +335,14 @@ function changeKey(client: UpstreamClient, kind: DerivedKeyKind, agreementId: st
     agreementId,
     request,
   });
+}
+
+/**
+ * A key for one request only: `kind`, a dash and 32 random hex characters, in the form of the keys made from a
+ * request's content, so it is never passed on either (isDerivedIdempotencyKey).
+ */
+function oneTimeKey(kind: DerivedKeyKind): string {
+  return `${kind}-${randomBytes(16).toString('hex')}`;
 }
 
 /** The smallest and the largest amount of a charge or a price, in minor units (the Recurring guide's payment amounts). */
@@ -389,7 +401,11 @@ export const CHARGE_TRANSACTION_TYPES = ['DIRECT_CAPTURE', 'RESERVE_CAPTURE'] as
 export const PROCESSING_MODES = ['MULTIPLE_ATTEMPTS', 'SINGLE_ATTEMPT'] as const;
 /** The most days Vipps MobilePay retries a charge after its due date. */
 export const MAX_RETRY_DAYS = 14;
-/** The business's own number for a charge, which then becomes the charge's id (the API's orderId). */
+/**
+ * The business's own number for a charge, which then becomes the charge's id (the API's orderId). Required: Vipps
+ * MobilePay takes an orderId once per sales unit, so it is what keeps a charge from being created twice when the
+ * Idempotency-Key no longer helps (after the client secret is replaced, or after Vipps MobilePay forgets the key).
+ */
 export const ORDER_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 
 export interface CreateChargeInput {
@@ -403,7 +419,7 @@ export interface CreateChargeInput {
   retryDays: number;
   transactionType: (typeof CHARGE_TRANSACTION_TYPES)[number];
   processingMode?: (typeof PROCESSING_MODES)[number];
-  orderId?: string;
+  orderId: string;
 }
 
 /** What the fields must be together, which the schema cannot say. Nothing here reads the clock. */
@@ -422,7 +438,7 @@ function chargeContent(input: CreateChargeInput): Record<string, unknown> {
     due: input.due,
     retryDays: input.retryDays,
     ...(input.processingMode === undefined ? {} : { processingMode: input.processingMode }),
-    ...(input.orderId === undefined ? {} : { orderId: input.orderId }),
+    orderId: input.orderId,
   };
 }
 
@@ -436,7 +452,7 @@ const CHARGE_TEXTS: ChangeTexts = {
 
 const CHARGE_EXISTS = 'This charge already exists, so nothing new was created.';
 const ORDER_ID_USED =
-  'Refused: a charge with this orderId exists and is not this request, or cannot be shown to be it. Nothing was created. An orderId is used once per sales unit: get_charge shows the charge that has it.';
+  'Refused: a charge with this orderId exists and cannot be shown to be this request: another request, or this one made before the client secret was replaced. Nothing was created. An orderId is used once per sales unit: get_charge shows the charge that has it.';
 
 /** Whether a charge was created by a request with this key: its history has a CREATE with the key. */
 function createdWith(charge: Record<string, unknown>, idempotencyKey: string): boolean {
@@ -450,37 +466,18 @@ function createdWith(charge: Record<string, unknown>, idempotencyKey: string): b
 type FoundCharge = { kind: 'ours'; charge: Record<string, unknown> } | { kind: 'other' } | { kind: 'none' } | { kind: 'unread' };
 
 /**
- * After a refusal: the charge this very request created before, if there is one. With an orderId it is the charge with
- * that id; without one, the agreement's charges are read. Only a charge whose history holds this request's key is
- * taken for it.
+ * After a refusal: the charge with the request's orderId, and whether this very request created it. Only a charge
+ * whose history holds this request's key is taken for it.
  */
 async function findOwnCharge(client: UpstreamClient, input: CreateChargeInput, idempotencyKey: string): Promise<FoundCharge> {
+  let charge: Record<string, unknown>;
   try {
-    if (input.orderId !== undefined) {
-      let charge: Record<string, unknown>;
-      try {
-        charge = asRecord(await client.get(chargePath(input.agreementId, input.orderId)));
-      } catch (error) {
-        if (error instanceof VippsHttpError && !error.tokenRequest && error.status === 404) return { kind: 'none' };
-        return { kind: 'unread' };
-      }
-      return createdWith(charge, idempotencyKey) ? { kind: 'ours', charge } : { kind: 'other' };
-    }
-    let token: string | undefined;
-    for (let page = 1; page <= MAX_CHARGE_PAGES; page += 1) {
-      const response = await client.getPage<unknown>(`${agreementPath(input.agreementId)}/charges`, {}, token ? { 'Continuation-Token': token } : undefined);
-      if (!Array.isArray(response.data)) return { kind: 'unread' };
-      const found = response.data.map(asRecord).find(charge => createdWith(charge, idempotencyKey));
-      if (found) return { kind: 'ours', charge: found };
-      const next = response.headers['continuation-token'];
-      if (!next) return { kind: 'none' };
-      if (!/^[A-Za-z0-9-]{1,100}$/.test(next) || next === token) return { kind: 'unread' };
-      token = next;
-    }
-    return { kind: 'unread' };
-  } catch {
+    charge = asRecord(await client.get(chargePath(input.agreementId, input.orderId)));
+  } catch (error) {
+    if (error instanceof VippsHttpError && !error.tokenRequest && error.status === 404) return { kind: 'none' };
     return { kind: 'unread' };
   }
+  return createdWith(charge, idempotencyKey) ? { kind: 'ours', charge } : { kind: 'other' };
 }
 
 /** The status of a charge as a text we can repeat: one of the documented ones, or none. */
@@ -544,7 +541,7 @@ export async function createCharge(client: UpstreamClient, input: CreateChargeIn
   try {
     accepted = await client.post(`${agreementPath(input.agreementId)}/charges`, content, { idempotencyKey });
   } catch (error) {
-    // A refusal because the request was seen before, or because its orderId is used: look for the charge it made.
+    // A refusal because the request was seen before, or because its orderId is used: read the charge with it.
     if (error instanceof VippsHttpError && !error.tokenRequest && error.status === 409) {
       const found = await findOwnCharge(client, input, idempotencyKey);
       if (found.kind === 'ours') {
@@ -728,19 +725,6 @@ function alreadyHas(agreement: Record<string, unknown>, field: string, value: un
   }
 }
 
-/** The part of the agreement a change touches, as it is before the change. Part of the key: A to B and back are two changes. */
-function partBefore(agreement: Record<string, unknown>, fields: string[]): Record<string, unknown> {
-  const pricing = asRecord(agreement.pricing);
-  const interval = asRecord(agreement.interval);
-  const out: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (field === 'pricing') out.pricing = { amount: pricing.amount ?? null, suggestedMaxAmount: pricing.suggestedMaxAmount ?? null };
-    else if (field === 'interval') out.interval = { unit: interval.unit ?? null, count: interval.count ?? null };
-    else out[field] = agreement[field] ?? null;
-  }
-  return out;
-}
-
 export async function updateAgreement(client: UpstreamClient, input: UpdateAgreementInput): Promise<unknown> {
   const agreement = asRecord(await client.get(agreementPath(input.agreementId)));
   const status = agreementStatus(agreement);
@@ -769,7 +753,11 @@ export async function updateAgreement(client: UpstreamClient, input: UpdateAgree
     return { ...answer, updateRequested: false, note: 'The agreement already has what was asked, so nothing was sent.' };
   }
   const request = Object.fromEntries(changed.map(field => [field, body[field]]));
-  const idempotencyKey = changeKey(client, 'update', input.agreementId, { before: partBefore(agreement, changed), request });
+  // A new key for every change that is sent. A key made from the change would be the same for A to B now and A to B
+  // again after B to A, and Vipps MobilePay answers a key it has seen with its first answer without changing the
+  // agreement. A repeat after a lost answer needs no key to be safe: it reads the agreement first and sends nothing
+  // when the agreement already has what is asked, and setting the same values twice changes nothing.
+  const idempotencyKey = oneTimeKey('update');
   try {
     await client.patch(agreementPath(input.agreementId), request, { idempotencyKey });
   } catch (error) {

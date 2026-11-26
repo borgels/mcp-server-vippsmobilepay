@@ -51,7 +51,7 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   cancel_payment: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' },
   refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren', idempotencyKey: 'op-0001-aaaa' },
   cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
-  create_charge: { agreementId: 'agr_7TqP2m', amount: 19_900, currency: 'DKK', description: 'Brødabonnement: november', due: '2026-12-01', retryDays: 3, transactionType: 'RESERVE_CAPTURE' },
+  create_charge: { agreementId: 'agr_7TqP2m', amount: 19_900, currency: 'DKK', description: 'Brødabonnement: november', due: '2026-12-01', retryDays: 3, transactionType: 'RESERVE_CAPTURE', orderId: 'brod-2026-12' },
   capture_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-Rz4mQ8', amount: 19_900, currency: 'DKK', alreadyCaptured: 0 },
   update_agreement: { agreementId: 'agr_7TqP2m', productName: 'Brødabonnement, stor' },
   stop_agreement: { agreementId: 'agr_7TqP2m' },
@@ -232,13 +232,9 @@ describe('tool catalog', () => {
       // already carried out); tested in writes.test.ts.
       // The order details are read by the reference of a payment or by the id of a charge: one of the two requests
       // (both tested in lookups.test.ts).
-      // create_charge reads the agreement's charges only after a refusal (HTTP 409), to find the charge the same
-      // request made before (tested in recurring-changes.test.ts).
       const conditional = ['capture_payment', 'refund_payment'].includes(entry.name)
         ? ['GET /epayment/v1/payments/{reference}/events']
-        : entry.name === 'create_charge'
-          ? ['GET /recurring/v3/agreements/{agreementId}/charges']
-          : entry.name === 'get_receipt'
+        : entry.name === 'get_receipt'
           ? ['GET /order-management/v2/RECURRING/{chargeId}']
           : [];
       const expected = (entry.name === 'list_transactions' ? declared.filter(item => item.includes('/fees/')) : declared).filter(
