@@ -192,6 +192,7 @@ export function ownerBoundClient(client: UpstreamClient, owner: LedgerOwner): Up
       return client.getPage<T>(path, query, headers);
     },
     post: refuse('POST'),
+    patch: refuse('PATCH'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
     ownLedgers,

@@ -13,7 +13,16 @@ import {
   type InstancePolicy,
 } from './vipps/policy.js';
 import { ConfigError } from './config-env.js';
-import { failureMetadata, formatUnknownError, redactDeep, SecretRedactor, vendorRequestId, type FailureMetadata } from './errors.js';
+import {
+  listWebhooks,
+  PAYMENT_EVENTS,
+  registerPaymentEvents,
+  removeWebhook,
+  type PaymentEvent,
+  type Webhook,
+  type WebhookRegistration,
+} from './vipps/webhooks.js';
+import { failureInForm, failureMetadata, formatUnknownError, redactDeep, SecretRedactor, type FailureMetadata } from './errors.js';
 import { fixedOutputs, withheldResult } from './fallbacks.js';
 import { admitsKey, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 import {
@@ -30,6 +39,7 @@ import {
   type ToolDefinition,
   type UpstreamOperation,
   type VippsChangeAction,
+  type VippsChangeRecord,
   type VippsChangeSpec,
   type VippsLogField,
   type VippsLogFieldType,
@@ -63,14 +73,23 @@ import {
  * are still read from the environment and apply to every instance.
  *
  * What no policy can turn on: a request outside the client's fixed list
- * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that changes an
- * agreement (price, interval, status), merchant or sales unit settings, or
- * the keys, and none that creates a charge.
+ * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that creates an
+ * agreement, or changes merchant or sales unit settings or the keys.
  */
 
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
 export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
-export type { ConnectionFailureOutcome, VippsChangeAction, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
+export type {
+  ConnectionFailureOutcome,
+  VippsChangeAction,
+  VippsChangeRecord,
+  VippsChangeSpec,
+  VippsLogField,
+  VippsLogFieldType,
+} from './tools/vipps.js';
+export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
+/** The ePayment events a host can register its address for (registerPaymentEvents). */
+export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
 
 export type GatewayRiskLevel = 'read' | 'write' | 'destructive';
 export type GatewayJsonValue = string | number | boolean | null | GatewayJsonValue[] | { [key: string]: GatewayJsonValue };
@@ -86,9 +105,11 @@ export interface GatewayToolDefinition {
 }
 
 /**
- * Metadata about a failed call, on an error result whose cause is known: the HTTP status the upstream API answered
- * with, and the vendor's own request id when a response header gives one as a UUID or hex id. For a host that counts
- * failures without reading their text. Never the response body, the vendor's error code or message, or the input.
+ * Metadata about a failed call, on an error result whose cause is known: the request's method and path template, the
+ * HTTP status the upstream API answered with, the vendor's own request id when a response header gives one as a UUID
+ * or hex id, and Vipps MobilePay's error code and trace id from the body in their fixed forms. For a host that logs
+ * and counts failures without reading their text. Never the response body, the vendor's message, an id or query value
+ * from the path, or the input.
  */
 export type GatewayFailure = FailureMetadata;
 
@@ -100,7 +121,7 @@ export interface GatewayToolResult {
    */
   structuredContent?: GatewayJsonValue;
   isError?: boolean;
-  /** On an error result from the upstream API only: its HTTP status and request id (see GatewayFailure). */
+  /** On an error result from the upstream API only: method, path template, status, ids and error code (see GatewayFailure). */
   failure?: GatewayFailure;
 }
 
@@ -142,10 +163,11 @@ export interface GatewayToolCatalogEntry {
    */
   readonly environments: readonly VippsEnvironment[];
   /**
-   * Vipps MobilePay addition: true for every write tool. A capture, refund
-   * or cancellation moves or releases money, and a payment request reaches
-   * a customer: a host should have a person confirm each call outside the
-   * chat before it runs. `change.movesMoney` tells the two kinds apart.
+   * Vipps MobilePay addition: true for every write tool. A capture, refund,
+   * cancellation or new Recurring charge moves or releases money, a payment
+   * request reaches a customer, and a change or stop of an agreement changes
+   * what the customer has agreed to: a host should have a person confirm
+   * each call before it runs. `change.movesMoney` tells the kinds apart.
    */
   readonly requiresConfirmation: boolean;
   /**
@@ -209,8 +231,8 @@ export interface VippsAccountingGatewayOptions
 export interface VippsChange {
   readonly tool: string;
   readonly action: VippsChangeAction;
-  readonly record: 'payment' | 'charge';
-  /** Whether the call itself moves or releases money (false for a new payment request). */
+  readonly record: VippsChangeRecord;
+  /** Whether the call itself moves or releases money (false for a new payment request and a change or stop of an agreement). */
   readonly movesMoney: boolean;
   /**
    * The values of the tool's `logFields` that are present and have their
@@ -228,14 +250,22 @@ export type VippsChangeResolution =
  * JSON Schema for a gateway tool, derived from the tool's zod schema.
  * `format` is dropped: validators such as Ajv reject unknown formats in
  * strict mode unless format plugins are installed, and zod already checks
- * these values when the call runs.
+ * these values when the call runs. A numeric bound of six digits or more
+ * (the amount limit, or the safe-integer limit zod adds to an integer) is
+ * dropped too, for the same reason zod still checks it: every text in the
+ * tool list is compared with the keys, and a run of six digits is a piece a
+ * hex key can hold (test/fixed-corpus.test.ts).
  */
 function toGatewayJsonSchema(tool: ToolDefinition): GatewayJsonObject {
   const { $schema: _ignored, ...schema } = z.toJSONSchema(tool.inputSchema, {
     io: 'input',
     unrepresentable: 'any',
     override: ctx => {
-      delete (ctx.jsonSchema as Record<string, unknown>).format;
+      const json = ctx.jsonSchema as Record<string, unknown>;
+      delete json.format;
+      for (const bound of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum']) {
+        if (typeof json[bound] === 'number' && Math.abs(json[bound]) >= 100_000) delete json[bound];
+      }
     },
   }) as Record<string, unknown>;
   return schema as GatewayJsonObject;
@@ -346,7 +376,7 @@ function requiredSecret(options: Partial<VippsGatewayOptions> | undefined, name:
   const value: unknown = options?.[name];
   if (typeof value !== 'string' || value.trim() === '') {
     throw new ConfigError(
-      `createVippsMobilePayGateway requires options.${name}. Embedded instances do not read credentials from the environment.`,
+      `createVippsMobilePayGateway requires options.${name}. A gateway inside a host does not read credentials from the environment.`,
     );
   }
   // Key admission (src/key-admission.ts): printable ASCII of 16 characters or more, sharing no piece with any text of
@@ -454,6 +484,40 @@ function buildGateway(options: VippsGatewayOptions, secrets: Partial<Record<Secr
   });
   const redactor: SecretRedactor = client.redactor;
   const underPolicy = <T>(work: () => T): T => runInCallScope(policy ? { policy, redactor } : { redactor }, work);
+  /**
+   * Set when a registration answer could not be masked in full (seen() was told it is incomplete, or masking itself
+   * threw): from then on this instance gives nothing more on, neither a host value nor a tool result, since what it
+   * would give could carry a secret it does not know. A new instance (new keys from the host) starts clean.
+   */
+  let withholdAll = false;
+  /** The registration secrets this instance has given on: the same one again is a repeat, not a leak. */
+  const givenSigningValues = new Set<string>();
+  /**
+   * What a host function returns, as a tool result is returned: with this instance's secrets redacted everywhere, then
+   * the sink check. A value that still holds a piece of a secret is withheld whole, as a failure in our own words.
+   */
+  const guarded = <T>(value: T): T => {
+    if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+    if (value === undefined) return value;
+    const final = JSON.parse(JSON.stringify(redactDeep(redactDeep(value, redactor), redactor))) as T;
+    if (leaksSecret(final, redactor)) throw new Error(HOST_ANSWER_WITHHELD);
+    return final;
+  };
+  /**
+   * Every host function goes through here: its value through `guarded`, its failure as our own text, redacted, without
+   * the cause. Nothing a host function returns or throws skips either.
+   */
+  const hostCall = async <T>(work: () => Promise<T>, after?: (value: T) => void, guard = true): Promise<T> => {
+    try {
+      const raw = await underPolicy(work);
+      const value = guard ? guarded(raw) : raw;
+      after?.(value);
+      return value;
+    } catch (error) {
+      // Once the instance withholds everything, its failures say nothing but that.
+      throw sealedError(new Error(withholdAll ? HOST_ANSWER_WITHHELD : formatUnknownError(error, redactor)));
+    }
+  };
 
   return {
     /** Tools offered on this instance: not disabled or outside allowedTools, and usable with its keys. */
@@ -463,11 +527,68 @@ function buildGateway(options: VippsGatewayOptions, secrets: Partial<Record<Secr
     /** The environment and key type of this instance. */
     environment: client.environment,
     keyType: client.keyType,
+    /**
+     * Host only, never a tool: register `address` (https, the host's own) for this sales unit's ePayment `events`.
+     * Returns the registration's id and the secret that signs every event sent there; the secret is given only here, only
+     * when it shares nothing with a secret the instance already knows (or is exactly an earlier registration's), and
+     * the instance masks it from the moment the answer arrives, also when the answer is then refused. Registering the same address and set of events again sends the same operation
+     * key (Vipps MobilePay does not document it for this API).
+     */
+    registerPaymentEvents(address: string, events: readonly PaymentEvent[]): Promise<WebhookRegistration> {
+      // The secret is the one value given on unmasked, because it is what the host asked for, and only when it is new to
+      // this instance's keys: one that shares a piece with a key is withheld (it may be an echo of the key). The same
+      // secret as an earlier registration of this instance is a repeat and goes on. It is masked from here on, before
+      // the rest of the answer is checked, so an id that holds it is withheld too; and from then on everywhere: every
+      // later error, failure metadata, result, host value and audit record.
+      return hostCall(async () => {
+        // Whether the value may be given on is decided against every secret the instance knows (its keys, the access
+        // tokens it has had, the registration secrets before this one), before the value itself is added; then every
+        // text in the field is masked from here on, whatever becomes of the answer. The one exception is the exact value
+        // of an earlier registration of this instance: a repeat.
+        let mayGiveOn = false;
+        const registration = await underPolicy(() =>
+          registerPaymentEvents(client, address, events, signing => {
+            try {
+              if (signing.incomplete) withholdAll = true;
+              const value = signing.value;
+              mayGiveOn = value !== undefined && (givenSigningValues.has(value) || !redactor.sharesWith(value));
+              for (const text of signing.texts) redactor.addSecret(text);
+            } catch (error) {
+              // Masking that did not finish: nothing more leaves this instance.
+              withholdAll = true;
+              mayGiveOn = false;
+              throw error;
+            }
+          }),
+        );
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+        if (!mayGiveOn) throw new Error(HOST_ANSWER_WITHHELD);
+        givenSigningValues.add(registration.secret);
+        // The rest of the answer, the id, as any other value the instance returns: one that holds a secret or a piece of
+        // one (by the redactor, as for a tool result) is withheld. The stricter sharesWith is for the value given on
+        // unmasked only; an id is not given on unmasked.
+        const { id } = guarded({ id: registration.id });
+        if (id !== registration.id || redactor.matches(registration.id)) throw new Error(HOST_ANSWER_WITHHELD);
+        return { id, secret: registration.secret };
+      }, undefined, false);
+    },
+    /** Host only, never a tool: the registrations of this sales unit, as id, address and events (no secret). */
+    listWebhooks(): Promise<Webhook[]> {
+      return hostCall(() => listWebhooks(client));
+    },
+    /** Host only, never a tool: remove one registration by its id. */
+    removeWebhook(id: string): Promise<void> {
+      return hostCall(async () => {
+        if (withholdAll) throw new Error(HOST_ANSWER_WITHHELD);
+        await removeWebhook(client, id);
+      });
+    },
     callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       // The whole result, text and data (keys included, numbers by their string form), with this instance's secrets
       // redacted, then the sink check: a result that holds a piece of a key anywhere is withheld whole.
       return underPolicy(() =>
         runCall(toolName, input, context).then(result => {
+          if (withholdAll) return withheldResult();
           const final = withFailureInForm(
             JSON.parse(JSON.stringify(redactDeep(redactDeep(result, redactor), redactor))) as GatewayToolResult,
           );
@@ -513,6 +634,9 @@ function buildGateway(options: VippsGatewayOptions, secrets: Partial<Record<Secr
   }
 }
 
+/** A host function's value that held a piece of a secret after redaction: withheld whole. */
+const HOST_ANSWER_WITHHELD = 'The answer from Vipps MobilePay was withheld: it held a piece of a key of this instance.';
+
 /** The connection check: with accounting keys its failures carry an outcome in their data. */
 const CONNECTION_CHECK = `${TOOL_PREFIX}check_connection`;
 
@@ -540,9 +664,7 @@ function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult 
  */
 function withFailureInForm(result: GatewayToolResult): GatewayToolResult {
   const { failure, ...rest } = result;
-  if (!result.isError || failure === undefined || failure === null || typeof failure !== 'object') return rest;
-  const status = failure.httpStatus;
-  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return rest;
-  const requestId = vendorRequestId(failure.requestId);
-  return { ...rest, failure: requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId } };
+  if (!result.isError) return rest;
+  const inForm = failureInForm(failure);
+  return inForm === undefined ? rest : { ...rest, failure: inForm };
 }

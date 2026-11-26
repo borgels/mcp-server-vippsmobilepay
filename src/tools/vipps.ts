@@ -27,13 +27,24 @@ import { listQrCodes, MAX_QR_CODES, QR_KINDS } from '../vipps/qr-codes.js';
 import {
   AGREEMENT_STATUSES,
   cancelCharge,
+  captureCharge,
   CHARGE_STATUSES,
+  CHARGE_TRANSACTION_TYPES,
+  checkCreateCharge,
+  checkUpdateAgreement,
+  createCharge,
   findCharge,
   getAgreement,
   getCharge,
+  INTERVAL_UNITS,
   listAgreements,
   listCharges,
+  MAX_RETRY_DAYS,
+  ORDER_ID_PATTERN,
+  PROCESSING_MODES,
   refundCharge,
+  stopAgreement,
+  updateAgreement,
 } from '../vipps/recurring.js';
 import { fundsSummary, listLedgers, listTransactions, MAX_REPORT_DAYS, MAX_TRANSACTIONS, periodNoteOf } from '../vipps/reports.js';
 import { getSale, listSales, MAX_SALES } from '../vipps/sales.js';
@@ -73,7 +84,7 @@ type ToolAnnotations = typeof READ_TOOL_ANNOTATIONS | typeof WRITE_TOOL_ANNOTATI
  */
 export interface UpstreamOperation {
   access: 'read' | 'write';
-  method: 'GET' | 'POST' | 'DELETE';
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   path: string;
 }
 
@@ -84,8 +95,15 @@ export interface RedactingClient extends UpstreamClient {
   readonly environment: VippsEnvironment;
 }
 
-/** What a write tool does: to money (capture, refund, cancel), or `create` for a new payment request. */
-export type VippsChangeAction = 'capture' | 'refund' | 'cancel' | 'create';
+/**
+ * What a write tool does: to money (capture, refund, cancel), `create` for a
+ * new payment request or a new Recurring charge, `update` for a change of a
+ * Recurring agreement and `stop` for stopping one.
+ */
+export type VippsChangeAction = 'capture' | 'refund' | 'cancel' | 'create' | 'update' | 'stop';
+
+/** The kind of thing a change touches: an ePayment payment, a Recurring charge or a Recurring agreement. */
+export type VippsChangeRecord = 'payment' | 'charge' | 'agreement';
 
 /**
  * The type a logged value must have; anything else is left out of the values.
@@ -116,13 +134,15 @@ export interface VippsLogField {
  */
 export interface VippsChangeSpec {
   readonly action: VippsChangeAction;
-  /** The kind of thing the change touches: 'payment' (ePayment) or 'charge' (Recurring). */
-  readonly record: 'payment' | 'charge';
+  /** The kind of thing the change touches: 'payment' (ePayment), 'charge' or 'agreement' (Recurring). */
+  readonly record: VippsChangeRecord;
   /**
    * True when the call itself moves or releases money (capture, refund,
-   * cancel). False for a new payment request: the customer approves it in
-   * the app, and only a capture draws it. A host should have a person
-   * confirm either kind.
+   * cancel, and a new Recurring charge, which charges or reserves on its due
+   * date without the customer approving it again). False for a new payment
+   * request (the customer approves it in the app, and only a capture draws
+   * it) and for a change or stop of an agreement. A host should have a
+   * person confirm either kind.
    */
   readonly movesMoney: boolean;
   readonly logFields: readonly VippsLogField[];
@@ -182,13 +202,15 @@ function defineTool<S extends z.ZodRawShape>(definition: Omit<ToolDefinition<S>,
 
 const change = (
   action: VippsChangeAction,
-  record: 'payment' | 'charge',
+  record: VippsChangeRecord,
   logFields: Record<string, VippsLogFieldType>,
+  // A new payment request moves nothing until the customer approves it and it is captured; a new Recurring charge is
+  // drawn on its due date without that. A change or stop of an agreement moves nothing by itself.
+  movesMoney = record === 'payment' ? action !== 'create' : record === 'charge',
 ): VippsChangeSpec => ({
   action,
   record,
-  // A new payment request moves nothing until the customer approves it and it is captured.
-  movesMoney: action !== 'create',
+  movesMoney,
   logFields: Object.entries(logFields).map(([name, type]) => ({ name, type })),
 });
 
@@ -209,7 +231,7 @@ const ACCOUNTING_NOTE =
 
 const referenceSchema = z.string().trim().regex(REFERENCE_PATTERN).describe('The ePayment reference (8-64 letters, digits or dashes).');
 const agreementIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring agreement id, e.g. agr_5kSeqz.');
-const chargeIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring charge id, e.g. chr-123ab.');
+const chargeIdSchema = z.string().trim().regex(RECURRING_ID_PATTERN).describe('The Recurring charge id, e.g. chr-Kq7wZp.');
 const ledgerIdSchema = z.string().trim().regex(LEDGER_ID_PATTERN).describe('The ledger id, from list_ledgers.');
 const saleReferenceSchema = z.string().trim().regex(SALE_REFERENCE_PATTERN);
 const dateSchema = z.string().trim().refine(isIsoDate, 'must be a date written YYYY-MM-DD');
@@ -551,15 +573,15 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
         .string()
         .regex(PHONE_NUMBER_PATTERN)
         .optional()
-        .describe('Only with delivery phone: the number of the customer as digits with country code and no plus sign, e.g. 4512345678.'),
+        .describe('Only with delivery phone: the number of the customer as digits with country code and no plus sign or spaces: 45 followed by the 8-digit number for Denmark.'),
       returnUrl: httpsUrlSchema
         .optional()
         .describe('Required with delivery link: the https address the customer is sent to after the payment page, e.g. the website of the business.'),
       expiresAt: z
         .string()
-        .refine(value => timestampMs(value) !== undefined, 'must be a time with a time zone, e.g. 2026-12-15T23:59:59+01:00')
+        .refine(value => timestampMs(value) !== undefined, 'must be a time with a time zone in the form YYYY-MM-DDThh:mm:ss+01:00 (or ending in Z)')
         .optional()
-        .describe('Only for a request the customer can pay later: the deadline, more than 10 minutes and less than 60 days ahead, e.g. 2026-12-15T23:59:59+01:00.'),
+        .describe('Only for a request the customer can pay later: the deadline, more than 10 minutes and less than 60 days ahead, in the form YYYY-MM-DDThh:mm:ss+01:00 (or ending in Z).'),
       orderLines: z
         .array(orderLineSchema)
         .min(1)
@@ -701,6 +723,157 @@ export const VIPPS_TOOLS: ToolDefinition[] = [
       idempotencyKey: 'pseudonym',
     }),
     handler: async (client, input) => cancelCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_create_charge',
+    title: 'Create Recurring charge (Vipps MobilePay)',
+    description:
+      'Create a charge on an active Recurring agreement: Vipps MobilePay draws the amount from the customer on the due date, without the customer approving it again, and tries again for retryDays days if that fails. ' +
+      'transactionType DIRECT_CAPTURE charges on the due date; RESERVE_CAPTURE reserves the amount on the due date, and capture_charge draws it once the product or service is delivered. ' +
+      'The due date must be at least one day and at most two years ahead. Reads the agreement first and refuses, without sending anything, when it is not active, when the currency differs, or when the amount is outside the limits of the currency or above the maximum of a variable price. ' +
+      'orderId is the business’s own number for the charge and is required; it becomes the charge’s id and can be used once per sales unit. After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, and the orderId keeps the charge from being created twice, so the answer says whether it was created now or exists already (alreadyExists). Never change the orderId to try again. ' +
+      'cancel_charge cancels a charge before it is drawn. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
+    inputShape: {
+      agreementId: agreementIdSchema,
+      amount: amountSchema,
+      currency: currencySchema.describe('ISO 4217 currency code. Must be the currency of the agreement.'),
+      description: z.string().trim().min(1).max(100).describe('What the customer is charged for (1-100 characters), shown in the app, e.g. the month.'),
+      due: dateSchema.describe('The due date, YYYY-MM-DD: at least one day and at most two years ahead.'),
+      retryDays: z.number().int().min(0).max(MAX_RETRY_DAYS).describe(`Days Vipps MobilePay tries again after the due date if the charge fails, 0-${MAX_RETRY_DAYS}. Vipps MobilePay recommends at least 2.`),
+      transactionType: z.enum(CHARGE_TRANSACTION_TYPES).describe('DIRECT_CAPTURE (charged on the due date) or RESERVE_CAPTURE (reserved on the due date and drawn with capture_charge).'),
+      processingMode: z.enum(PROCESSING_MODES).optional().describe('MULTIPLE_ATTEMPTS (default) or SINGLE_ATTEMPT: one try only, and then retryDays must be 0.'),
+      orderId: z
+        .string()
+        .trim()
+        .regex(ORDER_ID_PATTERN)
+        .describe('The business’s own number for this charge (1-64 letters, digits or dashes), e.g. its invoice or subscription period number. It becomes the charge’s id and can be used once per sales unit, so the same charge is never created twice. Never change it to try again.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Created charge.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}' },
+      { access: 'write', method: 'POST', path: '/recurring/v3/agreements/{agreementId}/charges' },
+      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' },
+    ],
+    keyTypes: ALL_KEYS,
+    change: change(
+      'create',
+      'charge',
+      { agreementId: 'pseudonym', orderId: 'pseudonym', amount: 'amountMinor', currency: 'currency' },
+      true,
+    ),
+    check: input => checkCreateCharge(input),
+    keyedAuditText: true,
+    handler: async (client, input) => createCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_capture_charge',
+    title: 'Capture Recurring charge (Vipps MobilePay)',
+    description:
+      'Capture (draw) all or part of a reserved Recurring charge, one created as RESERVE_CAPTURE. Capture only once the product or service is delivered. ' +
+      'alreadyCaptured is how much of the charge is captured before this capture, as get_charge shows it (summary.captured): 0 for the first capture. Reads the charge first and refuses, without sending anything, when alreadyCaptured is not what the charge shows, when the currency differs, when the charge is not reserved or partially captured, or when the amount is more than is reserved and not captured. ' +
+      'After a failure or a lost answer, call again with exactly the same input: the server makes the Idempotency-Key from the input, so the capture is made only once, and the answer says when it was already made (alreadyDone). ' +
+      `${WRITE_NOTE}`,
+    inputShape: {
+      agreementId: agreementIdSchema,
+      chargeId: chargeIdSchema,
+      amount: amountSchema,
+      currency: currencySchema,
+      alreadyCaptured: z
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_AMOUNT_MINOR)
+        .describe('How much of the charge is captured before this capture, in minor units, as get_charge shows it (summary.captured). 0 for the first capture.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Capture of the charge requested.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}' },
+      { access: 'write', method: 'POST', path: '/recurring/v3/agreements/{agreementId}/charges/{chargeId}/capture' },
+    ],
+    keyTypes: ALL_KEYS,
+    change: change(
+      'capture',
+      'charge',
+      { agreementId: 'pseudonym', chargeId: 'pseudonym', amount: 'amountMinor', currency: 'currency' },
+      true,
+    ),
+    handler: async (client, input) => captureCharge(client, input),
+  }),
+  defineTool({
+    name: 'vipps_update_agreement',
+    title: 'Change Recurring agreement (Vipps MobilePay)',
+    description:
+      'Change a pending or active Recurring agreement: the product name and description the customer sees, the address where the customer manages the agreement, the price, or the interval. Give only what changes. ' +
+      'price changes a fixed price (pricing type LEGACY) and suggestedMaxAmount the suggested maximum of a variable price (VARIABLE), each with currency; the kind of price cannot be changed. Vipps MobilePay does not tell the customer of a new price: the business tells the customer itself, as its terms say. ' +
+      'Reads the agreement first and refuses, without sending anything, when it is stopped or expired, when the price does not fit its kind of price, or when the currency differs; what the agreement already has is not sent again. Moves no money. To stop an agreement, use stop_agreement. ' +
+      'After a failure or a lost answer, call again with exactly the same input: the agreement is read first, and what it already has is not sent again. Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
+    inputShape: {
+      agreementId: agreementIdSchema,
+      productName: z.string().trim().min(1).max(45).optional().describe('The product name the customer sees (1-45 characters).'),
+      productDescription: z.string().trim().min(1).max(100).optional().describe('The longer product description (1-100 characters).'),
+      merchantAgreementUrl: z
+        .string()
+        .refine(value => isHttpsUrl(value, 1024), 'must be an https:// address of at most 1024 characters')
+        .optional()
+        .describe('The https address where the customer can see and manage the agreement, e.g. a “my page” of the business.'),
+      price: z.number().int().min(1).max(MAX_AMOUNT_MINOR).optional().describe('A new fixed price in minor units (pricing type LEGACY only). Needs currency.'),
+      suggestedMaxAmount: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_AMOUNT_MINOR)
+        .optional()
+        .describe('A new suggested maximum in minor units (pricing type VARIABLE only). Needs currency.'),
+      currency: currencySchema.optional().describe('With price or suggestedMaxAmount: the currency of the agreement.'),
+      interval: z
+        .strictObject({
+          unit: z.enum(INTERVAL_UNITS).describe('YEAR, MONTH, WEEK or DAY.'),
+          count: z.number().int().min(1).max(31).describe('How many units, 1-31: every 2 WEEK is every second week.'),
+        })
+        .optional()
+        .describe('A new fixed interval: every count units. A flexible interval cannot be set here.'),
+    },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Change of the agreement requested.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}' },
+      { access: 'write', method: 'PATCH', path: '/recurring/v3/agreements/{agreementId}' },
+    ],
+    keyTypes: ALL_KEYS,
+    change: change(
+      'update',
+      'agreement',
+      { agreementId: 'pseudonym', price: 'amountMinor', suggestedMaxAmount: 'amountMinor', currency: 'currency' },
+      false,
+    ),
+    check: input => checkUpdateAgreement(input),
+    keyedAuditText: true,
+    handler: async (client, input) => updateAgreement(client, input),
+  }),
+  defineTool({
+    name: 'vipps_stop_agreement',
+    title: 'Stop Recurring agreement (Vipps MobilePay)',
+    description:
+      'Stop a pending or active Recurring agreement. This cannot be undone: a stopped agreement can never be started again, and the customer must agree to a new one. Ask the person first, and say so. ' +
+      'Vipps MobilePay cancels the pending, due and reserved charges of the agreement (capture a reserved charge with capture_charge first if it should be drawn), and no new charge can be created on it. Charges already drawn stay as they are. ' +
+      'To pause an agreement, leave it active and create no charges. Reads the agreement first: one that is already stopped is answered as such, without sending anything. Moves no money itself. ' +
+      'Disabled by default (VIPPS_ENABLE_WRITES, or the gateway host policy enableWrites); a person should confirm every call.',
+    inputShape: { agreementId: agreementIdSchema },
+    annotations: WRITE_TOOL_ANNOTATIONS,
+    returnsUpstreamContent: false,
+    summary: 'Stop of the agreement requested.',
+    upstream: [
+      { access: 'read', method: 'GET', path: '/recurring/v3/agreements/{agreementId}' },
+      { access: 'write', method: 'PATCH', path: '/recurring/v3/agreements/{agreementId}' },
+    ],
+    keyTypes: ALL_KEYS,
+    change: change('stop', 'agreement', { agreementId: 'pseudonym' }, false),
+    handler: async (client, input) => stopAgreement(client, input),
   }),
 ];
 

@@ -3,6 +3,7 @@ import { vippsToolCatalog, type GatewayJsonObject, type GatewayToolResult } from
 import { MAX_QR_CODES } from '../src/vipps/qr-codes.js';
 import { MAX_SALES_UNITS } from '../src/vipps/sales-units.js';
 import { derivedIdempotencyKey, pseudonym } from '../src/vipps/values.js';
+import { requestTemplate } from '../src/vipps/client.js';
 import { apiCalls, charge, connect, gateway, KEYS, texts, type Reply, type Route } from './helpers.js';
 
 /**
@@ -53,7 +54,8 @@ function commonFailures(
       const { result } = await call({ status, body: vendorText });
       expect(result.isError).toBe(true);
       expect(texts(result)[0]).toMatch(new RegExp(`^Vipps MobilePay API request failed with HTTP ${status}`));
-      expect(result.failure).toEqual({ httpStatus: status });
+      expect(requestTemplate('GET', path)).toMatch(/^\/[a-z]/);
+      expect(result.failure).toEqual({ httpStatus: status, method: 'GET', pathTemplate: requestTemplate('GET', path) });
       expectNothingOf(result, VENDOR_WORDS);
     });
   }
@@ -63,7 +65,7 @@ function commonFailures(
     expect(result.isError).toBe(true);
     expect(texts(result)[0]).toMatch(/^Vipps MobilePay API request failed with HTTP 429 /);
     expect(texts(result)[0]).toMatch(/retry-after=7s/);
-    expect(result.failure).toEqual({ httpStatus: 429 });
+    expect(result.failure).toEqual({ httpStatus: 429, method: 'GET', pathTemplate: requestTemplate('GET', path) });
     expect(apiCalls(calls).filter(made => made.path === path)).toHaveLength(1);
     expectNothingOf(result, VENDOR_WORDS);
   });
@@ -237,7 +239,7 @@ describe('find_charge: a charge by its own id', () => {
     expect(texts(result)[0]).toBe(
       'Refused: more than one charge has this id, so Vipps MobilePay does not say which is meant. get_charge reads the charge of a known agreement (agreementId and chargeId).',
     );
-    expect(result.failure).toEqual({ httpStatus: 409 });
+    expect(result.failure).toEqual({ httpStatus: 409, method: 'GET', pathTemplate: '/recurring/v3/charges/{chargeId}' });
     expectNothingOf(result, [...VENDOR_WORDS, 'ambiguous-charge-id']);
   });
 
@@ -246,7 +248,7 @@ describe('find_charge: a charge by its own id', () => {
     const result = await gw.callTool('find_charge', INPUT);
     expect(result.isError).toBe(true);
     expect(texts(result)[0]).toBe('Vipps MobilePay API request failed with HTTP 404 | Not found, or the keys have no access to it. Check the reference or id.');
-    expect(result.failure).toEqual({ httpStatus: 404 });
+    expect(result.failure).toEqual({ httpStatus: 404, method: 'GET', pathTemplate: '/recurring/v3/charges/{chargeId}' });
     expectNothingOf(result, VENDOR_WORDS);
   });
 
@@ -414,7 +416,7 @@ describe('get_receipt: the order lines of a payment', () => {
     expect(texts(result)[0]).toBe(
       'Vipps MobilePay API request failed with HTTP 404 | Not found, or the keys have no access to it. Check the reference or id. | No order lines or category are stored with it, or it does not exist. A payment has them only when the business or its system sent them.',
     );
-    expect(result.failure).toEqual({ httpStatus: 404 });
+    expect(result.failure).toEqual({ httpStatus: 404, method: 'GET', pathTemplate: '/order-management/v2/ECOM/{orderId}' });
     expectNothingOf(result, VENDOR_WORDS);
   });
 
@@ -571,8 +573,9 @@ describe('the sales units (production only)', () => {
         const { gw } = gateway({ [`GET ${LIST}`]: { status, body: vendorText } }, PRODUCTION);
         const result = await gw.callTool('list_sales_units', {});
         expect(result.isError).toBe(true);
+        expect(result.failure).toMatchObject({ method: 'GET', pathTemplate: '/management/v1/sales-units' });
         expect(texts(result)[0]).toMatch(new RegExp(`^Vipps MobilePay API request failed with HTTP ${status} .* \\| The refusal came from the Management API \\(sales units\\), not from a payment API\\.$`));
-        expect(result.failure).toEqual({ httpStatus: status });
+        expect(result.failure?.httpStatus).toBe(status);
         expectNothingOf(result, VENDOR_WORDS);
       });
     }
@@ -636,8 +639,9 @@ describe('the sales units (production only)', () => {
         const { gw } = gateway({ [`GET ${ONE}`]: { status, body: vendorText } }, PRODUCTION);
         const result = await gw.callTool('get_sales_unit', {});
         expect(result.isError).toBe(true);
+        expect(result.failure).toMatchObject({ method: 'GET', pathTemplate: '/management/v1/sales-units/{msn}' });
         expect(texts(result)[0]).toMatch(/ \| The refusal came from the Management API \(sales units\), not from a payment API\.$/);
-        expect(result.failure).toEqual({ httpStatus: status });
+        expect(result.failure?.httpStatus).toBe(status);
         expectNothingOf(result, VENDOR_WORDS);
       });
     }

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 ### Accounting keys
 
@@ -33,7 +33,143 @@
   lacks one of them, or has one in another type, refuses the report, where
   it used to be read as the last page of a closed date.
 
-### Reads
+### Recurring changes
+
+- Four new Recurring write tools, off by default like every write and
+  confirmed (`requiresConfirmation`):
+  - `create_charge` creates a charge on an `ACTIVE` agreement
+    (`POST /recurring/v3/agreements/{agreementId}/charges`), `DIRECT_CAPTURE`
+    or `RESERVE_CAPTURE`, with `due`, `retryDays`, an optional
+    `processingMode` and a required `orderId`, the business's own number for
+    the charge, which becomes its id and which Vipps MobilePay takes once.
+    `change.action` `create`, `record` `charge`, `movesMoney` true.
+  - `capture_charge` captures all or part of a reserved charge
+    (`POST .../charges/{chargeId}/capture`). It takes `alreadyCaptured`, what
+    the charge shows as captured before this capture. `action` `capture`,
+    `movesMoney` true.
+  - `update_agreement` changes an agreement's product name and description,
+    its address for the customer, its fixed price (`price`) or a variable
+    price's suggested maximum, or its fixed interval (a unit and a count)
+    (`PATCH /recurring/v3/agreements/{agreementId}`), and sends only what
+    differs from the agreement. It never sends `status`, and it does not set a
+    flexible interval, which cannot be read back from the agreement, so a
+    repeat could not see that it was set. `action` `update`,
+    `record` `agreement`, `movesMoney` false.
+  - `stop_agreement` stops an agreement (the same `PATCH`, with `status`
+    `STOPPED` alone). Its description says that it cannot be undone and that
+    the AI asks the person first. `action` `stop`, `record` `agreement`,
+    `movesMoney` false.
+- Each reads the agreement or the charge first and refuses, without sending
+  anything, what Vipps MobilePay documents it would refuse (status, currency,
+  the currency's amount limits, the kind of price, a variable price's maximum).
+- None takes an `idempotencyKey`. For `create_charge`, `capture_charge` and
+  `stop_agreement` the key is made from the sales unit, the agreement and the
+  request's content with a keyed hash, as for `create_payment` (`charge-`,
+  `capture-` or `stop-` and 32 hex characters), so a call repeated after a
+  failure or a lost answer is the same request. Since that key changes with
+  the client secret, the `orderId` of a charge, the captured amount of a
+  charge and the status of an agreement guard against a second change too.
+  `update_agreement` gets a new random key (`update-`) for every request, so
+  A to B, back to A and to B again is carried out each time. A repeat finds a change already made (a charge by the
+  `CREATE` event with its key, a capture by its `CAPTURE` event, an agreement
+  that already has what is asked or is stopped) and sends nothing again. The
+  key is in no answer, error or audit record, and `get_charge` and
+  `list_charges` now leave such a key out of a charge's history, as
+  `find_charge` already did.
+- Error texts are our own for each change: HTTP 429 and 423 say that nothing
+  was done and to call again with the same input after the wait, 408, 5xx, a
+  timeout and a lost connection that the outcome is not known, and 400, 404
+  and 409 what they can mean for that change. For `update_agreement` they say
+  that the agreement is read first and what it has is not sent again, since
+  its key is new for every request.
+- The fixed request list gains `POST .../charges`, `POST .../capture` and one
+  `PATCH /recurring/v3/agreements/{agreementId}`; the client gets `patch`,
+  which read-only tools cannot use, and `PATCH` is a method in failure
+  metadata and in a catalog entry's `upstream`. `VippsChangeAction` gains
+  `update` and `stop`, and `record` (`VippsChangeRecord`) gains `agreement`.
+  New log fields: `orderId` (pseudonym), `price` and `suggestedMaxAmount`
+  (amounts). The audit adds `due`, `retryDays`, `transactionType`,
+  `processingMode`, `alreadyCaptured`, `price` and `suggestedMaxAmount` in
+  clear, `orderId` as a pseudonym, a product name and description only as a
+  keyed hash, and the field names of an interval; never the agreement's
+  address.
+
+## 0.9.0
+
+- Webhook registration for an embedding host: `registerPaymentEvents`,
+  `listWebhooks` and `removeWebhook` on a gateway instance, and
+  `VIPPS_PAYMENT_EVENTS`. The host registers its own https address for the
+  sales unit's ePayment events and gets the registration's id and signing
+  secret back, once. Host functions only, never tools. The fixed request list
+  gains `GET` and `POST /webhooks/v1/webhooks` and
+  `DELETE /webhooks/v1/webhooks/{id}`; an answer that cannot be used is never
+  quoted, since it may hold the secret. The answer's `secret` is masked by the
+  instance the moment the answer arrives, also when the answer is then
+  refused; when `secret` is not one text, every text anywhere in the answer is
+  masked, without a cap on count or depth, and the answer is refused. If
+  that masking cannot finish, the instance withholds every later host value
+  and tool result. The secret is given on only when it shares nothing
+  with a secret the instance already knows (its keys, access tokens and earlier
+  registration secrets, compared piece by piece for every one of them), or is
+  exactly an earlier registration's; an id that
+  holds a secret is withheld. The address must be https on a public host
+  name: IP literals, single labels, non-default ports, fragments and local or
+  internal names are refused before anything is sent (by the name's form,
+  without a DNS lookup). Every value a host function returns goes through the
+  same redaction and leak check as a tool result. The events are sent sorted,
+  so the same set always gives the same request and operation key.
+
+## 0.8.0
+
+- All four `Vipps-System-*` headers are sent on every request, as Vipps
+  MobilePay requires of partners and plugins. An embedding host can give its
+  own solution as `systemName` and `systemVersion`; the host is then sent as
+  the system and the server as the plugin (`Vipps-System-Plugin-Name:
+  mcp-server-vippsmobilepay` with the package version). On its own the server
+  sends itself as both. A host that gives `systemPluginName` keeps the older
+  arrangement, with the server as the system.
+- `systemName` is given with `systemVersion`. `systemPluginName` without
+  `systemPluginVersion` still works, as before, and sends the plugin version
+  `0` (`DEFAULT_PLUGIN_VERSION`); `systemPluginVersion` without
+  `systemPluginName` is refused at construction.
+- A Vipps-System-* value that shares text with the instance's keys is refused
+  at construction, without quoting it: the headers are sent in clear.
+- Failure metadata for logging errors as Vipps MobilePay's checklist asks,
+  without keeping answers: `failure` on an error result, and the audit's
+  error record, now carry the request's `method`, its `pathTemplate` (the
+  path from the server's fixed list with every reference, id, date and number
+  as a `{name}`, never a query), Vipps MobilePay's `errorCode` (digits only,
+  such as ePayment's `6080`) and its `traceId` (ePayment's W3C trace context,
+  or Recurring's `contextId` as a UUID), next to `httpStatus` and `requestId`.
+  In the audit the vendor's request id is `vendorRequestId`; `requestId`
+  stays the server's own, shared by a call's start and error records. The error code and trace id
+  are the only values read from an error body, only from JSON of at most
+  16 KiB and only in their fixed forms; the vendor's message, title, field
+  names and reasons are never read out.
+
+## 0.7.1
+
+- Fix: 0.7.0 refused valid keys. A key is refused when it shares six
+  characters with one of the server's own texts, and 0.7.0's texts held the
+  example phone number `4512345678`, so a client id, subscription key or
+  client secret holding `123456`, `234567`, `345678` and so on was refused
+  before any request (for example the client id
+  `e89f2345-c841-4bc7-a695-234567ab89cd`, which 0.5.0 accepts). The same
+  class of run was in other texts too: the example dates
+  `2026-12-15T23:59:59+01:00`, the charge id example `chr-123ab`, the word
+  "Embedded", the range `0-9a-f` in the host name pattern, and the numbers
+  `65000000` (the amount limit) and `9007199254740991` (the integer limit
+  zod adds) in the gateway's tool list.
+- The texts now hold no run of six or more characters from `[0-9A-Fa-f-]`:
+  the phone number and the dates are described in words and by their form,
+  the examples are changed, and a numeric bound of six digits or more is left
+  out of the gateway's JSON schemas (zod still checks it when the call runs;
+  the limits themselves are unchanged).
+- A test checks every text a key is compared against (the fixed texts, the
+  refusal, the fallbacks and the gateway's tool list) for such runs, and
+  realistic made-up GUID, hex and base64 keys are admitted.
+
+## 0.7.0
 
 - Five new read tools. `find_charge`: one Recurring charge by its own id,
   when the agreement is not known. `get_receipt`: the order lines with VAT,

@@ -1,7 +1,8 @@
 import { createHmac } from 'node:crypto';
 import { ConfigError, readEnvBoolean, readEnvInteger, readEnvString, type Env } from '../config-env.js';
-import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor } from '../errors.js';
+import { VippsHttpError, describeUrl, parseRetryAfterMs, requestIdFrom, SecretRedactor, vendorErrorFields } from '../errors.js';
 import { PACKAGE_VERSION, USER_AGENT } from '../version.js';
+import { ACCOUNTING_REQUESTS, ACCOUNTING_TOKEN_PATH, ALLOWED_REQUESTS, TOKEN_PATH } from './requests.js';
 import type { KeyedHashPurpose } from './values.js';
 
 /** Which Vipps MobilePay environment the keys belong to. */
@@ -34,7 +35,10 @@ export const UPSTREAM_HOSTS: readonly string[] = ['api.vipps.no', 'apitest.vipps
 /** Header names that carry a credential; redaction follows them by name. */
 export const CREDENTIAL_HEADERS = ['client_id', 'client_secret', 'Ocp-Apim-Subscription-Key', 'Authorization'] as const;
 
-/** The value sent as Vipps-System-Name. */
+/**
+ * This server's name in the Vipps-System-* headers: the system when it runs on its own, and the plugin when a host
+ * gives its own system name (the host is the solution, this server the service it uses).
+ */
 export const SYSTEM_NAME = 'mcp-server-vippsmobilepay';
 
 const MSN_PATTERN = /^\d{4,10}$/;
@@ -42,6 +46,53 @@ const MSN_PATTERN = /^\d{4,10}$/;
 const SYSTEM_HEADER_PATTERN = /^[A-Za-z0-9._-]{1,30}$/;
 /** Idempotency-Key: the Recurring API allows 1-40 characters without '#', '?', '/' or '\'; we allow a strict subset. */
 export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9-]{8,40}$/;
+
+/** The plugin version sent when a host gives systemPluginName without systemPluginVersion (the older use). */
+export const DEFAULT_PLUGIN_VERSION = '0';
+
+/**
+ * The four Vipps-System-* headers, always all four: Vipps MobilePay requires them of partners and plugins. A host that
+ * gives its own system name and version is the system, and this server the plugin. On its own this server is both, as
+ * Vipps MobilePay suggests when there is no plugin. A host that gives a plugin name instead (the older use) is the
+ * plugin, and this server the system; without systemPluginVersion its version is DEFAULT_PLUGIN_VERSION. systemName is
+ * given with systemVersion, and a version is never given without its name.
+ *
+ * The values go to Vipps MobilePay in clear on every request, outside the credential headers, so none may hold a
+ * secret of the instance or a piece of one (`secrets`, the client's redactor). The refusal names the option, never
+ * the value.
+ */
+export function systemHeaders(
+  options: Pick<VippsClientOptions, 'systemName' | 'systemVersion' | 'systemPluginName' | 'systemPluginVersion'>,
+  secrets?: { matches(text: string): boolean },
+): Record<string, string> {
+  for (const [value, name] of [
+    [options.systemName, 'systemName'],
+    [options.systemVersion, 'systemVersion'],
+    [options.systemPluginName, 'systemPluginName'],
+    [options.systemPluginVersion, 'systemPluginVersion'],
+  ] as const) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
+      throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
+    }
+    if (secrets?.matches(value)) {
+      throw new ConfigError(`${name} shares text with the keys; it is sent in clear and must not hold a key.`);
+    }
+  }
+  if ((options.systemName === undefined) !== (options.systemVersion === undefined)) {
+    throw new ConfigError('systemName and systemVersion must be given together.');
+  }
+  if (options.systemPluginName === undefined && options.systemPluginVersion !== undefined) {
+    throw new ConfigError('systemPluginVersion is given only with systemPluginName.');
+  }
+  return {
+    'Vipps-System-Name': options.systemName ?? SYSTEM_NAME,
+    'Vipps-System-Version': options.systemVersion ?? PACKAGE_VERSION,
+    'Vipps-System-Plugin-Name': options.systemPluginName ?? SYSTEM_NAME,
+    'Vipps-System-Plugin-Version':
+      options.systemPluginName === undefined ? PACKAGE_VERSION : (options.systemPluginVersion ?? DEFAULT_PLUGIN_VERSION),
+  };
+}
 
 export interface VippsClientOptions {
   /** client_id. When omitted, read from VIPPS_CLIENT_ID in `credentialEnv`. */
@@ -67,7 +118,14 @@ export interface VippsClientOptions {
   baseUrl?: string;
   /** Allow a base URL outside UPSTREAM_HOSTS (env VIPPS_ALLOW_CUSTOM_BASE_URL=true). */
   allowCustomBaseUrl?: boolean;
-  /** Vipps-System-Plugin-Name, for a host that embeds this package (one word, at most 30 characters). */
+  /**
+   * Vipps-System-Name, for a host that embeds this package: its own solution (one word, at most 30 characters). Given
+   * with systemVersion; this server is then sent as the plugin (see systemHeaders).
+   */
+  systemName?: string;
+  /** Vipps-System-Version of the host's solution (at most 30 characters). */
+  systemVersion?: string;
+  /** Vipps-System-Plugin-Name, for a host that embeds this package as the system (one word, at most 30 characters). */
   systemPluginName?: string;
   /** Vipps-System-Plugin-Version (at most 30 characters). */
   systemPluginVersion?: string;
@@ -98,7 +156,8 @@ export interface VippsClientOptions {
 
 export type QueryValue = string | number | boolean | null | undefined;
 
-export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type { HttpMethod } from './requests.js';
+import type { HttpMethod } from './requests.js';
 
 /** A page of a response: the body and the response headers this server reads (lower-case names). */
 export interface ResponsePage<T> {
@@ -112,8 +171,10 @@ export interface WriteOptions {
    * Idempotency-Key header. Required, and never generated here. For a capture,
    * refund or cancellation the caller chooses it, logs it before the request,
    * and sends the same key when it repeats the same change, so Vipps MobilePay
-   * carries the change out once. For a new payment the tool derives it from
-   * the request's own content (derivedIdempotencyKey in values.ts).
+   * carries the change out once. For a new payment, and for the Recurring
+   * changes create_charge, capture_charge, update_agreement and
+   * stop_agreement, the tool derives it from the request's own content
+   * (derivedIdempotencyKey in values.ts).
    */
   idempotencyKey: string;
 }
@@ -171,76 +232,36 @@ const TRANSIENT_NETWORK_CODES = new Set([
   'UND_ERR_BODY_TIMEOUT',
 ]);
 
-/**
- * Every API request this server can make, by method. A path is checked
- * against this list before anything is sent, whichever tool asks: nothing
- * outside it (agreement changes, merchant or sales unit settings, new
- * charges) can be sent, whatever the policy says. Path segments arrive
- * already encoded by encodePathParam. Accounting keys have a list of their
- * own (ACCOUNTING_REQUESTS).
- */
-const SEGMENT = '[^/?#]+';
-const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, readonly RegExp[]>> = {
-  GET: [
-    /^\/settlement\/v1\/ledgers$/,
-    /^\/report\/v2\/ledgers\/\d{1,20}\/(funds|fees)\/dates\/\d{4}-\d{2}-\d{2}$/,
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}$`),
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}/events$`),
-    /^\/recurring\/v3\/agreements$/,
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`),
-    // A charge by its own id, when the agreement is not known (find_charge).
-    new RegExp(`^/recurring/v3/charges/${SEGMENT}$`),
-    // The order lines and category stored with a payment or a charge (get_receipt).
-    new RegExp(`^/order-management/v2/(ECOM|RECURRING)/${SEGMENT}$`),
-    // The sales units the keys can read, and one of them (list_sales_units, get_sales_unit). Production only.
-    /^\/management\/v1\/sales-units$/,
-    /^\/management\/v1\/sales-units\/\d{4,10}$/,
-    // The sales unit's fixed QR codes (list_qr_codes).
-    /^\/qr\/v1\/merchant-redirect$/,
-    /^\/qr\/v1\/merchant-callback$/,
-  ],
-  POST: [
-    // A new payment request (create_payment). The customer approves it in the app before any money moves.
-    /^\/epayment\/v1\/payments$/,
-    new RegExp(`^/epayment/v1/payments/${SEGMENT}/(capture|refund|cancel)$`),
-    new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
-  ],
-  // Vipps MobilePay cancels a Recurring charge with DELETE on the charge. It is
-  // the only DELETE this server can send, and it deletes no record: the charge
-  // stays. A pending, due or reserved charge ends as CANCELLED; a partially
-  // captured one ends as CHARGED, with the rest released to the customer.
-  DELETE: [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}$`)],
-};
-
-/**
- * Every API request a client with accounting keys can make: the ledger list,
- * the funds and fees ledgers of a ledger date, and the sales of a ledger (by
- * ledger date, by the business's reference, by Vipps MobilePay's
- * reference). All are GET. Nothing of the other list is among them, and the
- * sales paths are in no other list: the Sales API takes accounting keys only.
- * The feed of a ledger is not here: it is for keeping a copy, and this
- * server keeps none.
- */
-const ACCOUNTING_REQUESTS: readonly RegExp[] = [
-  /^\/settlement\/v1\/ledgers$/,
-  /^\/report\/v2\/ledgers\/\d{1,20}\/(funds|fees)\/dates\/\d{4}-\d{2}-\d{2}$/,
-  /^\/sales\/report\/v1\/ledgers\/\d{1,20}\/dates\/\d{4}-\d{2}-\d{2}$/,
-  new RegExp(`^/sales/report/v1/ledgers/\\d{1,20}/(references|psp-references)/${SEGMENT}$`),
-];
-
 /** A dot segment, or an encoded dot or separator, in a path: never sent. */
 const DOT_OR_ENCODED_SEPARATOR = /(^|\/)\.{1,2}(\/|$)|%2e|%2f|%5c/i;
 
 /**
  * Whether a client with keys of this type may send the request at all (see
- * ALLOWED_REQUESTS and ACCOUNTING_REQUESTS).
+ * ALLOWED_REQUESTS and ACCOUNTING_REQUESTS): accounting keys only their own
+ * GETs, every other kind the main list.
  */
 export function isAllowedRequest(method: HttpMethod, path: string, keyType: VippsKeyType = 'merchant'): boolean {
-  if (keyType === 'accounting') return method === 'GET' && ACCOUNTING_REQUESTS.some(pattern => pattern.test(path));
-  return (ALLOWED_REQUESTS[method] ?? []).some(pattern => pattern.test(path));
+  if (keyType === 'accounting') return method === 'GET' && ACCOUNTING_REQUESTS.some(([pattern]) => pattern.test(path));
+  return (ALLOWED_REQUESTS[method] ?? []).some(([pattern]) => pattern.test(path));
 }
+
+/**
+ * The template of an allowed request's path, for logging a failure: the fixed text from ALLOWED_REQUESTS (or
+ * ACCOUNTING_REQUESTS for accounting keys), with every id, reference, date and number as a {name}, and never a query.
+ * Undefined for a path outside the list.
+ */
+export function requestTemplate(method: HttpMethod, path: string, keyType: VippsKeyType = 'merchant'): string | undefined {
+  const pathOnly = path.split('?')[0] ?? '';
+  if (keyType === 'accounting') {
+    if (method === 'POST' && pathOnly === ACCOUNTING_TOKEN_PATH) return ACCOUNTING_TOKEN_PATH;
+    return method === 'GET' ? ACCOUNTING_REQUESTS.find(([pattern]) => pattern.test(pathOnly))?.[1] : undefined;
+  }
+  if (method === 'POST' && pathOnly === TOKEN_PATH) return TOKEN_PATH;
+  return (ALLOWED_REQUESTS[method] ?? []).find(([pattern]) => pattern.test(pathOnly))?.[1];
+}
+
+/** The largest error body read for its code and trace id; a larger one is not read. */
+const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /**
  * The ledgers of one organisation, as a client bound to that organisation
@@ -258,12 +279,13 @@ export interface OwnLedgers {
 
 /**
  * The client as handed to tool handlers. Read-only tools get a view whose
- * post and delete throw (see readOnlyClient).
+ * post, patch and delete throw (see readOnlyClient).
  */
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
   getPage<T>(path: string, query?: Record<string, QueryValue>, headers?: Record<string, string>): Promise<ResponsePage<T>>;
   post<T>(path: string, body: unknown, options: WriteOptions): Promise<T>;
+  patch<T>(path: string, body: unknown, options: WriteOptions): Promise<T>;
   delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
@@ -293,6 +315,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     get: (path, query) => client.get(path, query),
     getPage: (path, query, headers) => client.getPage(path, query, headers),
     post: refuse('POST'),
+    patch: refuse('PATCH'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
     ...(client.ownLedgers ? { ownLedgers: () => (client.ownLedgers as () => Promise<OwnLedgers>)() } : {}),
@@ -318,7 +341,7 @@ interface CachedToken {
  *
  * Redirects are never followed. GETs and the token request are retried with
  * backoff on throttling, gateway errors and transient network failures;
- * POST and DELETE are never retried except once after a 401 (with the same
+ * POST, PATCH and DELETE are never retried except once after a 401 (with the same
  * Idempotency-Key, since a 401 means nothing was done).
  *
  * Each client owns a SecretRedactor holding its own client_id, client_secret,
@@ -411,20 +434,8 @@ export class VippsMobilePayClient implements UpstreamClient {
     this.baseUrl = trimTrailingSlash(override ?? ENVIRONMENT_BASE_URLS[this.environment]);
     assertSafeBaseUrl(this.baseUrl, options.allowCustomBaseUrl ?? readEnvBoolean('VIPPS_ALLOW_CUSTOM_BASE_URL', false, env));
 
-    this.systemHeaders = {
-      'Vipps-System-Name': SYSTEM_NAME,
-      'Vipps-System-Version': PACKAGE_VERSION,
-    };
-    for (const [header, value, name] of [
-      ['Vipps-System-Plugin-Name', options.systemPluginName, 'systemPluginName'],
-      ['Vipps-System-Plugin-Version', options.systemPluginVersion, 'systemPluginVersion'],
-    ] as const) {
-      if (value === undefined) continue;
-      if (typeof value !== 'string' || !SYSTEM_HEADER_PATTERN.test(value)) {
-        throw new ConfigError(`${name} must be 1 to 30 letters, digits, dots, dashes or underscores.`);
-      }
-      this.systemHeaders[header] = value;
-    }
+    // After the keys are in the redactor: no header value may hold one of them.
+    this.systemHeaders = systemHeaders(options, this.redactor);
 
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = intOption('timeoutMs', options.timeoutMs, 'VIPPS_TIMEOUT_MS', 30_000, 1, MAX_TIMER_MS);
@@ -465,6 +476,10 @@ export class VippsMobilePayClient implements UpstreamClient {
 
   async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
     return (await this.call<T>('POST', path, { body, idempotencyKey: idempotencyKey(options) })).data;
+  }
+
+  async patch<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
+    return (await this.call<T>('PATCH', path, { body, idempotencyKey: idempotencyKey(options) })).data;
   }
 
   async delete<T>(path: string, options: WriteOptions): Promise<T> {
@@ -545,7 +560,7 @@ export class VippsMobilePayClient implements UpstreamClient {
     if (this.keyType === 'accounting') {
       const { basic } = this.accountingCredentials();
       return {
-        url: this.buildUrl('/miami/v1/token'),
+        url: this.buildUrl(ACCOUNTING_TOKEN_PATH),
         init: {
           method: 'POST',
           headers: {
@@ -650,14 +665,24 @@ export class VippsMobilePayClient implements UpstreamClient {
       );
     }
     if (!response.ok) {
-      // The body is the vendor's text: it is never read into an error, a result or an audit record.
-      await discardBody(response);
+      // The body is the vendor's text: only its error code and trace id are read out, in their fixed forms
+      // (vendorErrorFields). Nothing else of it reaches an error, a result or an audit record.
+      const fields = vendorErrorFields(await readErrorBody(response));
+      let path = '';
+      try {
+        path = new URL(url).pathname;
+      } catch {
+        // No template for an address that cannot be read.
+      }
       throw new VippsHttpError({
         status: response.status,
         url: describeUrl(url),
         retryAfter: response.headers.get('retry-after') ?? undefined,
         requestId: requestIdFrom(response.headers),
         tokenRequest,
+        method,
+        pathTemplate: requestTemplate(method, path, this.keyType),
+        ...fields,
         accountingKeys: this.keyType === 'accounting',
       });
     }
@@ -833,9 +858,9 @@ function causeCodes(cause: unknown, depth = 0): string[] {
   const { code, errors, cause: inner } = cause as { code?: unknown; errors?: unknown; cause?: unknown };
   if (typeof code === 'string') codes.push(code);
   if (Array.isArray(errors)) {
-    for (const entry of errors) codes.push(...causeCodes(entry, depth + 1));
+    for (const entry of errors) for (const code of causeCodes(entry, depth + 1)) codes.push(code);
   }
-  codes.push(...causeCodes(inner, depth + 1));
+  for (const code of causeCodes(inner, depth + 1)) codes.push(code);
   return codes;
 }
 
@@ -872,6 +897,26 @@ async function discardBody(response: Response): Promise<void> {
     await response.body?.cancel();
   } catch {
     // ignore
+  }
+}
+
+/**
+ * An error body as JSON, for vendorErrorFields only: read when it says it is JSON and is at most
+ * MAX_ERROR_BODY_BYTES, otherwise discarded. Any failure to read or parse it gives undefined.
+ */
+async function readErrorBody(response: Response): Promise<unknown> {
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  if (!contentType.includes('json')) {
+    await discardBody(response);
+    return undefined;
+  }
+  try {
+    const read = await readUpTo(response, MAX_ERROR_BODY_BYTES);
+    if (read.exceeded) return undefined;
+    return JSON.parse(new TextDecoder().decode(read.bytes)) as unknown;
+  } catch {
+    await discardBody(response);
+    return undefined;
   }
 }
 

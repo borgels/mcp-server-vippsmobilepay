@@ -15,6 +15,7 @@
  * short.
  */
 
+import { REQUEST_TEMPLATES } from './vipps/requests.js';
 import { isHttpsUrl } from './vipps/values.js';
 
 /** Configured secrets shorter than this are not redacted by value (too likely to hit normal text). */
@@ -147,6 +148,23 @@ export class SecretRedactor {
     return this.secrets.has(value);
   }
 
+  /**
+   * Whether the text shares anything with any secret of this instance, for deciding whether a new value may be given on:
+   * any piece of FRAGMENT_LENGTH characters of the text that is also in a secret, in any form, whether the secret was
+   * added whole and in pieces (a key) or whole only (an access token). Stricter than `matches`, which leaves the pieces
+   * of an exact-only secret alone because they are common in other text; here a false positive only withholds a value.
+   */
+  sharesWith(text: string): boolean {
+    if (this.matches(text)) return true;
+    for (const secret of this.secrets) {
+      if (secret.includes(text) || text.includes(secret)) return true;
+      for (let i = 0; i + FRAGMENT_LENGTH <= text.length; i += 1) {
+        if (secret.includes(text.slice(i, i + FRAGMENT_LENGTH))) return true;
+      }
+    }
+    return false;
+  }
+
   /** Whether the text contains one of the secrets in any form, or any FRAGMENT_LENGTH-character piece of one. */
   matches(text: string): boolean {
     for (const secret of this.secrets) {
@@ -258,8 +276,9 @@ const ACCOUNTING_TOKEN_STATUS_HINTS: Record<number, string> = {
 };
 
 /**
- * An HTTP error from Vipps MobilePay. It keeps the status and the parsed
- * Retry-After, nothing from the response body: the message is our own.
+ * An HTTP error from Vipps MobilePay. It keeps the status, the parsed Retry-After, the request's method and path
+ * template, and from the response body only the vendor's error code and trace id in their fixed forms
+ * (vendorErrorFields). The message is our own.
  */
 export class VippsHttpError extends Error {
   readonly status: number;
@@ -270,6 +289,14 @@ export class VippsHttpError extends Error {
   readonly requestId?: string;
   /** True when the Access Token API answered: no API request was sent. */
   readonly tokenRequest: boolean;
+  /** The request's method. */
+  readonly method?: string;
+  /** The request's path as a template from this server's fixed list, without ids or query (requestTemplate). */
+  readonly pathTemplate?: string;
+  /** Vipps MobilePay's error code, digits only (an ePayment ErrorCode such as 6080). */
+  readonly errorCode?: string;
+  /** Vipps MobilePay's trace id from the body, in its fixed form only. */
+  readonly traceId?: string;
   /** True when the keys are accounting keys: the hints of a token request name those. */
   readonly accountingKeys: boolean;
 
@@ -280,6 +307,10 @@ export class VippsHttpError extends Error {
     tokenRequest?: boolean;
     requestId?: string;
     note?: string;
+    method?: string;
+    pathTemplate?: string;
+    errorCode?: string;
+    traceId?: string;
     accountingKeys?: boolean;
   }) {
     super(httpErrorMessage(input.status, input.retryAfter, input.tokenRequest === true, input.note, input.accountingKeys === true));
@@ -290,8 +321,72 @@ export class VippsHttpError extends Error {
     this.retryAfter = retryMs === undefined ? undefined : String(Math.ceil(retryMs / 1000));
     this.requestId = vendorRequestId(input.requestId);
     this.tokenRequest = input.tokenRequest === true;
+    this.method = vendorMethod(input.method);
+    this.pathTemplate = templateInForm(input.pathTemplate);
+    this.errorCode = vendorErrorCode(input.errorCode);
+    this.traceId = vendorTraceId(input.traceId);
     this.accountingKeys = input.accountingKeys === true;
   }
+}
+
+const METHODS: readonly string[] = ['GET', 'POST', 'PATCH', 'DELETE'];
+/** Vipps MobilePay's error codes are numbers (ePayment: 3010 to 10070). */
+const ERROR_CODE_FORM = /^\d{2,6}$/;
+/** A W3C trace context, as ePayment gives its traceId: version, trace id, parent id and flags in lower-case hex. */
+const TRACE_CONTEXT_FORM = /^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
+/** A UUID, as the Recurring API gives its contextId: 8-4-4-4-12 hex digits. */
+const UUID_FORM = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+function vendorMethod(value: unknown): string | undefined {
+  return typeof value === 'string' && METHODS.includes(value) ? value : undefined;
+}
+
+/** A path template only when it is one of the fixed list's (REQUEST_TEMPLATES); any other text is dropped. */
+function templateInForm(value: unknown): string | undefined {
+  return typeof value === 'string' && REQUEST_TEMPLATES.has(value) ? value : undefined;
+}
+
+/** An error code only as digits; anything else (a word, a sentence) is dropped. */
+export function vendorErrorCode(value: unknown): string | undefined {
+  const text = typeof value === 'number' && Number.isInteger(value) ? String(value) : value;
+  return typeof text === 'string' && ERROR_CODE_FORM.test(text.trim()) ? text.trim() : undefined;
+}
+
+/** ePayment's traceId only as a W3C trace context; anything else (digits, a name, a resource id) is dropped. */
+export function vendorTraceContext(value: unknown): string | undefined {
+  return typeof value === 'string' && TRACE_CONTEXT_FORM.test(value.trim()) ? value.trim() : undefined;
+}
+
+/** Recurring's contextId only as a UUID; anything else is dropped. */
+export function vendorContextId(value: unknown): string | undefined {
+  return typeof value === 'string' && UUID_FORM.test(value.trim()) ? value.trim() : undefined;
+}
+
+/** A trace id as kept: a W3C trace context or a UUID, each in its exact form. Anything else is dropped. */
+export function vendorTraceId(value: unknown): string | undefined {
+  return vendorTraceContext(value) ?? vendorContextId(value);
+}
+
+/**
+ * The two values taken from an error body, and nothing else of it: the error code (ePayment puts it in extraDetails
+ * as name "ErrorCode", others at the top as errorCode or code) and the trace id (ePayment's traceId, Recurring's
+ * contextId). Texts, titles, details, field names and reasons are never read out.
+ */
+export function vendorErrorFields(body: unknown): { errorCode?: string; traceId?: string } {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return {};
+  const value = body as Record<string, unknown>;
+  let errorCode = vendorErrorCode(value.errorCode) ?? vendorErrorCode(value.code);
+  if (errorCode === undefined && Array.isArray(value.extraDetails)) {
+    for (const detail of value.extraDetails) {
+      if (detail !== null && typeof detail === 'object' && (detail as Record<string, unknown>).name === 'ErrorCode') {
+        errorCode = vendorErrorCode((detail as Record<string, unknown>).reason);
+        if (errorCode !== undefined) break;
+      }
+    }
+  }
+  // Each field by its own exact form: traceId as a trace context, contextId as a UUID.
+  const traceId = vendorTraceContext(value.traceId) ?? vendorContextId(value.contextId);
+  return { ...(errorCode === undefined ? {} : { errorCode }), ...(traceId === undefined ? {} : { traceId }) };
 }
 
 /**
@@ -336,14 +431,43 @@ export function requestIdFrom(headers: Headers, names: readonly string[] = REQUE
 }
 
 /**
- * Metadata about a failed call, for a host that counts failures: the HTTP status the upstream API answered with
- * and its request id. Never the response body, the vendor's error code or message, or the input.
+ * Metadata about a failed call, for a host that logs and counts failures: the request's method and path template,
+ * the HTTP status the upstream API answered with, its request id, and the vendor's error code and trace id. Never the
+ * response body, the vendor's message, an id or query value from the path, or the input.
  */
 export interface FailureMetadata {
   /** The HTTP status of the upstream API's answer (100-599). */
   httpStatus: number;
   /** The vendor's own id for the request, as a UUID or hex id only. */
   requestId?: string;
+  /** GET, POST or DELETE. */
+  method?: string;
+  /** The path as a template, such as /epayment/v1/payments/{reference}/capture: no id, reference or query. */
+  pathTemplate?: string;
+  /** Vipps MobilePay's error code, digits only. */
+  errorCode?: string;
+  /** Vipps MobilePay's trace id, in its fixed form only. */
+  traceId?: string;
+}
+
+/** Failure metadata in form: each field checked again, and anything out of form dropped. */
+export function failureInForm(failure: unknown): FailureMetadata | undefined {
+  if (failure === null || typeof failure !== 'object') return undefined;
+  const value = failure as Record<string, unknown>;
+  const status = value.httpStatus;
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return undefined;
+  const result: FailureMetadata = { httpStatus: status };
+  const requestId = vendorRequestId(typeof value.requestId === 'string' ? value.requestId : undefined);
+  if (requestId !== undefined) result.requestId = requestId;
+  const method = vendorMethod(value.method);
+  if (method !== undefined) result.method = method;
+  const pathTemplate = templateInForm(value.pathTemplate);
+  if (pathTemplate !== undefined) result.pathTemplate = pathTemplate;
+  const errorCode = vendorErrorCode(value.errorCode);
+  if (errorCode !== undefined) result.errorCode = errorCode;
+  const traceId = vendorTraceId(value.traceId);
+  if (traceId !== undefined) result.traceId = traceId;
+  return result;
 }
 
 /**
@@ -358,10 +482,14 @@ export function failureMetadata(error: unknown): FailureMetadata | undefined {
         ? error.cause
         : undefined;
   if (http === undefined) return undefined;
-  const status = http.status;
-  if (!Number.isInteger(status) || status < 100 || status > 599) return undefined;
-  const requestId = vendorRequestId(http.requestId);
-  return requestId === undefined ? { httpStatus: status } : { httpStatus: status, requestId };
+  return failureInForm({
+    httpStatus: http.status,
+    requestId: http.requestId,
+    method: http.method,
+    pathTemplate: http.pathTemplate,
+    errorCode: http.errorCode,
+    traceId: http.traceId,
+  });
 }
 
 /**
@@ -377,6 +505,10 @@ export function withNote(error: VippsHttpError, note: string): VippsHttpError {
     tokenRequest: error.tokenRequest,
     accountingKeys: error.accountingKeys,
     note,
+    method: error.method,
+    pathTemplate: error.pathTemplate,
+    errorCode: error.errorCode,
+    traceId: error.traceId,
   });
 }
 
