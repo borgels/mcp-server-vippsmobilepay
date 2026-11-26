@@ -51,6 +51,10 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   cancel_payment: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' },
   refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren', idempotencyKey: 'op-0001-aaaa' },
   cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
+  create_charge: { agreementId: 'agr_7TqP2m', amount: 19_900, currency: 'DKK', description: 'Brødabonnement: november', due: '2026-12-01', retryDays: 3, transactionType: 'RESERVE_CAPTURE' },
+  capture_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-Rz4mQ8', amount: 19_900, currency: 'DKK', alreadyCaptured: 0 },
+  update_agreement: { agreementId: 'agr_7TqP2m', productName: 'Brødabonnement, stor' },
+  stop_agreement: { agreementId: 'agr_7TqP2m' },
 };
 
 /** The payment request answerEverything last accepted: it is read back as that request, as Vipps MobilePay would. */
@@ -62,7 +66,9 @@ const answerEverything: typeof fetch = async (input, init) => {
     new Response(status === 204 ? null : JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   const path = url.pathname;
   if (path === '/accesstoken/get') return json({ access_token: fakeToken('catalog'), expires_in: '3600' });
-  if (method === 'DELETE') return json(null, 204);
+  if (method === 'DELETE' || method === 'PATCH') return json(null, 204);
+  if (method === 'POST' && path.endsWith('/capture')) return json(null, 204);
+  if (method === 'POST' && path === '/recurring/v3/agreements/agr_7TqP2m/charges') return json({ chargeId: 'chr-9xWq2b' }, 201);
   if (path.endsWith('/charges/chr-5kSeqz/refund')) return json(null, 204);
   if (method === 'POST' && path === '/epayment/v1/payments') {
     lastCreated = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -93,8 +99,11 @@ const answerEverything: typeof fetch = async (input, init) => {
   }
   if (path === '/recurring/v3/agreements') return json([]);
   if (path.endsWith('/charges')) return json([]);
+  if (path.endsWith('/charges/chr-Rz4mQ8')) {
+    return json(charge({ id: 'chr-Rz4mQ8', status: 'RESERVED', transactionType: 'RESERVE_CAPTURE', summary: { captured: 0, refunded: 0, cancelled: 0 } }));
+  }
   if (path.includes('/charges/')) return json(charge({ status: 'RESERVED' }));
-  return json({ id: 'agr_7TqP2m' });
+  return json({ id: 'agr_7TqP2m', status: 'ACTIVE', productName: 'Brødabonnement', pricing: { type: 'LEGACY', currency: 'DKK', amount: 19_900 }, interval: { unit: 'MONTH', count: 1 } });
 };
 
 /** Turn a request path into the catalog's template. */
@@ -149,13 +158,17 @@ describe('tool catalog', () => {
       cancel_payment: 'write',
       refund_charge: 'write',
       cancel_charge: 'write',
+      create_charge: 'write',
+      capture_charge: 'write',
+      update_agreement: 'write',
+      stop_agreement: 'write',
     });
     for (const entry of vippsToolCatalog) {
       const write = entry.riskLevel !== 'read';
       expect(entry.enabledByDefault, entry.name).toBe(!write);
       // Every write is confirmed. The call itself moves or releases money for every write but a new payment request,
-      // which the customer approves in the app.
-      const movesMoney = write && entry.name !== 'create_payment';
+      // which the customer approves in the app, and a change or stop of an agreement.
+      const movesMoney = write && !['create_payment', 'update_agreement', 'stop_agreement'].includes(entry.name);
       expect(entry.requiresConfirmation, entry.name).toBe(write);
       expect(entry.broad, entry.name).toBe(false);
       expect(entry.change !== undefined, entry.name).toBe(write);
@@ -219,9 +232,13 @@ describe('tool catalog', () => {
       // already carried out); tested in writes.test.ts.
       // The order details are read by the reference of a payment or by the id of a charge: one of the two requests
       // (both tested in lookups.test.ts).
+      // create_charge reads the agreement's charges only after a refusal (HTTP 409), to find the charge the same
+      // request made before (tested in recurring-changes.test.ts).
       const conditional = ['capture_payment', 'refund_payment'].includes(entry.name)
         ? ['GET /epayment/v1/payments/{reference}/events']
-        : entry.name === 'get_receipt'
+        : entry.name === 'create_charge'
+          ? ['GET /recurring/v3/agreements/{agreementId}/charges']
+          : entry.name === 'get_receipt'
           ? ['GET /order-management/v2/RECURRING/{chargeId}']
           : [];
       const expected = (entry.name === 'list_transactions' ? declared.filter(item => item.includes('/fees/')) : declared).filter(

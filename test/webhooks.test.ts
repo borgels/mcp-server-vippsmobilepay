@@ -193,6 +193,10 @@ const SAMPLES: Record<string, GatewayJsonObject> = {
   cancel_payment: { reference: 'fjord-order-10042', idempotencyKey: 'op-0001-aaaa' },
   refund_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', amount: 100, currency: 'DKK', description: 'Fejl i ordren', idempotencyKey: 'op-0001-aaaa' },
   cancel_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-5kSeqz', idempotencyKey: 'op-0001-aaaa' },
+  create_charge: { agreementId: 'agr_7TqP2m', amount: 19_900, currency: 'DKK', description: 'Brødabonnement: november', due: '2026-12-01', retryDays: 3, transactionType: 'RESERVE_CAPTURE' },
+  capture_charge: { agreementId: 'agr_7TqP2m', chargeId: 'chr-Rz4mQ8', amount: 19_900, currency: 'DKK', alreadyCaptured: 0 },
+  update_agreement: { agreementId: 'agr_7TqP2m', productName: 'Brødabonnement, stor' },
+  stop_agreement: { agreementId: 'agr_7TqP2m' },
 };
 
 describe('the secret, swept through every result', () => {

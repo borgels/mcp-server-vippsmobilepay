@@ -1,14 +1,16 @@
 // The fixed list of requests this server can send, each with the template it is logged by. Its own module, with no
 // imports, so the error helpers (src/errors.ts) can check a template against the list without importing the client.
 
-export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 /**
  * Every API request this server can make, by method. A path is checked
  * against this list before anything is sent, whichever tool asks: nothing
- * outside it (agreement changes, merchant or sales unit settings, new
- * charges) can be sent, whatever the policy says. Path segments arrive
- * already encoded by encodePathParam.
+ * outside it (a new agreement, merchant or sales unit settings) can be sent,
+ * whatever the policy says. Path segments arrive
+ * already encoded by encodePathParam. A Recurring agreement can be changed
+ * and stopped (PATCH) and get a new charge, but never created or force
+ * accepted.
  */
 const SEGMENT = '[^/?#]+';
 export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonly [RegExp, string]>>> = {
@@ -49,9 +51,17 @@ export const ALLOWED_REQUESTS: Readonly<Record<HttpMethod, ReadonlyArray<readonl
       new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/refund$`),
       '/recurring/v3/agreements/{agreementId}/charges/{chargeId}/refund',
     ],
+    // A new charge on an agreement (create_charge), and the capture of a reserved one (capture_charge).
+    [new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges$`), '/recurring/v3/agreements/{agreementId}/charges'],
+    [
+      new RegExp(`^/recurring/v3/agreements/${SEGMENT}/charges/${SEGMENT}/capture$`),
+      '/recurring/v3/agreements/{agreementId}/charges/{chargeId}/capture',
+    ],
     // The host registers its own address for a sales unit's ePayment events (registerPaymentEvents). Never a tool.
     [/^\/webhooks\/v1\/webhooks$/, '/webhooks/v1/webhooks'],
   ],
+  // One PATCH: an agreement's product, price or interval (update_agreement), or its status STOPPED (stop_agreement).
+  PATCH: [[new RegExp(`^/recurring/v3/agreements/${SEGMENT}$`), '/recurring/v3/agreements/{agreementId}']],
   // Two DELETEs, nothing else. Vipps MobilePay cancels a Recurring charge with
   // DELETE on the charge, the only DELETE a tool can send, and it deletes no
   // record: the charge stays. A pending, due or reserved charge ends as CANCELLED; a partially

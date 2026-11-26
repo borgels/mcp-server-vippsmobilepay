@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+- Four new Recurring write tools, off by default like every write and
+  confirmed (`requiresConfirmation`):
+  - `create_charge` creates a charge on an `ACTIVE` agreement
+    (`POST /recurring/v3/agreements/{agreementId}/charges`), `DIRECT_CAPTURE`
+    or `RESERVE_CAPTURE`, with `due`, `retryDays`, an optional
+    `processingMode` and an optional `orderId`, which becomes the charge's id.
+    `change.action` `create`, `record` `charge`, `movesMoney` true.
+  - `capture_charge` captures all or part of a reserved charge
+    (`POST .../charges/{chargeId}/capture`). It takes `alreadyCaptured`, what
+    the charge shows as captured before this capture. `action` `capture`,
+    `movesMoney` true.
+  - `update_agreement` changes an agreement's product name and description,
+    its address for the customer, its fixed price (`price`) or a variable
+    price's suggested maximum, or its interval
+    (`PATCH /recurring/v3/agreements/{agreementId}`), and sends only what
+    differs from the agreement. It never sends `status`. `action` `update`,
+    `record` `agreement`, `movesMoney` false.
+  - `stop_agreement` stops an agreement (the same `PATCH`, with `status`
+    `STOPPED` alone). Its description says that it cannot be undone and that
+    the AI asks the person first. `action` `stop`, `record` `agreement`,
+    `movesMoney` false.
+- Each reads the agreement or the charge first and refuses, without sending
+  anything, what Vipps MobilePay documents it would refuse (status, currency,
+  the currency's amount limits, the kind of price, a variable price's maximum).
+- None takes an `idempotencyKey`: the key is made from the sales unit, the
+  agreement and the request's content with a keyed hash, as for
+  `create_payment` (`charge-`, `capture-`, `update-` or `stop-` and 32 hex
+  characters), so a call repeated after a failure or a lost answer is the
+  same request. A repeat finds a change already made (a charge by the
+  `CREATE` event with its key, a capture by its `CAPTURE` event, an agreement
+  that already has what is asked or is stopped) and sends nothing again. The
+  key is in no answer, error or audit record, and `get_charge` and
+  `list_charges` now leave such a key out of a charge's history, as
+  `find_charge` already did.
+- Error texts are our own for each change: HTTP 429 and 423 say that nothing
+  was done and to call again with the same input after the wait, 408, 5xx, a
+  timeout and a lost connection that the outcome is not known, and 400, 404
+  and 409 what they can mean for that change.
+- The fixed request list gains `POST .../charges`, `POST .../capture` and one
+  `PATCH /recurring/v3/agreements/{agreementId}`; the client gets `patch`,
+  which read-only tools cannot use, and `PATCH` is a method in failure
+  metadata and in a catalog entry's `upstream`. `VippsChangeAction` gains
+  `update` and `stop`, and `record` (`VippsChangeRecord`) gains `agreement`.
+  New log fields: `orderId` (pseudonym), `price` and `suggestedMaxAmount`
+  (amounts). The audit adds `due`, `retryDays`, `transactionType`,
+  `processingMode`, `alreadyCaptured`, `price` and `suggestedMaxAmount` in
+  clear, `orderId` as a pseudonym, a product name and description only as a
+  keyed hash, and the field names of an interval; never the agreement's
+  address.
+
 ## 0.9.0
 
 - Webhook registration for an embedding host: `registerPaymentEvents`,

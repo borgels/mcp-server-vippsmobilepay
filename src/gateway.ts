@@ -37,6 +37,7 @@ import {
   type ToolDefinition,
   type UpstreamOperation,
   type VippsChangeAction,
+  type VippsChangeRecord,
   type VippsChangeSpec,
   type VippsLogField,
   type VippsLogFieldType,
@@ -60,14 +61,13 @@ import {
  * are still read from the environment and apply to every instance.
  *
  * What no policy can turn on: a request outside the client's fixed list
- * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that changes an
- * agreement (price, interval, status), merchant or sales unit settings, or
- * the keys, and none that creates a charge.
+ * (src/vipps/client.ts, ALLOWED_REQUESTS). There is no tool that creates an
+ * agreement, or changes merchant or sales unit settings or the keys.
  */
 
 export type { AuditSink, InstancePolicy } from './vipps/policy.js';
 export type { VippsEnvironment, VippsKeyType } from './vipps/client.js';
-export type { VippsChangeAction, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
+export type { VippsChangeAction, VippsChangeRecord, VippsChangeSpec, VippsLogField, VippsLogFieldType } from './tools/vipps.js';
 export type { PaymentEvent, Webhook, WebhookRegistration } from './vipps/webhooks.js';
 /** The ePayment events a host can register its address for (registerPaymentEvents). */
 export const VIPPS_PAYMENT_EVENTS: readonly PaymentEvent[] = Object.freeze([...PAYMENT_EVENTS]);
@@ -136,10 +136,11 @@ export interface GatewayToolCatalogEntry {
    */
   readonly environments: readonly VippsEnvironment[];
   /**
-   * Vipps MobilePay addition: true for every write tool. A capture, refund
-   * or cancellation moves or releases money, and a payment request reaches
-   * a customer: a host should have a person confirm each call outside the
-   * chat before it runs. `change.movesMoney` tells the two kinds apart.
+   * Vipps MobilePay addition: true for every write tool. A capture, refund,
+   * cancellation or new Recurring charge moves or releases money, a payment
+   * request reaches a customer, and a change or stop of an agreement changes
+   * what the customer has agreed to: a host should have a person confirm
+   * each call before it runs. `change.movesMoney` tells the kinds apart.
    */
   readonly requiresConfirmation: boolean;
   /**
@@ -185,8 +186,8 @@ export interface VippsGatewayOptions
 export interface VippsChange {
   readonly tool: string;
   readonly action: VippsChangeAction;
-  readonly record: 'payment' | 'charge';
-  /** Whether the call itself moves or releases money (false for a new payment request). */
+  readonly record: VippsChangeRecord;
+  /** Whether the call itself moves or releases money (false for a new payment request and a change or stop of an agreement). */
   readonly movesMoney: boolean;
   /**
    * The values of the tool's `logFields` that are present and have their
