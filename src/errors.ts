@@ -318,7 +318,7 @@ export class VippsHttpError extends Error {
   }
 }
 
-const METHODS: readonly string[] = ['GET', 'POST', 'DELETE'];
+const METHODS: readonly string[] = ['GET', 'POST', 'PATCH', 'DELETE'];
 /** Vipps MobilePay's error codes are numbers (ePayment: 3010 to 10070). */
 const ERROR_CODE_FORM = /^\d{2,6}$/;
 /** A W3C trace context, as ePayment gives its traceId: version, trace id, parent id and flags in lower-case hex. */

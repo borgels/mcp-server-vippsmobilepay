@@ -251,10 +251,19 @@ describe('requests', () => {
     expect(calls).toHaveLength(0);
 
     expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/refund')).toBe(true);
-    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/capture')).toBe(false);
-    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges')).toBe(false);
+    // A new charge and the capture of a reserved one (create_charge, capture_charge); a change or stop of an
+    // agreement is the one PATCH. An agreement is never created, and nothing else is patched.
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/capture')).toBe(true);
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges')).toBe(true);
+    expect(isAllowedRequest('PATCH', '/recurring/v3/agreements/agr_1')).toBe(true);
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements')).toBe(false);
+    expect(isAllowedRequest('PATCH', '/recurring/v3/agreements')).toBe(false);
+    expect(isAllowedRequest('PATCH', '/recurring/v3/agreements/agr_1/accept')).toBe(false);
+    expect(isAllowedRequest('PATCH', '/recurring/v3/agreements/agr_1/charges/chr_1')).toBe(false);
+    expect(isAllowedRequest('PATCH', '/epayment/v1/payments/fjord-order-1')).toBe(false);
+    expect(isAllowedRequest('POST', '/recurring/v3/agreements/agr_1/charges/chr_1/capture/x')).toBe(false);
     expect(isAllowedRequest('DELETE', '/recurring/v3/agreements/agr_1/charges/chr_1')).toBe(true);
-    // A new payment request is on the list; nothing else is created.
+    // A new payment request is on the list.
     expect(isAllowedRequest('POST', '/epayment/v1/payments')).toBe(true);
     expect(isAllowedRequest('POST', '/epayment/v1/payments/')).toBe(false);
     expect(isAllowedRequest('DELETE', '/epayment/v1/payments')).toBe(false);

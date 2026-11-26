@@ -168,8 +168,8 @@ function errorFields(summary: ReturnType<typeof auditErrorSummary>) {
  * Fields logged in clear text: provider ledger ids (digits), dates and
  * times, enum values, amounts in minor units, currency codes and flags. They
  * are checked against the tool's input schema before a call runs. A payment
- * request's phone number, return address, order lines and receipt number are
- * not logged in any form: a phone number has too few digits for a hash to
+ * request's phone number, return address, order lines and receipt number, and
+ * an agreement's address (merchantAgreementUrl), are not logged in any form: a phone number has too few digits for a hash to
  * hide it.
  */
 const ID_FIELDS = [
@@ -186,6 +186,13 @@ const ID_FIELDS = [
   'expiresAt',
   'customerPresent',
   'qrFormat',
+  'due',
+  'retryDays',
+  'transactionType',
+  'processingMode',
+  'alreadyCaptured',
+  'price',
+  'suggestedMaxAmount',
 ] as const;
 
 /**
@@ -193,7 +200,7 @@ const ID_FIELDS = [
  * allowed characters, a name among them): logged only as their pseudonym,
  * the same one resolveVippsChange gives without a host key.
  */
-const PSEUDONYM_FIELDS = ['reference', 'agreementId', 'chargeId', 'idempotencyKey'] as const;
+const PSEUDONYM_FIELDS = ['reference', 'agreementId', 'chargeId', 'orderId', 'idempotencyKey'] as const;
 
 /**
  * Free-text fields are hashed so user-written text does not land in the log:
@@ -202,13 +209,13 @@ const PSEUDONYM_FIELDS = ['reference', 'agreementId', 'chargeId', 'idempotencyKe
  * (auditTarget's `keyedText`): `<field>Hmac`, which cannot be tested against
  * a guess without the client secret.
  */
-const FREE_TEXT_FIELDS = ['description'] as const;
+const FREE_TEXT_FIELDS = ['description', 'productName', 'productDescription'] as const;
 
 /** Characters of a keyed hash of a free text that are logged: 128 bits, as hex. */
 const KEYED_TEXT_LENGTH = 32;
 
-/** Write payload objects: only their field names are logged. None of the tools takes one. */
-const PAYLOAD_FIELDS = [] as const;
+/** Write payload objects: only their field names are logged (update_agreement's interval). */
+const PAYLOAD_FIELDS = ['interval'] as const;
 
 /**
  * Build the audit `target` for a tool input. Values not listed above are not

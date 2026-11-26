@@ -170,6 +170,15 @@ export function requestFingerprint(keyedHash: (purpose: KeyedHashPurpose, text: 
 }
 
 /**
+ * What a derived key is for: a new payment request (create), and the
+ * Recurring changes a new charge (charge), the capture of a reserved charge
+ * (capture), a change of an agreement (update) and the stop of one (stop).
+ * Each is at most 7 characters, so the key fits the 40 the header allows.
+ */
+export const DERIVED_KEY_KINDS = ['create', 'charge', 'capture', 'update', 'stop'] as const;
+export type DerivedKeyKind = (typeof DERIVED_KEY_KINDS)[number];
+
+/**
  * The Idempotency-Key of a request this server builds itself: `kind`, a dash
  * and a second keyed hash of the same content, made with another key than
  * the fingerprint. A request repeated after a failure or a lost answer is
@@ -178,7 +187,7 @@ export function requestFingerprint(keyedHash: (purpose: KeyedHashPurpose, text: 
  * events) learns neither the content nor the fingerprint.
  */
 export function derivedIdempotencyKey(
-  kind: 'create',
+  kind: DerivedKeyKind,
   keyedHash: (purpose: KeyedHashPurpose, text: string) => string,
   content: unknown,
 ): string {
@@ -187,5 +196,5 @@ export function derivedIdempotencyKey(
 
 /** Whether a text has the form of a key this server derives. Such a key is never passed on in an answer. */
 export function isDerivedIdempotencyKey(value: unknown): boolean {
-  return typeof value === 'string' && /^create-[0-9a-f]{32}$/.test(value);
+  return typeof value === 'string' && /^(?:create|charge|capture|update|stop)-[0-9a-f]{32}$/.test(value);
 }

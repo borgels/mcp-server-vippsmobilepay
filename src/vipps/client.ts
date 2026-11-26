@@ -161,8 +161,10 @@ export interface WriteOptions {
    * Idempotency-Key header. Required, and never generated here. For a capture,
    * refund or cancellation the caller chooses it, logs it before the request,
    * and sends the same key when it repeats the same change, so Vipps MobilePay
-   * carries the change out once. For a new payment the tool derives it from
-   * the request's own content (derivedIdempotencyKey in values.ts).
+   * carries the change out once. For a new payment, and for the Recurring
+   * changes create_charge, capture_charge, update_agreement and
+   * stop_agreement, the tool derives it from the request's own content
+   * (derivedIdempotencyKey in values.ts).
    */
   idempotencyKey: string;
 }
@@ -244,12 +246,13 @@ const MAX_ERROR_BODY_BYTES = 16 * 1024;
 
 /**
  * The client as handed to tool handlers. Read-only tools get a view whose
- * post and delete throw (see readOnlyClient).
+ * post, patch and delete throw (see readOnlyClient).
  */
 export interface UpstreamClient {
   get<T>(path: string, query?: Record<string, QueryValue>): Promise<T>;
   getPage<T>(path: string, query?: Record<string, QueryValue>, headers?: Record<string, string>): Promise<ResponsePage<T>>;
   post<T>(path: string, body: unknown, options: WriteOptions): Promise<T>;
+  patch<T>(path: string, body: unknown, options: WriteOptions): Promise<T>;
   delete<T>(path: string, options: WriteOptions): Promise<T>;
   /** Fetch an access token (or use the cached one): whether the keys work. */
   verifyCredentials(): Promise<void>;
@@ -274,6 +277,7 @@ export function readOnlyClient(client: UpstreamClient, toolName: string): Upstre
     get: (path, query) => client.get(path, query),
     getPage: (path, query, headers) => client.getPage(path, query, headers),
     post: refuse('POST'),
+    patch: refuse('PATCH'),
     delete: refuse('DELETE'),
     verifyCredentials: () => client.verifyCredentials(),
     merchantSerialNumber: client.merchantSerialNumber,
@@ -298,7 +302,7 @@ interface CachedToken {
  *
  * Redirects are never followed. GETs and the token request are retried with
  * backoff on throttling, gateway errors and transient network failures;
- * POST and DELETE are never retried except once after a 401 (with the same
+ * POST, PATCH and DELETE are never retried except once after a 401 (with the same
  * Idempotency-Key, since a 401 means nothing was done).
  *
  * Each client owns a SecretRedactor holding its own client_id, client_secret,
@@ -403,6 +407,10 @@ export class VippsMobilePayClient implements UpstreamClient {
 
   async post<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
     return (await this.call<T>('POST', path, { body, idempotencyKey: idempotencyKey(options) })).data;
+  }
+
+  async patch<T>(path: string, body: unknown, options: WriteOptions): Promise<T> {
+    return (await this.call<T>('PATCH', path, { body, idempotencyKey: idempotencyKey(options) })).data;
   }
 
   async delete<T>(path: string, options: WriteOptions): Promise<T> {
