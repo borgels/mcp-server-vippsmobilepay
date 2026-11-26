@@ -499,11 +499,16 @@ describe('accounting keys: reports and sales', () => {
   it('refuses a page of sales in another form: a wrong type, a missing field, an empty item', async () => {
     for (const items of [
       [sale({ amounts: { gross: '125.00', net: 10_000, vat: 2_500 } })],
-      [sale({ amounts: { gross: 12_500, net: 10_000 } })],
-      [sale({ lines: undefined })],
+      // Fields the specification never lets be null: missing, or null, refuses the page.
+      [sale({ amounts: { net: 10_000, vat: 2_500 } })],
+      [sale({ amounts: { gross: null, net: 10_000, vat: 2_500 } })],
+      [sale({ reference: null })],
+      [sale({ entryType: null })],
+      [sale({ currency: undefined })],
+      [sale({ completeness: null })],
       [sale({ lines: [{}] })],
+      [sale({ lines: [{ ...sale().lines[0], quantity: null }] })],
       [sale({ completeness: { hasLineItems: true } })],
-      [sale({ pspReference: undefined })],
       [{}],
     ]) {
       const { gw } = accountingGateway(
@@ -513,6 +518,72 @@ describe('accounting keys: reports and sales', () => {
       const result = await gw.callTool('list_sales', SAMPLES.list_sales, { owner: OWNER });
       expect(result.isError, JSON.stringify(items)).toBe(true);
     }
+  });
+
+  it('reads a sale with every field the specification lets be null as null: a cash sale with no VAT breakdown', async () => {
+    const cash = sale({
+      pspReference: null,
+      orderDate: null,
+      paymentType: 'CASH',
+      classification: { solution: null, salesCategory: null },
+      amounts: { gross: 12_500, net: null, vat: null },
+      lines: [
+        {
+          lineId: null,
+          name: null,
+          quantity: 1,
+          unitPriceGross: null,
+          unitPriceNet: null,
+          lineTotalGross: null,
+          lineTotalNet: null,
+          vatRate: null,
+          vatAmount: null,
+          category: null,
+          discountTotal: null,
+        },
+      ],
+      customer: null,
+      completeness: { hasLineItems: true, hasVatBreakdown: false, hasCustomerIdentity: false },
+    });
+    const noLines = sale({ reference: 'fjord-salg-10043', classification: null, lines: null });
+    const { gw } = accountingGateway(
+      {
+        ...ledgerList(BOTH),
+        'GET /sales/report/v1/ledgers/302321/dates/2026-11-03': { body: { items: [cash, noLines, sale()], cursor: null, hasMore: false } },
+        'GET /sales/report/v1/ledgers/302321/references/fjord-salg-10042': { body: { items: [cash], cursor: null, hasMore: false } },
+      },
+      { now: NOW },
+    );
+    const listed = await gw.callTool('list_sales', SAMPLES.list_sales, { owner: OWNER });
+    expect(listed.isError, JSON.stringify(listed)).toBeUndefined();
+    const items = (listed.structuredContent as { items: Array<Record<string, unknown>> }).items;
+    expect(items).toHaveLength(3);
+    // A null is left out, never passed on as a value, and the rest of the sale stays.
+    expect(items[0]).not.toHaveProperty('pspReference');
+    expect(items[0]).not.toHaveProperty('orderDate');
+    expect(items[0]).toMatchObject({ reference: 'fjord-salg-10042', paymentType: 'CASH', amounts: { gross: 12_500 }, classification: {}, lines: [{ quantity: 1 }] });
+    expect(items[0]!.amounts).toEqual({ gross: 12_500 });
+    expect(items[1]).not.toHaveProperty('lines');
+    expect(items[1]).not.toHaveProperty('classification');
+    expect(items[2]).toMatchObject({ pspReference: '3343121302', classification: { salesCategory: 'retail' } });
+    const one = await gw.callTool('get_sale', SAMPLES.get_sale, { owner: OWNER });
+    expect(one.isError, JSON.stringify(one)).toBeUndefined();
+    expect(one.structuredContent).toMatchObject({ reference: 'fjord-salg-10042', count: 1 });
+  });
+
+  it('reads a ledger entry whose reference and sales unit are null', async () => {
+    const { gw } = accountingGateway(
+      {
+        ...ledgerList(BOTH),
+        'GET /report/v2/ledgers/302321/funds/dates/2026-11-03': {
+          body: { items: [entry({ entryType: 'payout-scheduled', reference: null, recipientHandle: null })], cursor: '', tryLater: false, hasMore: false },
+        },
+      },
+      { now: NOW },
+    );
+    const result = await gw.callTool('list_transactions', SAMPLES.list_transactions, { owner: OWNER });
+    expect(result.isError, JSON.stringify(result)).toBeUndefined();
+    expect(JSON.stringify(result.structuredContent)).toContain('payout-scheduled');
   });
 
   it('refuses more pages of sales without a new cursor', async () => {

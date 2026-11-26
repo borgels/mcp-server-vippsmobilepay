@@ -290,8 +290,9 @@ const SALES_PAGE = {
   [REQUIRED]: ['items', 'hasMore'],
   items: [
     {
-      // The specification requires every field; classification and customer can be null, and customer is not read.
-      [REQUIRED]: ['entryType', 'time', 'orderDate', 'pspReference', 'reference', 'currency', 'paymentType', 'amounts', 'lines', 'completeness'],
+      // The specification (LedgerEvent) has every field present, and these never null. orderDate, pspReference (null
+      // for cash), classification and lines can be null, and then are absent here; customer is not read.
+      [REQUIRED]: ['entryType', 'time', 'reference', 'currency', 'paymentType', 'amounts', 'completeness'],
       entryType: 'string',
       time: 'string',
       orderDate: 'string',
@@ -299,8 +300,10 @@ const SALES_PAGE = {
       reference: 'string',
       currency: 'string',
       paymentType: 'string',
-      classification: { [REQUIRED]: ['solution', 'salesCategory'], solution: 'string', salesCategory: 'string' },
-      amounts: { [REQUIRED]: ['gross', 'net', 'vat'], gross: 'integer', net: 'integer', vat: 'integer' },
+      // Both can be null (salesCategory is the business's own, solution is null for some sales).
+      classification: { solution: 'string', salesCategory: 'string' },
+      // gross is never null; net and vat are null when the sale has no VAT breakdown.
+      amounts: { [REQUIRED]: ['gross'], gross: 'integer', net: 'integer', vat: 'integer' },
       lines: [
         {
           // Every other field of a line can be null in the specification.
@@ -321,6 +324,7 @@ const SALES_PAGE = {
       completeness: { [REQUIRED]: ['hasLineItems', 'hasVatBreakdown'], hasLineItems: 'boolean', hasVatBreakdown: 'boolean' },
     },
   ],
+  // cursor can be null (no more pages); hasMore says whether to follow it.
   cursor: 'longString',
   hasMore: 'boolean',
 } as const;

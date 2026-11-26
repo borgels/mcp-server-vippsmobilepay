@@ -24,6 +24,10 @@
 - `payoutBankAccount` is never passed on with accounting keys, and the
   customer fields of the Sales API are left out. Every answer read with
   accounting keys passes a strict allow-list.
+  A field the Sales API lets be null (`pspReference` for cash,
+  `orderDate`, `classification` and its fields, `amounts.net`, `amounts.vat`,
+  `lines` and the line fields but `quantity`, `cursor`) is left out when null
+  and never refuses the answer.
 - `ledgerOwners()`, a host function for the host's operator (never a tool):
   which organisations have given access, as `{ scheme, id, ledgers,
   salesUnits }` per owner and a count of ledgers that name none. Nothing else
